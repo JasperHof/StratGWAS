@@ -1,0 +1,12 @@
+Package: StratGWAS
+Title: Stratified GWAS analysis of binary traits
+Version: 0.0.0
+Authors@R: person("Jasper", "Hof", email = "jasper.hof@qgg.au.dk", role = c("aut","cre"))
+Description: StratGWAS enables a stratified GWAS analysis of binary phenotypes.
+License: GPL-3
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Imports: Rcpp
+LinkingTo: Rcpp, RcppEigen
+
