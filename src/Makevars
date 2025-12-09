@@ -1,0 +1,1 @@
+CXXFLAGS = $(CXXFLAGS) -Wno-ignored-attributes -Wno-psabi
