@@ -64,9 +64,6 @@ Eigen::MatrixXd convert_and_impute(const IntegerMatrix &geno) {
 // [[Rcpp::depends(RcppEigen)]]
 // [[Rcpp::export]]
 NumericVector computeLDscoresFromBED(std::string file_prefix, int n_ind, int n_snp) {
-  
-  // First load BIM file
-  Rcout << "Reading BIM file " << "\n";
 
   // Call the new function and extract vectors
   List bim = read_bim_file(file_prefix);
@@ -75,8 +72,6 @@ NumericVector computeLDscoresFromBED(std::string file_prefix, int n_ind, int n_s
   IntegerVector pos = bim["pos"];
   CharacterVector a1 = bim["a1"];
   CharacterVector a2 = bim["a2"];
-
-  Rcout << "Read BIM file " << "\n";
 
   // Compute maximum number of SNPs within 1Mb to determine sliding block size
   int max_block = max_snps_in_1mb_block(chr, pos, 1e6);

@@ -72,10 +72,17 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
     // Block size
     int nr_blocks = n_snps / block_size;
 
+    // Set up random vectors
+    std::mt19937 rng(12345);
+    std::normal_distribution<double> norm(0,1);
+    int nmcmc = 20;
+
     for(int b = 0; b < nr_blocks; ++b){
 
-        Rcout << "Processing genotype block " << b << "\n";
-
+        if (b % 100 == 1) {
+            Rcpp::Rcout << "Processing genotype block " << b << "/" << nr_blocks << "\n";
+        }
+    
         int block_start = b * block_size;
         int block_end = std::min(n_snps - 1, (b + 1) * block_size - 1);
         int n_snps_block = block_end - block_start + 1;
@@ -125,11 +132,6 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
             }
         }
 
-        // set up random vectors - maybe prepare outside loop better
-        std::mt19937 rng(12345);
-        std::normal_distribution<double> norm(0,1);
-        int nmcmc = 20;
-
         // Set traces for estimation
         double tr_K = n_inds;
         double tr_KK = 0.0;
@@ -142,7 +144,7 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
             tr_KK += Kz.squaredNorm() / (nmcmc * n_snps_block * n_snps_block);
         }
 
-        // Haseman-Elston equatins
+        // Haseman-Elston equations
         for(int i = 0; i < n_pheno; ++i){
             for(int j = i; j < n_pheno; ++j){
                 

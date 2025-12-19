@@ -2,34 +2,34 @@
 # Generator token: 10BE3573-1514-4C36-9D1C-5A225CD40393
 
 read_bim_file <- function(filename) {
-    .Call('_StratGWAS_read_bim_file', PACKAGE = 'StratGWAS', filename)
+    .Call(`_StratGWAS_read_bim_file`, filename)
 }
 
 read_fam_file <- function(filename) {
-    .Call('_StratGWAS_read_fam_file', PACKAGE = 'StratGWAS', filename)
+    .Call(`_StratGWAS_read_fam_file`, filename)
 }
 
 he <- function(genotypes, pheno) {
-    .Call('_StratGWAS_he', PACKAGE = 'StratGWAS', genotypes, pheno)
+    .Call(`_StratGWAS_he`, genotypes, pheno)
 }
 
 he_multi <- function(genotypes, pheno) {
-    .Call('_StratGWAS_he_multi', PACKAGE = 'StratGWAS', genotypes, pheno)
+    .Call(`_StratGWAS_he_multi`, genotypes, pheno)
 }
 
 he_multi_part <- function(filename, pheno_mat, block_size) {
-    .Call('_StratGWAS_he_multi_part', PACKAGE = 'StratGWAS', filename, pheno_mat, block_size)
+    .Call(`_StratGWAS_he_multi_part`, filename, pheno_mat, block_size)
 }
 
 computeLDscoresFromBED <- function(file_prefix, n_ind, n_snp) {
-    .Call('_StratGWAS_computeLDscoresFromBED', PACKAGE = 'StratGWAS', file_prefix, n_ind, n_snp)
+    .Call(`_StratGWAS_computeLDscoresFromBED`, file_prefix, n_ind, n_snp)
 }
 
 linear_gwas <- function(filename, pheno_file, out_file, n_inds, n_snps, block_size) {
-    .Call('_StratGWAS_linear_gwas', PACKAGE = 'StratGWAS', filename, pheno_file, out_file, n_inds, n_snps, block_size)
+    .Call(`_StratGWAS_linear_gwas`, filename, pheno_file, out_file, n_inds, n_snps, block_size)
 }
 
 readBedBlock <- function(filename, n_ind, n_snp, start_ind, end_ind, start_snp, end_snp) {
-    .Call('_StratGWAS_readBedBlock', PACKAGE = 'StratGWAS', filename, n_ind, n_snp, start_ind, end_ind, start_snp, end_snp)
+    .Call(`_StratGWAS_readBedBlock`, filename, n_ind, n_snp, start_ind, end_ind, start_snp, end_snp)
 }
 
