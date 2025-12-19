@@ -13,6 +13,7 @@ gencov_he <- function(strata, filename) {
   bim = read.table(paste0(filename,".bim"))
 
   # Read in data as multivariate phenotype
+  K = strata$K
   ids = strata$y[,1]
   multi = matrix(0, length(ids), strata$K)  
   for(k in 1:K) multi[,k] = strata[[paste0("group",k)]][match(ids,strata[[paste0("group",k)]][,1]),3]
@@ -24,6 +25,7 @@ gencov_he <- function(strata, filename) {
     multi[is.na(multi[,k]),k] = mean(multi[,k], na.rm=T)
     multi[,k] = scale(as.numeric(multi[,k]))
   }
+  rownames(multi) = ids
 
   # make sure the phenotype is numerical matrix; IDs provided as rownames
   cor = he_multi_part(filename, multi, 1000)
