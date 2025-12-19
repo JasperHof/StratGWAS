@@ -8,7 +8,7 @@
 using namespace Rcpp;
 
 // [[Rcpp::export]]
-IntegerMatrix readBedBlock(std::string filename, int n_ind, int n_snp, 
+Rcpp::IntegerMatrix readBedBlock(std::string filename, int n_ind, int n_snp, 
                                int start_ind, int end_ind, int start_snp, int end_snp) {
   
   std::ifstream bedFile(filename, std::ios::binary);
@@ -46,7 +46,7 @@ IntegerMatrix readBedBlock(std::string filename, int n_ind, int n_snp,
       int g;
       switch(geno) {
         case 0b00: g = 2; break;
-        case 0b10: g = 1; break;
+        case 0b10: g = 1; break;  
         case 0b11: g = 0; break;
         case 0b01: g = -1; break;  // missing
         default: g = -2;

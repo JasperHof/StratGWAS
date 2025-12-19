@@ -11,6 +11,28 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
+// read_bim_file
+List read_bim_file(const std::string& filename);
+RcppExport SEXP _StratGWAS_read_bim_file(SEXP filenameSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    rcpp_result_gen = Rcpp::wrap(read_bim_file(filename));
+    return rcpp_result_gen;
+END_RCPP
+}
+// read_fam_file
+Rcpp::List read_fam_file(const std::string& filename);
+RcppExport SEXP _StratGWAS_read_fam_file(SEXP filenameSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    rcpp_result_gen = Rcpp::wrap(read_fam_file(filename));
+    return rcpp_result_gen;
+END_RCPP
+}
 // he
 Rcpp::NumericVector he(const Eigen::MatrixXd& genotypes, const Rcpp::NumericVector& pheno);
 RcppExport SEXP _StratGWAS_he(SEXP genotypesSEXP, SEXP phenoSEXP) {
@@ -23,8 +45,62 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// he_multi
+Rcpp::NumericMatrix he_multi(const Eigen::MatrixXd& genotypes, const Rcpp::NumericMatrix& pheno);
+RcppExport SEXP _StratGWAS_he_multi(SEXP genotypesSEXP, SEXP phenoSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const Eigen::MatrixXd& >::type genotypes(genotypesSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::NumericMatrix& >::type pheno(phenoSEXP);
+    rcpp_result_gen = Rcpp::wrap(he_multi(genotypes, pheno));
+    return rcpp_result_gen;
+END_RCPP
+}
+// he_multi_part
+Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_mat, int block_size);
+RcppExport SEXP _StratGWAS_he_multi_part(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP block_sizeSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
+    Rcpp::traits::input_parameter< int >::type block_size(block_sizeSEXP);
+    rcpp_result_gen = Rcpp::wrap(he_multi_part(filename, pheno_mat, block_size));
+    return rcpp_result_gen;
+END_RCPP
+}
+// computeLDscoresFromBED
+NumericVector computeLDscoresFromBED(std::string file_prefix, int n_ind, int n_snp);
+RcppExport SEXP _StratGWAS_computeLDscoresFromBED(SEXP file_prefixSEXP, SEXP n_indSEXP, SEXP n_snpSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< std::string >::type file_prefix(file_prefixSEXP);
+    Rcpp::traits::input_parameter< int >::type n_ind(n_indSEXP);
+    Rcpp::traits::input_parameter< int >::type n_snp(n_snpSEXP);
+    rcpp_result_gen = Rcpp::wrap(computeLDscoresFromBED(file_prefix, n_ind, n_snp));
+    return rcpp_result_gen;
+END_RCPP
+}
+// linear_gwas
+Rcpp::NumericMatrix linear_gwas(const std::string& filename, const std::string& pheno_file, const std::string& out_file, int n_inds, int n_snps, int block_size);
+RcppExport SEXP _StratGWAS_linear_gwas(SEXP filenameSEXP, SEXP pheno_fileSEXP, SEXP out_fileSEXP, SEXP n_indsSEXP, SEXP n_snpsSEXP, SEXP block_sizeSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type pheno_file(pheno_fileSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type out_file(out_fileSEXP);
+    Rcpp::traits::input_parameter< int >::type n_inds(n_indsSEXP);
+    Rcpp::traits::input_parameter< int >::type n_snps(n_snpsSEXP);
+    Rcpp::traits::input_parameter< int >::type block_size(block_sizeSEXP);
+    rcpp_result_gen = Rcpp::wrap(linear_gwas(filename, pheno_file, out_file, n_inds, n_snps, block_size));
+    return rcpp_result_gen;
+END_RCPP
+}
 // readBedBlock
-IntegerMatrix readBedBlock(std::string filename, int n_ind, int n_snp, int start_ind, int end_ind, int start_snp, int end_snp);
+Rcpp::IntegerMatrix readBedBlock(std::string filename, int n_ind, int n_snp, int start_ind, int end_ind, int start_snp, int end_snp);
 RcppExport SEXP _StratGWAS_readBedBlock(SEXP filenameSEXP, SEXP n_indSEXP, SEXP n_snpSEXP, SEXP start_indSEXP, SEXP end_indSEXP, SEXP start_snpSEXP, SEXP end_snpSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
@@ -42,7 +118,13 @@ END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_StratGWAS_read_bim_file", (DL_FUNC) &_StratGWAS_read_bim_file, 1},
+    {"_StratGWAS_read_fam_file", (DL_FUNC) &_StratGWAS_read_fam_file, 1},
     {"_StratGWAS_he", (DL_FUNC) &_StratGWAS_he, 2},
+    {"_StratGWAS_he_multi", (DL_FUNC) &_StratGWAS_he_multi, 2},
+    {"_StratGWAS_he_multi_part", (DL_FUNC) &_StratGWAS_he_multi_part, 3},
+    {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 3},
+    {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 6},
     {"_StratGWAS_readBedBlock", (DL_FUNC) &_StratGWAS_readBedBlock, 7},
     {NULL, NULL, 0}
 };
