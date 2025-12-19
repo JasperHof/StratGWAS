@@ -2,6 +2,9 @@
 #'
 #' Compute genetic covariance of subgroups using Haseman-Elston regression
 #'
+#' @useDynLib StratGWAS, .registration = TRUE
+#' @importFrom Rcpp sourceCpp
+#' 
 #' @param strata An object returned from stratify()
 #' @param filename Prefix of genotype .bed file
 #' @return Returns covariance matrix of the strata
