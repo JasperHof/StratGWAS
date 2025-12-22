@@ -30,7 +30,8 @@ transform <- function(strata, gencov, outfile) {
 
   trans_pheno = cbind(ids, ids, 0)
   trans_pheno[match(names(trans_pred), trans_pheno[,1]),3] = trans_pred
+  colnames(trans_pheno) = c("FID", "IID", "Pheno")
 
   # Write to phenotype
-  write.table(trans_pheno, paste0(outfie, ".pheno"))
+  write.table(trans_pheno, paste0(outfile, ".pheno"), quote = F, row = F)
 }
