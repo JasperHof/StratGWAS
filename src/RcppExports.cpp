@@ -71,7 +71,7 @@ BEGIN_RCPP
 END_RCPP
 }
 // computeLDscoresFromBED
-NumericVector computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set);
+DataFrame computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set);
 RcppExport SEXP _StratGWAS_computeLDscoresFromBED(SEXP file_prefixSEXP, SEXP geno_setSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;

@@ -48,14 +48,16 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
 
   # Use for genetic correlations
   gencor = matrix(NA, K, K)
+  lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
+
   for(i in 1:K){
     for(j in i:K){
       if(i == j){
-        gencor[i,j] = ldsc(ss_list[[i]], lds)
+        gencor[i,j] = ldsc(ss_list[[i]], lds_matched)
       } else {
         ss1 = ss_list[[i]]
         ss2 = ss_list[[j]]
-        cor = ldsc_cor(ss_list[[i]], ss_list[[j]], lds)
+        cor = ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
         gencor[i,j] = gencor[j,i] = cor$cov_g
       }
     }

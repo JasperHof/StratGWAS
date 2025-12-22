@@ -73,7 +73,7 @@ Eigen::MatrixXd convert_and_impute(const IntegerMatrix &geno, const std::vector<
 
 // [[Rcpp::depends(RcppEigen)]]
 // [[Rcpp::export]]
-NumericVector computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set) {
+DataFrame computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set) {
 
   // Read BIM and FAM files
   List bim = read_bim_file(file_prefix);
@@ -81,6 +81,8 @@ NumericVector computeLDscoresFromBED(std::string file_prefix, IntegerVector geno
 
   IntegerVector chr = bim["chr"];
   IntegerVector pos = bim["pos"];
+  CharacterVector snp = bim["snp"];
+
   int n_snp = chr.size();
   int n_ind_total = as<CharacterVector>(fam["iid"]).size();
 
@@ -161,5 +163,9 @@ NumericVector computeLDscoresFromBED(std::string file_prefix, IntegerVector geno
     start_snp += max_block;
   }
 
-  return ldscore;
+  return DataFrame::create(
+    Named("Predictor") = snp,
+    Named("Tagging") = ldscore,
+    _["stringsAsFactors"] = false
+  );
 }
