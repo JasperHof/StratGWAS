@@ -4,14 +4,14 @@
 \alias{ldsc_cor}
 \title{LD score regression for genetic correlation}
 \usage{
-ldsc_cor(sumstats1_file, sumstats2_file, ldscores)
+ldsc_cor(ss1, ss2, ldscores)
 }
 \arguments{
+\item{ldscores}{Numeric vector of LD scoees}
+
 \item{sumstats1_file}{Summary statistics of phenotype 1}
 
 \item{sumstats2_file}{Summary statistics of phenotype 2}
-
-\item{ldscores}{Numeric vector of LD scoees}
 }
 \value{
 Numeric vector: h2

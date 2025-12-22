@@ -15,121 +15,154 @@ using Eigen::Matrix2d;
 using Eigen::Vector2d;
 
 // [[Rcpp::export]]
-Rcpp::NumericMatrix linear_gwas(const std::string& filename, const std::string& pheno_file, const std::string& out_file, int n_inds, int n_snps, int block_size) {
+Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_mat, int block_size, const std::string& out_file) {
     
-    std::string bed_file = filename + ".bed";
-    std::string bim_file = filename + ".bim";
-    std::string fam_file = filename + ".fam";
+    // Read in .bim and .fam file
+    List bim = read_bim_file(filename);
+    List fam = read_fam_file(filename);
 
-    // Read phenotype file using R's read.table and make it numerical matrix
-    DataFrame pheno_df = Rcpp::as<DataFrame>(Rcpp::Function("read.table")(pheno_file, Named("header", true)));
-    
-    int n_pheno = pheno_df.size() - 2;       // number of columns
-    int nr_blocks = n_snps / block_size; // note that we actually want to have floor, which is automatically done
-
-    NumericMatrix pheno(n_inds, n_pheno);
-    for (int j = 0; j < n_pheno; ++j) {
-        Rcpp::NumericVector col = pheno_df[j + 2];
-        pheno(_, j) = col;
-    }
-
-    // Read BIM file into Rcpp vectors
-    Rcpp::List bim = read_bim_file(filename);
     Rcpp::CharacterVector snp = bim["snp"];
     Rcpp::IntegerVector chr = bim["chr"];
     Rcpp::IntegerVector pos = bim["pos"];
     Rcpp::CharacterVector a1 = bim["a1"];
     Rcpp::CharacterVector a2 = bim["a2"];
 
-    // Open output files for each phenotype
+    CharacterVector geno_iid = fam["iid"];
+    int n_total_inds = geno_iid.size();
+    int n_snps = snp.size();
+
+    Rcpp::Rcout << "Number of individuals (from .fam): " << n_total_inds << std::endl;
+    Rcpp::Rcout << "Number of SNPs (from .bim): " << n_snps << std::endl;   
+
+    // Read in phenotype
+    Rcpp::NumericMatrix pheno;
+    CharacterVector pheno_ids;
+
+    if (Rf_isMatrix(pheno_mat) && !Rf_isNull(rownames(pheno_mat))) { // Case 1: rownames as IDs
+        pheno = as<NumericMatrix>(pheno_mat);
+        pheno_ids = rownames(pheno_mat);
+    } else {
+        stop("Phenotype must be a numerical matrix with IDs as rownames");
+    }
+
+    int n_pheno = pheno.cols();
+
+    // Match phenotype ids to genotype ids
+    IntegerVector match_idx = match(geno_iid, pheno_ids);
+    std::vector<int> geno_keep;
+    std::vector<int> pheno_keep;
+
+    for (int i = 0; i < match_idx.size(); ++i) {
+        if (match_idx[i] != NA_INTEGER) {
+            geno_keep.push_back(i);
+            pheno_keep.push_back(match_idx[i] - 1); // R → C++ index
+        }
+    }
+
+    if (geno_keep.empty())
+        stop("No overlapping individuals between genotype and phenotype");
+    
+    // Reorder phenotype to match genotype
+    NumericMatrix pheno_sub(geno_keep.size(), n_pheno);
+    for (size_t i = 0; i < geno_keep.size(); ++i) {
+        for (int j = 0; j < n_pheno; ++j) {
+            pheno_sub(i, j) = pheno(pheno_keep[i], j);
+        }
+    }
+
+    pheno = pheno_sub;
+
+    int n_inds = pheno.nrow(); // note that this is different from n_total_inds (genotype dim)
+    Rcout << "Will be using " << n_inds << " overlapping individuals\n";
+
+    // Open output files for each phenotype and write header
     std::vector<std::ofstream> out_files(n_pheno);
     for(int i = 0; i < n_pheno; ++i) {
         std::string fname = out_file + ".pheno" + std::to_string(i+1);
         out_files[i].open(fname, std::ios::out);
-        // write header
         out_files[i] << "Chromosome\tPredictor\tBasepair\tA1\tA2\tBeta\tSE\tChisq\tP\tN\tMAF\tMiss\n";
     }
 
+    int nr_blocks = n_snps / block_size;
+
     for(int b = 0; b < nr_blocks; ++b){
 
-        Rcout << "Performing linear regression for block " << b << "\n";
+        Rcout << "Performing linear regression for block " << b + 1 << "/" << nr_blocks << "\n";
 
-        // read in the genotype - need to optimize the matrix later
         int block_start = b * block_size;
         int block_end = std::min(n_snps - 1, (b + 1) * block_size - 1); // make sure you don't exceed n_snps
         int n_snps_block = block_end - block_start + 1;
 
-        Rcpp::IntegerMatrix geno_block = readBedBlock(
-            bed_file, 
-            n_inds, n_snps, 
-            0, n_inds - 1,              // full range of individuals
-            block_start, block_end      // full range of SNPs
+        // Read in the genotype and subset
+        IntegerMatrix geno_block = readBedBlock(
+            filename + ".bed",
+            n_total_inds, n_snps,
+            0, n_total_inds - 1,
+            block_start, block_end
         );
-        Eigen::MatrixXd genotypes = Rcpp::as<Eigen::MatrixXd>(geno_block);
+        IntegerMatrix geno_sub(n_inds, n_snps_block);
+        for (int i = 0; i < n_inds; ++i)
+            for (int s = 0; s < n_snps_block; ++s)
+                geno_sub(i, s) = geno_block(geno_keep[i], s);
+        
+        Eigen::MatrixXd G = as<Eigen::MatrixXd>(geno_sub);
 
         // Compute MAF and missingness
-        Rcpp::NumericVector maf = computeMAF(geno_block);
-        Rcpp::NumericVector miss = computeMissingness(geno_block);
+        Rcpp::NumericVector maf = computeMAF(geno_sub);
+        Rcpp::NumericVector miss = computeMissingness(geno_sub);
 
-        // Standardize columns - for one parameter alpha
-        for (int col = 0; col < genotypes.cols(); ++col) {
-            
-            Eigen::VectorXd v = genotypes.col(col);
-           
+        // Standardize genotypes
+        for (int s = 0; s < G.cols(); ++s) {
+            Eigen::VectorXd v = G.col(s);
             double mean = v.mean();
-            double stddev = std::sqrt((v.array() - mean).square().sum() / (v.size() - 1));
-            
-            if (stddev > 0) {
-                genotypes.col(col) = (v.array() - mean) / stddev;
-            } else {
-                genotypes.col(col).setZero(); // trivial column (all same value), set to zero
-            }
+            double sd = std::sqrt((v.array() - mean).square().sum() / (v.size() - 1));
+            if (sd > 0)
+                G.col(s) = (v.array() - mean) / sd;
+            else
+                G.col(s).setZero();
         }
 
-        for(int i = 0; i < n_pheno; ++i){
+        // Perform the linear regression for each phenotype
+        for (int p = 0; p < n_pheno; ++p) {
                 
-            Eigen::VectorXd y = Eigen::VectorXd::Map(pheno.column(i).begin(), pheno.nrow());
+            Eigen::VectorXd y = Eigen::Map<Eigen::VectorXd>(
+                pheno.column(p).begin(), n_inds);
 
-            // Pre-allocate SNP outside
-            std::vector<double> x_nonmiss(n_inds);
-            std::vector<double> y_nonmiss(n_inds);
+            // Pre-allocate SNP
+            std::vector<double> xbuf(n_inds);
+            std::vector<double> ybuf(n_inds);
 
             // now loop over the SNPs
             for (int s = 0; s < n_snps_block; ++s) {
-             
+
                 int n_used = 0;
 
-                // Fill pre-allocated vectors
-                for (int ind = 0; ind < n_inds; ++ind) {
-                    int g = geno_block(ind, s);
-                    if (g != -1 && !NumericVector::is_na(y(ind))) {
-                        x_nonmiss[n_used] = genotypes(ind, s);
-                        y_nonmiss[n_used] = y(ind);
+                for (int i = 0; i < n_inds; ++i) {
+                    if (geno_sub(i, s) != -1 && !NumericVector::is_na(y(i))) {
+                        xbuf[n_used] = G(i, s);
+                        ybuf[n_used] = y(i);
                         n_used++;
                     }
                 }
 
-                // Use Eigen::Map on pre-allocated vectors
-                Eigen::Map<Eigen::VectorXd> xs2(x_nonmiss.data(), n_used);
-                Eigen::Map<Eigen::VectorXd> ys2(y_nonmiss.data(), n_used);
+                double beta = NA_REAL, se = NA_REAL, chisq = NA_REAL, pval = NA_REAL;
 
-                double xTx = xs2.dot(xs2);
-                double beta = 0.0, se = NA_REAL, chisq = NA_REAL, pval = NA_REAL;
+                if (n_used > 2) {
+                    Eigen::Map<Eigen::VectorXd> xs(xbuf.data(), n_used);
+                    Eigen::Map<Eigen::VectorXd> ys(ybuf.data(), n_used);
 
-                if (xTx > 0) {
-                    double xTy = xs2.dot(ys2);
-                    beta = xTy / xTx;
-
-                    double rss = (ys2 - xs2 * beta).squaredNorm();
-                    double residual_var = rss / (n_used - 2);
-
-                    se    = std::sqrt(residual_var / xTx);
-                    chisq = (beta / se) * (beta / se);
-                    pval  = 1.0 - R::pchisq(chisq, 1, 1, 0);   // upper tail
+                    double xTx = xs.dot(xs);
+                    if (xTx > 0) {
+                        beta = xs.dot(ys) / xTx;
+                        double rss = (ys - xs * beta).squaredNorm();
+                        double sigma2 = rss / (n_used - 2);
+                        se = std::sqrt(sigma2 / xTx);
+                        chisq = (beta / se) * (beta / se);
+                        pval = R::pchisq(chisq, 1, false, false);
+                    }
                 }
-                
-                // Write output line
-                out_files[i]
+
+                out_files[p]
                     << chr[block_start + s] << "\t"
                     << snp[block_start + s] << "\t"
                     << pos[block_start + s] << "\t"

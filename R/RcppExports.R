@@ -25,8 +25,8 @@ computeLDscoresFromBED <- function(file_prefix, n_ind, n_snp) {
     .Call(`_StratGWAS_computeLDscoresFromBED`, file_prefix, n_ind, n_snp)
 }
 
-linear_gwas <- function(filename, pheno_file, out_file, n_inds, n_snps, block_size) {
-    .Call(`_StratGWAS_linear_gwas`, filename, pheno_file, out_file, n_inds, n_snps, block_size)
+linear_gwas <- function(filename, pheno_mat, block_size, out_file) {
+    .Call(`_StratGWAS_linear_gwas`, filename, pheno_mat, block_size, out_file)
 }
 
 readBedBlock <- function(filename, n_ind, n_snp, start_ind, end_ind, start_snp, end_snp) {

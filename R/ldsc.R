@@ -6,12 +6,12 @@
 #' @param ldscores Numeric vector of LD scoees
 #' @return Numeric vector: h2
 #' @export
-ldsc <- function(sumstats_file, ldscores) {
+ldsc <- function(ss, ldscores) {
   
   # Read in summary statistics
-  ss <- read.table(sumstats_file, head = T)
 
-  if(dim(ss)[1] != length(ldscores)) stop("summary statistics and LD scores should be of the same size")
+  ldscores = as.numeric(ldscores)
+  if(dim(ss)[1] != length(ldscores)) stop("Summary statistics and LD scores should be of the same size")
 
   y <- ss$Chisq - 1
   M <- nrow(ss)

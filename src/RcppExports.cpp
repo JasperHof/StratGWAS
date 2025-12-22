@@ -84,18 +84,16 @@ BEGIN_RCPP
 END_RCPP
 }
 // linear_gwas
-Rcpp::NumericMatrix linear_gwas(const std::string& filename, const std::string& pheno_file, const std::string& out_file, int n_inds, int n_snps, int block_size);
-RcppExport SEXP _StratGWAS_linear_gwas(SEXP filenameSEXP, SEXP pheno_fileSEXP, SEXP out_fileSEXP, SEXP n_indsSEXP, SEXP n_snpsSEXP, SEXP block_sizeSEXP) {
+Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_mat, int block_size, const std::string& out_file);
+RcppExport SEXP _StratGWAS_linear_gwas(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP block_sizeSEXP, SEXP out_fileSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
-    Rcpp::traits::input_parameter< const std::string& >::type pheno_file(pheno_fileSEXP);
-    Rcpp::traits::input_parameter< const std::string& >::type out_file(out_fileSEXP);
-    Rcpp::traits::input_parameter< int >::type n_inds(n_indsSEXP);
-    Rcpp::traits::input_parameter< int >::type n_snps(n_snpsSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
     Rcpp::traits::input_parameter< int >::type block_size(block_sizeSEXP);
-    rcpp_result_gen = Rcpp::wrap(linear_gwas(filename, pheno_file, out_file, n_inds, n_snps, block_size));
+    Rcpp::traits::input_parameter< const std::string& >::type out_file(out_fileSEXP);
+    rcpp_result_gen = Rcpp::wrap(linear_gwas(filename, pheno_mat, block_size, out_file));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -124,7 +122,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_he_multi", (DL_FUNC) &_StratGWAS_he_multi, 2},
     {"_StratGWAS_he_multi_part", (DL_FUNC) &_StratGWAS_he_multi_part, 3},
     {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 3},
-    {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 6},
+    {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},
     {"_StratGWAS_readBedBlock", (DL_FUNC) &_StratGWAS_readBedBlock, 7},
     {NULL, NULL, 0}
 };

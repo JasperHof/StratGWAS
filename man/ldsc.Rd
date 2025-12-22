@@ -4,12 +4,12 @@
 \alias{ldsc}
 \title{LD score regression}
 \usage{
-ldsc(sumstats_file, ldscores)
+ldsc(ss, ldscores)
 }
 \arguments{
-\item{sumstats_file}{Summary statistics}
-
 \item{ldscores}{Numeric vector of LD scoees}
+
+\item{sumstats_file}{Summary statistics}
 }
 \value{
 Numeric vector: h2
