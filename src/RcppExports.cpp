@@ -71,15 +71,14 @@ BEGIN_RCPP
 END_RCPP
 }
 // computeLDscoresFromBED
-NumericVector computeLDscoresFromBED(std::string file_prefix, int n_ind, int n_snp);
-RcppExport SEXP _StratGWAS_computeLDscoresFromBED(SEXP file_prefixSEXP, SEXP n_indSEXP, SEXP n_snpSEXP) {
+NumericVector computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set);
+RcppExport SEXP _StratGWAS_computeLDscoresFromBED(SEXP file_prefixSEXP, SEXP geno_setSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< std::string >::type file_prefix(file_prefixSEXP);
-    Rcpp::traits::input_parameter< int >::type n_ind(n_indSEXP);
-    Rcpp::traits::input_parameter< int >::type n_snp(n_snpSEXP);
-    rcpp_result_gen = Rcpp::wrap(computeLDscoresFromBED(file_prefix, n_ind, n_snp));
+    Rcpp::traits::input_parameter< IntegerVector >::type geno_set(geno_setSEXP);
+    rcpp_result_gen = Rcpp::wrap(computeLDscoresFromBED(file_prefix, geno_set));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -121,7 +120,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_he", (DL_FUNC) &_StratGWAS_he, 2},
     {"_StratGWAS_he_multi", (DL_FUNC) &_StratGWAS_he_multi, 2},
     {"_StratGWAS_he_multi_part", (DL_FUNC) &_StratGWAS_he_multi_part, 3},
-    {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 3},
+    {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 2},
     {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},
     {"_StratGWAS_readBedBlock", (DL_FUNC) &_StratGWAS_readBedBlock, 7},
     {NULL, NULL, 0}

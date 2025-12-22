@@ -4,7 +4,7 @@
 \alias{gencov_ldsc}
 \title{LD score regression}
 \usage{
-gencov_ldsc(strata, filename, nr_blocks = 1000, outfile, tag)
+gencov_ldsc(strata, filename, nr_blocks = 1000, outfile)
 }
 \arguments{
 \item{strata}{An object returned from stratify()}

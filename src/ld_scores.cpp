@@ -32,30 +32,40 @@ int max_snps_in_1mb_block(IntegerVector chr, IntegerVector pos, int window_size 
 }
 
 // Helper function to impute missing values and standardise
-Eigen::MatrixXd convert_and_impute(const IntegerMatrix &geno) {
-  int N = geno.nrow();
+Eigen::MatrixXd convert_and_impute(const IntegerMatrix &geno, const std::vector<int> &inds_subset) {
+  int N = inds_subset.size();
   int M = geno.ncol();
   Eigen::MatrixXd G(N, M);
 
-  for (int c = 0; c < M; c++) {
-      // impute mean genotype
-      double sum = 0;
+  for(int c = 0; c < M; c++) {
+      Eigen::ArrayXd col(N);
+      double sum = 0.0;
       int cnt = 0;
-      for (int r = 0; r < N; r++) {  
-          int g = geno(r, c);
-          if (g >= 0) { sum += g; cnt++; }
-      }
-      double mean = (cnt > 0 ? sum / cnt : 0.0);
-      for (int r = 0; r < N; r++) {
-          int g = geno(r, c);
-          G(r, c) = (g >= 0 ? g : mean);
+
+      // One-pass imputation
+      for(int r = 0; r < N; r++) {
+        int g = geno(inds_subset[r], c);
+          if(g >= 0) {
+              col(r) = g;
+              sum += g;
+              cnt++;
+          } else {
+              col(r) = NAN;  // temporarily mark missing
+          }
       }
 
-      // standardize
-      Eigen::VectorXd v = G.col(c);
-      double sd = std::sqrt((v.array() - v.mean()).square().sum() / (N - 1));
-      if (sd > 0) G.col(c) = (v.array() - v.mean()) / sd;
-      else G.col(c).setZero();
+      double mean = (cnt > 0) ? sum / cnt : 0.0;
+      for(int r = 0; r < N; r++) {
+          if(std::isnan(col(r))) col(r) = mean;
+      }
+
+      // Standardize
+      double col_mean = col.mean();
+      double col_sd = std::sqrt((col - col_mean).square().sum() / (N - 1));
+      if(col_sd > 0) col = (col - col_mean) / col_sd;
+      else col.setZero();
+
+      G.col(c) = col.matrix();
   }
 
   return G;
@@ -63,30 +73,41 @@ Eigen::MatrixXd convert_and_impute(const IntegerMatrix &geno) {
 
 // [[Rcpp::depends(RcppEigen)]]
 // [[Rcpp::export]]
-NumericVector computeLDscoresFromBED(std::string file_prefix, int n_ind, int n_snp) {
+NumericVector computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set) {
 
-  // Call the new function and extract vectors
+  // Read BIM and FAM files
   List bim = read_bim_file(file_prefix);
-  CharacterVector snp = bim["snp"];
+  List fam = read_fam_file(file_prefix);
+
   IntegerVector chr = bim["chr"];
   IntegerVector pos = bim["pos"];
-  CharacterVector a1 = bim["a1"];
-  CharacterVector a2 = bim["a2"];
+  int n_snp = chr.size();
+  int n_ind_total = as<CharacterVector>(fam["iid"]).size();
 
-  // Compute maximum number of SNPs within 1Mb to determine sliding block size
+  // convert R indices to 0-based C++ indices
+  std::vector<int> inds_subset(geno_set.size());
+  for(int i = 0; i < geno_set.size(); ++i) inds_subset[i] = geno_set[i] - 1;
+
+  int n_ind = inds_subset.size();
+  Rcout << "Number of individuals = " << n_ind << ", number of SNPs = " << n_snp << "\n";
+
+  // Determine block size
   int max_block = max_snps_in_1mb_block(chr, pos, 1e6);
   Rcout << "Largest 1Mb SNP block = " << max_block << "\n";
-
   int read_block_size = 2 * max_block;
-  NumericVector ldscore(n_snp);
 
+  NumericVector ldscore(n_snp, 0.0);
   int start_snp = 0;
 
   // Strategy: read in blocks at a time to reduce memory. First find the maximum index distance that covers 1Mb? 
   while(start_snp < n_snp) {
-    int end_snp = std::min(start_snp + read_block_size - 1, n_snp - 1);
+
+    Rcout << "Reading SNP " << start_snp << "/" << n_snp << "\n";
 
     // Determine the indices to compute LD for in this block
+    int end_snp = std::min(start_snp + read_block_size - 1, n_snp - 1);
+    int n_block = end_snp - start_snp + 1;
+
     int compute_start, compute_end;
 
     if(start_snp == 0 && end_snp == n_snp - 1) {
@@ -94,41 +115,46 @@ NumericVector computeLDscoresFromBED(std::string file_prefix, int n_ind, int n_s
         compute_start = 0;
         compute_end = end_snp;
     } else if(start_snp == 0) {
-        // first block
+        // First block
         compute_start = 0;
         compute_end = std::min(start_snp + 3 * max_block / 2 - 1, n_snp - 1) - start_snp;
     } else if(end_snp == n_snp - 1) {
-        // last block
+        // Last block
         compute_start = max_block / 2;
         compute_end = end_snp - start_snp;
     } else {
-        // middle block
+        // Middle block
         compute_start = max_block / 2;
         compute_end = std::min(3 * max_block / 2 - 1, end_snp - start_snp);
     }
 
     // Read BED block
     IntegerMatrix geno = readBedBlock(file_prefix + ".bed",
-                                      n_ind, n_snp,
-                                      0, n_ind - 1,
+                                      n_ind_total, n_snp,
+                                      0, n_ind_total - 1,
                                       start_snp, end_snp);
 
-    Eigen::MatrixXd G = convert_and_impute(geno);
+    Eigen::MatrixXd G = convert_and_impute(geno, inds_subset);
 
-    // Compute LD scores for this block
-    for(int j = compute_start; j <= compute_end; ++j){
-        int global_j = start_snp + j;
-        double sum_r2 = 0.0;
+    // Compute correlation matrix for the block
+    Eigen::MatrixXd cor = (G.transpose() * G) / (n_ind - 1);
 
-        for(int k = 0; k < G.cols(); ++k){
-            int global_k = start_snp + k;
-            if(chr[global_j] != chr[global_k]) continue;
-            if(std::abs(pos[global_j] - pos[global_k]) > 1e6) continue;
+    // Compute LD scores
+    for(int j = compute_start; j <= compute_end; ++j) {
+      int global_j = start_snp + j;
+      double sum_r2 = 0.0;
 
-            double r = G.col(j).dot(G.col(k)) / (n_ind - 1);
-            sum_r2 += r * r;
-        }
-        ldscore[global_j] = sum_r2;
+      // Only consider SNPs on same chromosome within 1Mb
+      for(int k = 0; k < n_block; ++k) {
+          int global_k = start_snp + k;
+          if(chr[global_j] != chr[global_k]) continue;
+          if(std::abs(pos[global_j] - pos[global_k]) > 1e6) continue;
+
+          double r = cor(j, k);
+          sum_r2 += r * r;
+      }
+
+      ldscore[global_j] = sum_r2;
     }
 
     // Slide forward by max_block

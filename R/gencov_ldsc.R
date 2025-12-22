@@ -11,12 +11,9 @@
 #' @param tag Numerical matrix containing LD scores
 #' @return Returns covariance matrix of the strata
 #' @export
-gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, tag) {
+gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
   
   # <performs some checks here> #
-
-  bim <- read.table(paste0(filename, ".bim"))
-  overlap <- intersect(bim[,2], tag$Predictor)
 
   # Read in data as multivariate phenotype
   K = strata$K
@@ -36,20 +33,30 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, tag) {
   # Read in the linear regressions in list
   ss_list = vector("list", K)
   for(k in 1:K){
-    ss = read.table(paste0(outfile, ".pheno",k), head = T)
-    ss_list[[k]] = ss[match(overlap, ss$Predictor),]
+    ss_list[[k]] = read.table(paste0(outfile, ".pheno",k), head = T)
   }
 
+  # Compute LD scores for a subset of 1000 samples
+  if (length(ids) > 1000) {
+    geno_set <- sample(1:length(ids), size = 1000)
+  } else {
+    geno_set <- 1:length(ids)
+  }
+  geno_set = geno_set[order(geno_set)]
+
+  lds = computeLDscoresFromBED(filename, geno_set)
+
+  # Use for genetic correlations
   gencor = matrix(NA, K, K)
   for(i in 1:K){
     for(j in i:K){
       if(i == j){
-        gencor[i,j] = ldsc(ss_list[[i]], tag$Tagging[match(overlap, tag$Predictor)])
+        gencor[i,j] = ldsc(ss_list[[i]], lds)
       } else {
         ss1 = ss_list[[i]]
         ss2 = ss_list[[j]]
         ldscores = tag$Tagging[match(overlap, tag$Predictor)]
-        cor = ldsc_cor(ss_list[[i]], ss_list[[j]], tag$Tagging[match(overlap, tag$Predictor)])
+        cor = ldsc_cor(ss_list[[i]], ss_list[[j]], lds)
         gencor[i,j] = gencor[j,i] = cor$cov_g
       }
     }

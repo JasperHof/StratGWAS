@@ -21,8 +21,8 @@ he_multi_part <- function(filename, pheno_mat, block_size) {
     .Call(`_StratGWAS_he_multi_part`, filename, pheno_mat, block_size)
 }
 
-computeLDscoresFromBED <- function(file_prefix, n_ind, n_snp) {
-    .Call(`_StratGWAS_computeLDscoresFromBED`, file_prefix, n_ind, n_snp)
+computeLDscoresFromBED <- function(file_prefix, geno_set) {
+    .Call(`_StratGWAS_computeLDscoresFromBED`, file_prefix, geno_set)
 }
 
 linear_gwas <- function(filename, pheno_mat, block_size, out_file) {
