@@ -10,6 +10,10 @@ gencov_ldsc(strata, filename, nr_blocks = 1000, outfile, tag)
 \item{strata}{An object returned from stratify()}
 
 \item{filename}{Prefix of genotype .bed file}
+
+\item{outfile}{Name of output file for strata-specific summary statistics}
+
+\item{tag}{Numerical matrix containing LD scores}
 }
 \value{
 Returns covariance matrix of the strata

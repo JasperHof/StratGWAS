@@ -8,11 +8,13 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <sstream>
 
 using namespace Rcpp;
-
 using Eigen::Matrix2d;
 using Eigen::Vector2d;
+using Eigen::MatrixXd;
+using Eigen::VectorXd;
 
 // [[Rcpp::export]]
 Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_mat, int block_size, const std::string& out_file) {
@@ -34,21 +36,18 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
     Rcpp::Rcout << "Number of individuals (from .fam): " << n_total_inds << std::endl;
     Rcpp::Rcout << "Number of SNPs (from .bim): " << n_snps << std::endl;   
 
-    // Read in phenotype
-    Rcpp::NumericMatrix pheno;
-    CharacterVector pheno_ids;
-
-    if (Rf_isMatrix(pheno_mat) && !Rf_isNull(rownames(pheno_mat))) { // Case 1: rownames as IDs
-        pheno = as<NumericMatrix>(pheno_mat);
-        pheno_ids = rownames(pheno_mat);
-    } else {
+    // Read phenotype
+    if (!Rf_isMatrix(pheno_mat) || Rf_isNull(rownames(pheno_mat)))
         stop("Phenotype must be a numerical matrix with IDs as rownames");
-    }
+
+    NumericMatrix pheno = as<NumericMatrix>(pheno_mat);
+    CharacterVector pheno_ids = rownames(pheno);
 
     int n_pheno = pheno.cols();
 
     // Match phenotype ids to genotype ids
     IntegerVector match_idx = match(geno_iid, pheno_ids);
+
     std::vector<int> geno_keep;
     std::vector<int> pheno_keep;
 
@@ -61,19 +60,18 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
 
     if (geno_keep.empty())
         stop("No overlapping individuals between genotype and phenotype");
-    
+    int n_inds = geno_keep.size();
+    Rcout << "Using " << n_inds << " individuals\n";
+
     // Reorder phenotype to match genotype
-    NumericMatrix pheno_sub(geno_keep.size(), n_pheno);
-    for (size_t i = 0; i < geno_keep.size(); ++i) {
+    NumericMatrix pheno_sub(n_inds, n_pheno);
+    for (size_t i = 0; i < n_inds; ++i) {
         for (int j = 0; j < n_pheno; ++j) {
             pheno_sub(i, j) = pheno(pheno_keep[i], j);
         }
     }
 
     pheno = pheno_sub;
-
-    int n_inds = pheno.nrow(); // note that this is different from n_total_inds (genotype dim)
-    Rcout << "Will be using " << n_inds << " overlapping individuals\n";
 
     // Open output files for each phenotype and write header
     std::vector<std::ofstream> out_files(n_pheno);
@@ -111,7 +109,8 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
         Rcpp::NumericVector maf = computeMAF(geno_sub);
         Rcpp::NumericVector miss = computeMissingness(geno_sub);
 
-        // Standardize genotypes
+        // Standardize genotypes -- now moved to per-SNP loop
+        /*
         for (int s = 0; s < G.cols(); ++s) {
             Eigen::VectorXd v = G.col(s);
             double mean = v.mean();
@@ -121,61 +120,98 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
             else
                 G.col(s).setZero();
         }
+        */
 
         // Perform the linear regression for each phenotype
         for (int p = 0; p < n_pheno; ++p) {
                 
-            Eigen::VectorXd y = Eigen::Map<Eigen::VectorXd>(
-                pheno.column(p).begin(), n_inds);
+            // Phenotype vector + mask
+            VectorXd y(n_inds);
+            VectorXd y_mask(n_inds);
 
-            // Pre-allocate SNP
-            std::vector<double> xbuf(n_inds);
-            std::vector<double> ybuf(n_inds);
+            for (int i = 0; i < n_inds; ++i) {
+                if (NumericVector::is_na(pheno(i, p))) {
+                    y(i) = 0.0;
+                    y_mask(i) = 0.0;
+                } else {
+                    y(i) = pheno(i, p);
+                    y_mask(i) = 1.0;
+                }
+            }
 
-            // now loop over the SNPs
+            double yTy = y.squaredNorm();
+            int n_y = y_mask.sum();
+
+            // -----------------------------
+            // Standardize genotype block
+            // -----------------------------
+
+            MatrixXd G(n_inds, n_snps_block);
+
             for (int s = 0; s < n_snps_block; ++s) {
 
+                double sum = 0.0, sumsq = 0.0;
                 int n_used = 0;
 
                 for (int i = 0; i < n_inds; ++i) {
-                    if (geno_sub(i, s) != -1 && !NumericVector::is_na(y(i))) {
-                        xbuf[n_used] = G(i, s);
-                        ybuf[n_used] = y(i);
+                    int g = geno_sub(i, s);
+                    if (g != -1 && y_mask(i)) {
+                        sum += g;
+                        sumsq += g * g;
                         n_used++;
                     }
                 }
 
-                double beta = NA_REAL, se = NA_REAL, chisq = NA_REAL, pval = NA_REAL;
+                double mean = sum / n_used;
+                double var = (sumsq - n_used * mean * mean) / (n_used - 1);
+                double inv_sd = (var > 0) ? 1.0 / std::sqrt(var) : 0.0;
 
-                if (n_used > 2) {
-                    Eigen::Map<Eigen::VectorXd> xs(xbuf.data(), n_used);
-                    Eigen::Map<Eigen::VectorXd> ys(ybuf.data(), n_used);
-
-                    double xTx = xs.dot(xs);
-                    if (xTx > 0) {
-                        beta = xs.dot(ys) / xTx;
-                        double rss = (ys - xs * beta).squaredNorm();
-                        double sigma2 = rss / (n_used - 2);
-                        se = std::sqrt(sigma2 / xTx);
-                        chisq = (beta / se) * (beta / se);
-                        pval = R::pchisq(chisq, 1, false, false);
-                    }
+                for (int i = 0; i < n_inds; ++i) {
+                    int g = geno_sub(i, s);
+                    if (g != -1 && y_mask(i))
+                        G(i, s) = (g - mean) * inv_sd;
+                    else
+                        G(i, s) = 0.0;
                 }
-
-                out_files[p]
-                    << chr[block_start + s] << "\t"
-                    << snp[block_start + s] << "\t"
-                    << pos[block_start + s] << "\t"
-                    << a1[block_start + s]  << "\t"
-                    << a2[block_start + s]  << "\t"
-                    << beta << "\t"
-                    << se << "\t"
-                    << chisq << "\t"
-                    << pval << "\t"
-                    << n_used << "\t"
-                    << maf[s] << "\t"
-                    << miss[s] << "\n";
             }
+
+            // Vectorized regression
+            VectorXd XtY = G.transpose() * y;
+            std::ostringstream buffer;
+            // buffer.reserve(1 << 20);
+
+            for (int s = 0; s < n_snps_block; ++s) {
+
+                int n_used = n_y - miss[s];
+                if (n_used < 3) continue;
+
+                double beta = XtY(s) / (n_used - 1);
+                double se = std::sqrt(
+                    (yTy - beta * beta * (n_used - 1)) /
+                    ((n_used - 2) * (n_used - 1))
+                );
+
+                double chisq = (beta / se) * (beta / se);
+                double pval = R::pchisq(chisq, 1, false, false);
+
+                int idx = block_start + s;
+
+                buffer
+                    << chr[idx] << '\t'
+                    << snp[idx] << '\t'
+                    << pos[idx] << '\t'
+                    << a1[idx] << '\t'
+                    << a2[idx] << '\t'
+                    << beta << '\t'
+                    << se << '\t'
+                    << chisq << '\t'
+                    << pval << '\t'
+                    << n_used << '\t'
+                    << maf[s] << '\t'
+                    << miss[s] << '\n';
+            }
+
+            out_files[p] << buffer.str();
         }
     }
 
