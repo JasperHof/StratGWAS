@@ -8,7 +8,6 @@
 #' @param strata An object returned from stratify()
 #' @param filename Prefix of genotype .bed file
 #' @param outfile Name of output file for strata-specific summary statistics
-#' @param tag Numerical matrix containing LD scores
 #' @return Returns covariance matrix of the strata
 #' @export
 gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
@@ -55,7 +54,6 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
       } else {
         ss1 = ss_list[[i]]
         ss2 = ss_list[[j]]
-        ldscores = tag$Tagging[match(overlap, tag$Predictor)]
         cor = ldsc_cor(ss_list[[i]], ss_list[[j]], lds)
         gencor[i,j] = gencor[j,i] = cor$cov_g
       }
