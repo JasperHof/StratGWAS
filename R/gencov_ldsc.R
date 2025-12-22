@@ -8,6 +8,7 @@
 #' @param strata An object returned from stratify()
 #' @param filename Prefix of genotype .bed file
 #' @param outfile Name of output file for strata-specific summary statistics
+#' @param tag Numerical matrix containing LD scores
 #' @return Returns covariance matrix of the strata
 #' @export
 gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
@@ -27,7 +28,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
   rownames(multi) = ids
 
   # Perform a linear regression on the data
-  cor = linear_gwas(filename, multi, nr_blocks, outfile)
+  linear_gwas(filename, multi, nr_blocks, outfile)
 
   # Read in the linear regressions in list
   ss_list = vector("list", K)
