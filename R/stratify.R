@@ -9,7 +9,7 @@
 #' @export
 stratify <- function(pheno, strat, K = 5) {
   
-
+  # < perform some checks here > 
 
   # Read in summary statistics
   strata <- vector("list")
@@ -23,9 +23,10 @@ stratify <- function(pheno, strat, K = 5) {
   strat_cases$order = rank(strat_cases[,3])/length(strat_cases[,3])
   strat_cases$groups = cut(strat_cases$order, breaks = c(0,1:(K-1)/K,Inf), labels = 1:5)
 
-  # Create list with phenotype file for separate strata
+  # Create list with phenotype file for separate NORMALIZED strata
   for(k in 1:K){
-    strata[[paste0("group",k)]] = pheno[pheno[,3] == 0 | pheno[,1] %in% strat_cases[strat_cases$groups == k,1],]
+    strata[[paste0("group",k)]] = pheno[which(pheno[,3] == 0 | pheno[,1] %in% strat_cases[strat_cases$groups == k,1]),]
+    strata[[paste0("group",k)]][,3] = as.numeric(scale(strata[[paste0("group",k)]][,3]))
   }
 
   # < build in checks - check case distribution >

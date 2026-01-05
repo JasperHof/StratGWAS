@@ -42,7 +42,6 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
 
     NumericMatrix pheno = as<NumericMatrix>(pheno_mat);
     CharacterVector pheno_ids = rownames(pheno);
-
     int n_pheno = pheno.cols();
 
     // Match phenotype ids to genotype ids
@@ -60,6 +59,7 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
 
     if (geno_keep.empty())
         stop("No overlapping individuals between genotype and phenotype");
+
     int n_inds = geno_keep.size();
     Rcout << "Using " << n_inds << " individuals\n";
 
@@ -98,6 +98,7 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
             0, n_total_inds - 1,
             block_start, block_end
         );
+
         IntegerMatrix geno_sub(n_inds, n_snps_block);
         for (int i = 0; i < n_inds; ++i)
             for (int s = 0; s < n_snps_block; ++s)
@@ -109,25 +110,15 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
         Rcpp::NumericVector maf = computeMAF(geno_sub);
         Rcpp::NumericVector miss = computeMissingness(geno_sub);
 
-        // Standardize genotypes -- now moved to per-SNP loop
-        /*
-        for (int s = 0; s < G.cols(); ++s) {
-            Eigen::VectorXd v = G.col(s);
-            double mean = v.mean();
-            double sd = std::sqrt((v.array() - mean).square().sum() / (v.size() - 1));
-            if (sd > 0)
-                G.col(s) = (v.array() - mean) / sd;
-            else
-                G.col(s).setZero();
-        }
-        */
-
         // Perform the linear regression for each phenotype
         for (int p = 0; p < n_pheno; ++p) {
                 
             // Phenotype vector + mask
             VectorXd y(n_inds);
             VectorXd y_mask(n_inds);
+
+            int n_y = 0;
+            double y_sum = 0.0;
 
             for (int i = 0; i < n_inds; ++i) {
                 if (NumericVector::is_na(pheno(i, p))) {
@@ -136,17 +127,29 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
                 } else {
                     y(i) = pheno(i, p);
                     y_mask(i) = 1.0;
+                    y_sum += y(i);
+                    n_y++;
                 }
             }
 
-            double yTy = y.squaredNorm();
-            int n_y = y_mask.sum();
+            if (n_y < 3) continue;
+
+            double y_mean = y_sum / n_y;
+            double yTy = 0.0;
+
+            for (int i = 0; i < n_inds; ++i) {
+                if (y_mask(i)) {
+                    y(i) -= y_mean;
+                    yTy += y(i) * y(i);
+                }
+            }
 
             // -----------------------------
             // Standardize genotype block
             // -----------------------------
 
             MatrixXd G(n_inds, n_snps_block);
+            std::vector<int> n_used_snp(n_snps_block);
 
             for (int s = 0; s < n_snps_block; ++s) {
 
@@ -160,6 +163,12 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
                         sumsq += g * g;
                         n_used++;
                     }
+                }
+
+                n_used_snp[s] = n_used;
+                if (n_used < 3) {
+                    G.col(s).setZero();
+                    continue;
                 }
 
                 double mean = sum / n_used;
@@ -178,19 +187,22 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
             // Vectorized regression
             VectorXd XtY = G.transpose() * y;
             std::ostringstream buffer;
+
             // buffer.reserve(1 << 20);
 
             for (int s = 0; s < n_snps_block; ++s) {
 
-                int n_used = n_y - miss[s];
+                int n_used = n_used_snp[s];
                 if (n_used < 3) continue;
 
-                double beta = XtY(s) / (n_used - 1);
-                double se = std::sqrt(
-                    (yTy - beta * beta * (n_used - 1)) /
-                    ((n_used - 2) * (n_used - 1))
-                );
+                double XtX = G.col(s).squaredNorm();
+                if (XtX <= 0) continue;
 
+                double beta = XtY(s) / XtX;
+                double rss = yTy - beta * XtY(s);
+                if (rss <= 0) continue;
+
+                double se = std::sqrt((rss / (n_used - 2)) / XtX);
                 double chisq = (beta / se) * (beta / se);
                 double pval = R::pchisq(chisq, 1, false, false);
 
