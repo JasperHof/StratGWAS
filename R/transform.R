@@ -28,8 +28,13 @@ transform <- function(strata, gencov, outfile) {
   trans_pred <- predict(fit, strata$info$order)$y
   names(trans_pred) = strata$info[,1]
 
+  # Make the transformed phenotype
   trans_pheno = cbind(ids, ids, 0)
-  trans_pheno[match(names(trans_pred), trans_pheno[,1]),3] = trans_pred
+
+  idx = match(names(trans_pred), trans_pheno[,1])
+  valid <- !is.na(idx)
+
+  trans_pheno[idx[valid],3] = trans_pred[valid]
   colnames(trans_pheno) = c("FID", "IID", "Pheno")
 
   # Write to phenotype
