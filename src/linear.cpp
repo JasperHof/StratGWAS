@@ -104,7 +104,7 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
             for (int s = 0; s < n_snps_block; ++s)
                 geno_sub(i, s) = geno_block(geno_keep[i], s);
         
-        Eigen::MatrixXd G = as<Eigen::MatrixXd>(geno_sub);
+        // Eigen::MatrixXd G = as<Eigen::MatrixXd>(geno_sub);
 
         // Compute MAF and missingness
         Rcpp::NumericVector maf = computeMAF(geno_sub);

@@ -28,11 +28,16 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
   rownames(multi) = ids
 
   # Perform a linear regression on the data
+  #linear_gwas(filename, multi, nr_blocks, outfile)
+
+  # Perform a linear regression on the data: (i) subtypes; (ii) disease; (iii) stratification variable
+  multi = cbind(multi, as.numeric(scale(strata$y[,3])), as.numeric(scale(strata$info[match(strata$y[,1], strata$info[,1]),3])))
   linear_gwas(filename, multi, nr_blocks, outfile)
 
   # Read in the linear regressions in list
-  ss_list = vector("list", K)
-  for(k in 1:K){
+  K_tot = K + 2
+  ss_list = vector("list", K_tot)
+  for(k in 1:K_tot){
     ss_list[[k]] = read.table(paste0(outfile, ".pheno",k), head = T)
   }
 
@@ -47,11 +52,11 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
   lds = computeLDscoresFromBED(filename, geno_set)
 
   # Use for genetic correlations
-  gencor = matrix(NA, K, K)
+  gencor = matrix(NA, K_tot, K_tot)
   lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
 
-  for(i in 1:K){
-    for(j in i:K){
+  for(i in 1:K_tot){
+    for(j in i:K_tot){
       if(i == j){
         gencor[i,j] = ldsc(ss_list[[i]], lds_matched)
       } else {

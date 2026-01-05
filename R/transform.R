@@ -17,7 +17,7 @@ transform <- function(strata, gencov, outfile) {
   # Read in data as multivariate phenotype
   K = strata$K
   ids = strata$y[,1]
-  trans = eigen(gencov)$vectors[,1]
+  trans = eigen(gencov[1:K,1:K])$vectors[,1]
 
   # Compute medians for smoothing stratification variables
   cum = cumsum(table(strata$info$groups))
@@ -39,4 +39,10 @@ transform <- function(strata, gencov, outfile) {
 
   # Write to phenotype
   write.table(trans_pheno, paste0(outfile, ".pheno"), quote = F, row = F)
+
+  # Also compute the inflation factor
+  a2 = cor(strata$y[,3], trans_pheno[,3])
+  exp_inflation = a2^2 * (1 - gencov[K+1, K+2]^2) * gencov[K+2, K+2]
+  message(paste0("Expected inflation criterion is ",round(exp_inflation, 4)))
+  if(exp_inflation > 0.01) warning("Inflation criterion is greater than 0.01.")
 }

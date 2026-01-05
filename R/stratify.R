@@ -16,6 +16,7 @@ stratify <- function(pheno, strat, K = 5) {
   strat = as.data.frame(strat[match(pheno[,1], strat[,1]),]) # match stratification variable with phenotype
 
   # <performs some checks here> #
+  # what to do with missing stratification variable?
 
   # Extract stratification variable and compute quintiles
   strat_cases = strat[which(pheno[,3] == 1),]
@@ -32,6 +33,7 @@ stratify <- function(pheno, strat, K = 5) {
   # < build in checks - check case distribution >
   strata[["K"]] = K
   strata[["y"]] = pheno
+  strata[["Z"]] = strat
   strata[["info"]] = strat_cases
 
   return(strata)
