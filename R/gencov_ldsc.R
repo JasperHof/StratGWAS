@@ -7,16 +7,19 @@
 #'
 #' @param strata An object returned from stratify()
 #' @param filename Prefix of genotype .bed file
-#' @param outfile Name of output file for strata-specific summary statistics
-#' @param tag Numerical matrix containing LD scores
+#' @param nr_blocks Block size for reading in genotype data (default: 1000)
+#' @param outfile Name of output file (should match previous step)
+#' @param ss_list Optional: list of length K+2, containing input summary statistics specific to strata, binary trait, and stratification variable
+#' @param lds Optional: data frame containing LD scores 
 #' @return Returns covariance matrix of the strata
 #' @export
-gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
+gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = NULL, lds = NULL) {
 
   # <performs some checks here> #
 
   # Read in data as multivariate phenotype
   K <- strata$K
+  K_tot <- K + 2
   ids <- strata$y[,1]
   multi <- matrix(0, length(ids), strata$K)  
   for(k in 1:K) multi[, k] = strata[[paste0("group", k)]][match(ids,strata[[paste0("group", k)]][,1]), 3]
@@ -31,17 +34,19 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
   #linear_gwas(filename, multi, nr_blocks, outfile)
 
   # Perform a linear regression on the data: (i) subtypes; (ii) disease; (iii) stratification variable
+  if(is.null(ss_list)){
   multi = cbind(multi, as.numeric(scale(strata$y[,3])), as.numeric(scale(strata$info[match(strata$y[,1], strata$info[,1]),3])))
   linear_gwas(filename, multi, nr_blocks, outfile)
 
   # Read in the linear regressions in list
-  K_tot = K + 2
   ss_list = vector("list", K_tot)
   for(k in 1:K_tot){
     ss_list[[k]] = read.table(paste0(outfile, ".pheno",k), head = T)
   }
+  }
 
-  # Compute LD scores for a subset of 1000 samples
+  # Compute LD scores for a subset of at most 1000 samples
+  if(is.null(lds)){
   if (length(ids) > 1000) {
     geno_set <- sample(1:length(ids), size = 1000)
   } else {
@@ -51,6 +56,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
 
   lds = computeLDscoresFromBED(filename, geno_set)
   write.table(lds, paste0(outfile,".ldscores"), quote = F, row = F, col = T)
+  }
 
   # Use for genetic correlations
   gencor = matrix(NA, K_tot, K_tot)

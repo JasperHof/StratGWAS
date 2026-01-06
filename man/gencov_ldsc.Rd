@@ -4,16 +4,27 @@
 \alias{gencov_ldsc}
 \title{LD score regression}
 \usage{
-gencov_ldsc(strata, filename, nr_blocks = 1000, outfile)
+gencov_ldsc(
+  strata,
+  filename,
+  nr_blocks = 1000,
+  outfile,
+  ss_list = NULL,
+  lds = NULL
+)
 }
 \arguments{
 \item{strata}{An object returned from stratify()}
 
 \item{filename}{Prefix of genotype .bed file}
 
-\item{outfile}{Name of output file for strata-specific summary statistics}
+\item{nr_blocks}{Block size for reading in genotype data (default: 1000)}
 
-\item{tag}{Numerical matrix containing LD scores}
+\item{outfile}{Name of output file (should match previous step)}
+
+\item{ss_list}{Optional: list of length K+2, containing input summary statistics specific to strata, binary trait, and stratification variable}
+
+\item{lds}{Optional: data frame containing LD scores}
 }
 \value{
 Returns covariance matrix of the strata
