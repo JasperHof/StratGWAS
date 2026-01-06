@@ -4,7 +4,7 @@
 #'
 #' @useDynLib StratGWAS, .registration = TRUE
 #' @importFrom Rcpp sourceCpp
-#' 
+#'
 #' @param strata An object returned from stratify()
 #' @param filename Prefix of genotype .bed file
 #' @param outfile Name of output file for strata-specific summary statistics
@@ -12,14 +12,14 @@
 #' @return Returns covariance matrix of the strata
 #' @export
 gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
-  
+
   # <performs some checks here> #
 
   # Read in data as multivariate phenotype
-  K = strata$K
-  ids = strata$y[,1]
-  multi = matrix(0, length(ids), strata$K)  
-  for(k in 1:K) multi[,k] = strata[[paste0("group",k)]][match(ids,strata[[paste0("group",k)]][,1]),3]
+  K <- strata$K
+  ids <- strata$y[,1]
+  multi <- matrix(0, length(ids), strata$K)  
+  for(k in 1:K) multi[, k] = strata[[paste0("group", k)]][match(ids,strata[[paste0("group", k)]][,1]), 3]
 
   # Scale phenotypes - but keep missings as missings
   for(k in 1:K){
@@ -50,6 +50,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile) {
   geno_set = geno_set[order(geno_set)]
 
   lds = computeLDscoresFromBED(filename, geno_set)
+  write.table(lds, paste0(outfile,".ldscores"), quote = F, row = F, col = T)
 
   # Use for genetic correlations
   gencor = matrix(NA, K_tot, K_tot)
