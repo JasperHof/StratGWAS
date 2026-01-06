@@ -29,7 +29,8 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
     multi[!is.na(multi[,k]),k] = scale(as.numeric(multi[!is.na(multi[,k]),k]))
   }
   rownames(multi) = ids
-  write.table(multi, paste0(outfile, ".strata"))
+  multi_pheno = cbind(ids, ids, multi)
+  write.table(multi_pheno, paste0(outfile, ".strata"), quote = F, row = F, col = F)
 
   # Perform a linear regression on the data
   #linear_gwas(filename, multi, nr_blocks, outfile)
