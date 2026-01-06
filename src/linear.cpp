@@ -81,7 +81,7 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
         out_files[i] << "Chromosome\tPredictor\tBasepair\tA1\tA2\tBeta\tSE\tChisq\tP\tN\tMAF\tMiss\n";
     }
 
-    int nr_blocks = n_snps / block_size;
+    int nr_blocks = (n_snps + block_size - 1) / block_size;
 
     for(int b = 0; b < nr_blocks; ++b){
 

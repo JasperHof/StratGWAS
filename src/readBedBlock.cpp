@@ -34,7 +34,43 @@ Rcpp::IntegerMatrix readBedBlock(std::string filename, int n_ind, int n_snp,
   
   IntegerMatrix genoMatrix(n_inds_block, n_snps_block);
   
+  // Seek once to the start of the SNP block
+  std::streampos start_pos = 3 + static_cast<std::streampos>(start_snp) * bytes_per_snp;
+  bedFile.seekg(start_pos, std::ios::beg);
+  
+  if (!bedFile) {
+      stop("Error seeking to SNP position " + std::to_string(start_snp));
+  }
+
   for(int snp = start_snp; snp <= end_snp; ++snp) {
+
+    // Read one SNP worth of data
+    bedFile.read(reinterpret_cast<char*>(buffer.data()), bytes_per_snp);
+        
+    if (!bedFile) {
+        stop("Error reading SNP " + std::to_string(snp));
+    }
+    
+    // Decode genotypes for the requested individuals
+    for (int ind = start_ind; ind <= end_ind; ++ind) {
+        int byte_index = ind / 4;
+        int shift = (ind % 4) * 2;
+        
+        unsigned char geno = (buffer[byte_index] >> shift) & 0b11;
+        
+        int g;
+        switch (geno) {
+            case 0b00: g = 2; break;  // Homozygous alternative
+            case 0b10: g = 1; break;  // Heterozygous
+            case 0b11: g = 0; break;  // Homozygous reference
+            case 0b01: g = -1; break; // Missing
+            default: g = -2; break;   // Should never happen
+        }
+        
+        genoMatrix(ind - start_ind, snp - start_snp) = g;
+    }
+
+    /*
     bedFile.seekg(3 + snp * bytes_per_snp, std::ios::beg);
     bedFile.read(reinterpret_cast<char*>(buffer.data()), bytes_per_snp);
     
@@ -53,6 +89,7 @@ Rcpp::IntegerMatrix readBedBlock(std::string filename, int n_ind, int n_snp,
       }
       genoMatrix(ind - start_ind, snp - start_snp) = g;
     }
+    */
   }
 
   bedFile.close();
