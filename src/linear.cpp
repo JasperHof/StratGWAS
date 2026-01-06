@@ -137,6 +137,7 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
             double y_mean = y_sum / n_y;
             double yTy = 0.0;
 
+            // Center phenotype
             for (int i = 0; i < n_inds; ++i) {
                 if (y_mask(i)) {
                     y(i) -= y_mean;

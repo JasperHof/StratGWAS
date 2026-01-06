@@ -20,7 +20,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
   # Read in data as multivariate phenotype
   K <- strata$K
   K_tot <- K + 2
-  ids <- strata$y[,1]
+  ids <- as.character(read.table(paste0(filename, ".fam"))[, 2])
   multi <- matrix(0, length(ids), strata$K)  
   for(k in 1:K) multi[, k] = strata[[paste0("group", k)]][match(ids,strata[[paste0("group", k)]][,1]), 3]
 
@@ -35,7 +35,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
 
   # Perform a linear regression on the data: (i) subtypes; (ii) disease; (iii) stratification variable
   if(is.null(ss_list)){
-  multi = cbind(multi, as.numeric(scale(strata$y[,3])), as.numeric(scale(strata$info[match(strata$y[,1], strata$info[,1]),3])))
+  multi = cbind(multi, as.numeric(scale(strata$y[match(ids, strata$y[,1]),3])), as.numeric(scale(strata$info[match(ids, strata$info[,1]),3])))
   linear_gwas(filename, multi, nr_blocks, outfile)
 
   # Read in the linear regressions in list
