@@ -68,7 +68,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
   for(i in 1:K_tot){
     for(j in i:K_tot){
       if(i == j){
-        gencor[i,j] = ldsc(ss_list[[i]], lds_matched)
+        gencov[i,j] = ldsc(ss_list[[i]], lds_matched)
       } else {
         ss1 = ss_list[[i]]
         ss2 = ss_list[[j]]
