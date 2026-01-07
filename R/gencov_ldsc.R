@@ -73,7 +73,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
         ss1 = ss_list[[i]]
         ss2 = ss_list[[j]]
         cor = ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
-        gencor[i,j] = gencor[j,i] = cor$cov_g
+        gencov[i,j] = gencor[j,i] = cor$cov_g
       }
     }
   }
