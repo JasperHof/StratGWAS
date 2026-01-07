@@ -61,24 +61,34 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
   write.table(lds, paste0(outfile,".ldscores"), quote = F, row = F, col = T)
   }
 
-  # Use for genetic correlations
-  gencov = matrix(NA, K_tot, K_tot)
+  # Use LDSC for genetic correlations
+  hers = rep(NA, K_tot)
+  gencor = matrix(NA, K_tot, K_tot)
   lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
 
   for(i in 1:K_tot){
     for(j in i:K_tot){
       if(i == j){
-        gencov[i,j] = ldsc(ss_list[[i]], lds_matched)
+        ldsc <- ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
+        gencor[i,j] <- 1
+        hers[i] <- max(as.numeric(ldsc$h2_1), 0.001)
       } else {
         ss1 = ss_list[[i]]
         ss2 = ss_list[[j]]
-        cor = ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
-        gencov[i,j] = gencov[j,i] = cor$cov_g
+        ldsc = ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
+        gencor[i,j] = gencor[j,i] = ldsc$rg
       }
     }
   }
 
-  write.table(gencov, paste0(outfile,".gencov"), quote = F, row = F, col = T)
+  # Compute genetic covariance matrix
+  gencov <- gencor
+  for(k in 1:K_tot) gencov[k,] <- gencov[k,] * sqrt(hers[k])
+  for(k in 1:K_tot) gencov[,k] <- gencov[,k] * sqrt(hers[k])
+
+  write.table(hers, paste0(outfile,".hers"), quote = F, row = F, col = F)
+  write.table(gencov, paste0(outfile,".gencov"), quote = F, row = F, col = F)
+  write.table(gencor, paste0(outfile,".gencor"), quote = F, row = F, col = F)
 
   return(gencov)
 }

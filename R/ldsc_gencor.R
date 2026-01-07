@@ -51,8 +51,8 @@ ldsc_cor <- function(ss1, ss2, ldscores) {
   intercept_h2_1 <- coef(fit_h2_1)[1]
   intercept_h2_2 <- coef(fit_h2_2)[1]
 
-  # Genetic correlation
-  rg <- cov_g / sqrt(max(h2_1, 0.0001) * max(h2_2, 0.0001))
+  # Genetic correlation - maybe also change scale cov_g in case of small heritability estimates
+  rg <- cov_g / sqrt(max(h2_1, 0.001) * max(h2_2, 0.001))
 
   return(list(
     rg = rg,
