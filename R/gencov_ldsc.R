@@ -38,7 +38,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
   multi = cbind(multi, as.numeric(scale(strata$y[match(ids, strata$y[,1]),3])), as.numeric(scale(strata$info[match(ids, strata$info[,1]),3])))
   multi_pheno <- cbind(ids, ids, multi)
   write.table(multi_pheno, paste0(outfile, ".strata"), quote = F, row = F, col = F)
-  
+
   linear_gwas(filename, multi, nr_blocks, outfile)
 
   # Read in the linear regressions in list
@@ -62,7 +62,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
   }
 
   # Use for genetic correlations
-  gencor = matrix(NA, K_tot, K_tot)
+  gencov = matrix(NA, K_tot, K_tot)
   lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
 
   for(i in 1:K_tot){
@@ -78,5 +78,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
     }
   }
 
-  return(gencor)
+  write.table(gencov, paste0(outfile,".gencov"), quote = F, row = F, col = T)
+
+  return(gencov)
 }
