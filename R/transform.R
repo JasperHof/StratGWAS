@@ -40,9 +40,26 @@ transform <- function(strata, gencov, outfile) {
   # Write to phenotype
   write.table(trans_pheno, paste0(outfile, ".pheno"), quote = F, row = F)
 
-  # Also compute the inflation factor
-  a2 = cor(strata$y[,3], trans_pheno[,3])
-  exp_inflation = a2^2 * (1 - gencov[K+1, K+2]^2) * gencov[K+2, K+2]
-  message(paste0("Expected inflation criterion is ",round(exp_inflation, 4)))
-  if(exp_inflation > 0.01) warning("Inflation criterion is greater than 0.01.")
+  # Also compute the inflation factor - need a2, gencor, and h2_Z
+  if(gencov[K+1, K+1] * gencov[K+2, K+2] < 0){
+    message(paste0("Can not compute expected inflation criterion due to negative h2 estimate of binary trait or stratification variable"))
+  } else {
+    # Compute a2
+    Z = strata$Z[,3]
+    Z[is.na(Z)] = mean(Z, na.rm=T)
+    Z = as.numeric(scale(Z))
+    y = strata$y[,3]
+    y[is.na(y)] = mean(y, na.rm=T)
+    y = as.numeric(scale(y))
+    Y_trans = as.numeric(scale(trans_pheno[,3]))
+
+    fit = lm(Y_trans ~ y + Z - 1)
+    coefs = fit$coefficients
+
+    a2 = coefs["Z"]
+    rg = gencov[K+1, K+2] / sqrt(gencov[K+1, K+1] * gencov[K+2, K+2])
+    exp_inflation = a2^2 * (1 - rg^2) * gencov[K+2, K+2]
+    message(paste0("Expected inflation criterion is ",round(exp_inflation, 4)))
+    if(exp_inflation > 0.01) warning("Inflation criterion is greater than 0.01.")
+  }
 }

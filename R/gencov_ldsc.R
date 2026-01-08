@@ -50,32 +50,32 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T,
 
   # Compute LD scores for a subset of at most 1000 samples
   if(is.null(lds)){
-  if (length(ids) > 1000) {
-    geno_set <- sample(1:length(ids), size = 1000)
-  } else {
-    geno_set <- 1:length(ids)
-  }
-  geno_set = geno_set[order(geno_set)]
+    if (length(ids) > 1000) {
+      geno_set <- sample(1:length(ids), size = 1000)
+    } else {
+      geno_set <- 1:length(ids)
+    }
+    geno_set = geno_set[order(geno_set)]
 
-  lds = computeLDscoresFromBED(filename, geno_set)
-  write.table(lds, paste0(outfile,".ldscores"), quote = F, row = F, col = T)
+    lds = computeLDscoresFromBED(filename, geno_set)
+    write.table(lds, paste0(outfile,".ldscores"), quote = F, row = F, col = T)
   }
 
   if(SumHer == F){ # Use LDSC implementation for genetic correlations
     hers = rep(NA, K_tot)
     gencov = matrix(NA, K_tot, K_tot)
-    lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
+    ldscores = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
 
     for(i in 1:K_tot){
       for(j in i:K_tot){
         if(i == j){
-          ldsc <- ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
+          ldsc <- ldsc_cor(ss_list[[i]], ss_list[[j]], ldscores)
           gencov[i,j] <- ldsc$cov_g
           hers[i] <- ldsc$h2_1
         } else {
           ss1 = ss_list[[i]]
           ss2 = ss_list[[j]]
-          ldsc = ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
+          ldsc = ldsc_cor(ss_list[[i]], ss_list[[j]], ldscores)
           gencov[i,j] = gencov[j,i] = ldsc$cov_g
         }
       }
@@ -83,19 +83,23 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T,
   } else { # Use SumHer implementation for genetic correlations (default)
     hers = rep(NA, K_tot)
     gencov = matrix(NA, K_tot, K_tot)
-    lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
+    ldscores = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
 
     for(i in 1:K_tot){
       for(j in i:K_tot){
         if(i == j){
-          ldsc <- ldsc_likelihood(ss_list[[i]], lds_matched)
+          ldsc <- ldsc_likelihood(ss_list[[i]], ldscores)
           gencov[i,j] <- ldsc$h2_snp
           hers[i] <- ldsc$h2_snp
+
+          cat(sprintf("SNP heritability of trait %d: %.4f (SE = %.4f)\n", i, ldsc$h2_snp, ldsc$se_h2))
         } else {
           ss1 = ss_list[[i]]
           ss2 = ss_list[[j]]
-          ldsc = ldsc_gencor(ss_list[[i]], ss_list[[j]], lds_matched)
+          ldsc = ldsc_gencor(ss_list[[i]], ss_list[[j]], ldscores)
           gencov[i,j] = gencov[j,i] = ldsc$h2_AB
+
+          cat(sprintf("Genetic covariance between trait %d and %d: %.4f (SE = %.4f)\n", i, j, ldsc$h2_AB, ldsc$se_h2_AB))
         }
       }
     }

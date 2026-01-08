@@ -105,8 +105,8 @@ ldsc_likelihood <- function(ss, ldscores,
     }
   }
   
-  cat("Iter\tLogLik\t\tDiff\t\tH2_SNP\n")
-  cat(sprintf("%d\t%.4f\t\t%.6f\t%.4f\n", iter, loglik_new, diff, h2_snp))
+  #cat("Iter\tLogLik\t\tDiff\t\tH2_SNP\n")
+  #cat(sprintf("%d\t%.4f\t\t%.6f\t%.4f\n", iter, loglik_new, diff, h2_snp))
 
   # Final estimates
   h2_snp <- theta[1] * M / N_mean
@@ -182,8 +182,8 @@ ldsc_gencor <- function(ss1, ss2, ldscores,
   Z_product <- (ss1$Beta / ss1$SE) * (ss2$Beta / ss2$SE)
   
   # Cross-product sample size (geometric mean)
-  N_cross <- sqrt(ss1$N * ss2$N)
-  N_cross_mean <- sqrt(N_mean_1 * N_mean_2)
+  N_cross <- sqrt(ss1$N) * sqrt(ss2$N)
+  N_cross_mean <- sqrt(N_mean_1) * sqrt(N_mean_2)
   N_cross_scaled <- N_cross / N_cross_mean
   
   # Estimate h2 for each trait if not provided
@@ -197,7 +197,7 @@ ldsc_gencor <- function(ss1, ss2, ldscores,
       max_iter = max_iter
     )
     h2_1 <- res1$h2_snp
-    cat(sprintf("Trait 1 h2 = %.4f (SE = %.4f)\n\n", h2_1, res1$se_h2))
+    # cat(sprintf("Trait 1 h2 = %.4f (SE = %.4f)\n\n", h2_1, res1$se_h2))
   }
   
   if (is.null(h2_2)) {
@@ -210,7 +210,7 @@ ldsc_gencor <- function(ss1, ss2, ldscores,
       max_iter = max_iter
     )
     h2_2 <- res2$h2_snp
-    cat(sprintf("Trait 2 h2 = %.4f (SE = %.4f)\n\n", h2_2, res2$se_h2))
+    # cat(sprintf("Trait 2 h2 = %.4f (SE = %.4f)\n\n", h2_2, res2$se_h2))
   }
   
   # Initialize parameters
