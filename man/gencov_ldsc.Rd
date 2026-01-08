@@ -9,6 +9,7 @@ gencov_ldsc(
   filename,
   nr_blocks = 1000,
   outfile,
+  SumHer = T,
   ss_list = NULL,
   lds = NULL
 )

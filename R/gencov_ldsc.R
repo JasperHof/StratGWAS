@@ -13,7 +13,7 @@
 #' @param lds Optional: data frame containing LD scores 
 #' @return Returns covariance matrix of the strata
 #' @export
-gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = NULL, lds = NULL) {
+gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T, ss_list = NULL, lds = NULL) {
 
   # <performs some checks here> #
 
@@ -61,30 +61,50 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, ss_list = N
   write.table(lds, paste0(outfile,".ldscores"), quote = F, row = F, col = T)
   }
 
-  # Use LDSC for genetic correlations
-  hers = rep(NA, K_tot)
-  gencor = matrix(NA, K_tot, K_tot)
-  lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
+  if(SumHer == F){ # Use LDSC implementation for genetic correlations
+    hers = rep(NA, K_tot)
+    gencov = matrix(NA, K_tot, K_tot)
+    lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
 
-  for(i in 1:K_tot){
-    for(j in i:K_tot){
-      if(i == j){
-        ldsc <- ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
-        gencor[i,j] <- 1
-        hers[i] <- max(as.numeric(ldsc$h2_1), 0.001)
-      } else {
-        ss1 = ss_list[[i]]
-        ss2 = ss_list[[j]]
-        ldsc = ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
-        gencor[i,j] = gencor[j,i] = ldsc$rg
+    for(i in 1:K_tot){
+      for(j in i:K_tot){
+        if(i == j){
+          ldsc <- ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
+          gencov[i,j] <- ldsc$cov_g
+          hers[i] <- ldsc$h2_1
+        } else {
+          ss1 = ss_list[[i]]
+          ss2 = ss_list[[j]]
+          ldsc = ldsc_cor(ss_list[[i]], ss_list[[j]], lds_matched)
+          gencov[i,j] = gencov[j,i] = ldsc$cov_g
+        }
+      }
+    }
+  } else { # Use SumHer implementation for genetic correlations (default)
+    hers = rep(NA, K_tot)
+    gencov = matrix(NA, K_tot, K_tot)
+    lds_matched = lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
+
+    for(i in 1:K_tot){
+      for(j in i:K_tot){
+        if(i == j){
+          ldsc <- ldsc_likelihood(ss_list[[i]], lds_matched)
+          gencov[i,j] <- ldsc$h2_snp
+          hers[i] <- ldsc$h2_snp
+        } else {
+          ss1 = ss_list[[i]]
+          ss2 = ss_list[[j]]
+          ldsc = ldsc_gencor(ss_list[[i]], ss_list[[j]], lds_matched)
+          gencov[i,j] = gencov[j,i] = ldsc$h2_AB
+        }
       }
     }
   }
 
   # Compute genetic covariance matrix
-  gencov <- gencor
-  for(k in 1:K_tot) gencov[k,] <- gencov[k,] * sqrt(hers[k])
-  for(k in 1:K_tot) gencov[,k] <- gencov[,k] * sqrt(hers[k])
+  gencor <- gencov
+  for(k in 1:K_tot) gencor[k,] <- gencor[k,] / sqrt(hers[k])
+  for(k in 1:K_tot) gencor[,k] <- gencor[,k] / sqrt(hers[k])
 
   write.table(hers, paste0(outfile,".hers"), quote = F, row = F, col = F)
   write.table(gencov, paste0(outfile,".gencov"), quote = F, row = F, col = F)
