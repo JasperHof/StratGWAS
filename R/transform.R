@@ -30,7 +30,6 @@ transform <- function(strata, gencov, outfile) {
 
   # Make the transformed phenotype
   trans_pheno = cbind(ids, ids, 0)
-
   idx = match(names(trans_pred), trans_pheno[,1])
   valid <- !is.na(idx)
 
@@ -55,8 +54,8 @@ transform <- function(strata, gencov, outfile) {
 
     fit = lm(Y_trans ~ y + Z - 1)
     coefs = fit$coefficients
-
     a2 = coefs["Z"]
+
     rg = gencov[K+1, K+2] / sqrt(gencov[K+1, K+1] * gencov[K+2, K+2])
     exp_inflation = a2^2 * (1 - rg^2) * gencov[K+2, K+2]
     message(paste0("Expected inflation criterion is ",round(exp_inflation, 4)))

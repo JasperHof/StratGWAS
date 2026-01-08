@@ -13,7 +13,8 @@ sumher_cov(
   sample_overlap = 0,
   fit_intercept = TRUE,
   tol = 1e-06,
-  max_iter = 100
+  max_iter = 100,
+  alpha = -0.25
 )
 }
 \arguments{

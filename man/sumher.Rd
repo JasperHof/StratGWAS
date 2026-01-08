@@ -4,7 +4,14 @@
 \alias{sumher}
 \title{Implementation of SumHer for estimating SNP Heritability}
 \usage{
-sumher(ss, ldscores, fit_intercept = TRUE, tol = 1e-06, max_iter = 100)
+sumher(
+  ss,
+  ldscores,
+  fit_intercept = TRUE,
+  tol = 1e-06,
+  max_iter = 100,
+  alpha = -0.25
+)
 }
 \arguments{
 \item{ss}{Summary statistics data.frame with columns: SNP, N, Chisq}

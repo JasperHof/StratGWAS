@@ -11,13 +11,17 @@
 sumher <- function(ss, ldscores, 
                     fit_intercept = TRUE,
                     tol = 1e-6,
-                    max_iter = 100) {
+                    max_iter = 100,
+                    alpha = -0.25) {
 
   M <- length(ldscores)
   N_mean <- mean(ss$N)
   N_scaled <- ss$N / N_mean
   chisq_obs <- ss$Chisq
-  
+  MAF <- ss$MAF
+  q <- (MAF * (1 - MAF))^(1 + alpha)
+  q <- q / sum(q) 
+
   n_params <- 1 + fit_intercept
   theta <- rep(0, n_params)
   
@@ -40,8 +44,8 @@ sumher <- function(ss, ldscores,
   }
   
   # Compute expectations from parameters
-  compute_expectations <- function(theta, N_scaled, ldscores, fit_intercept) {
-    mu <- rep(1, length(ldscores)) + theta[1] * N_scaled * ldscores
+  compute_expectations <- function(theta, N_scaled, ldscores, q, M, fit_intercept) {
+    mu <- rep(1, length(ldscores)) + theta[1] * M * N_scaled * q * ldscores
     if (fit_intercept) {
       mu <- mu + theta[2] * N_scaled
     }
@@ -64,7 +68,7 @@ sumher <- function(ss, ldscores,
     W_sqrt <- sqrt(W)
     
     X <- matrix(0, nrow = M, ncol = n_params)
-    X[, 1] <- W_sqrt * N_scaled * ldscores
+    X[, 1] <- W_sqrt * M * N_scaled * q * ldscores
     if (fit_intercept) {
       X[, 2] <- W_sqrt * N_scaled
     }
@@ -84,7 +88,7 @@ sumher <- function(ss, ldscores,
     })
     
     # Update expectations
-    mu <- compute_expectations(theta_new, N_scaled, ldscores, fit_intercept)
+    mu <- compute_expectations(theta_new, N_scaled, ldscores, q, M, fit_intercept)
     
     # Update weights for NEXT iteration (but keep D_inv_0 for likelihood)
     # D_inv = ldscores * mu (where mu = expected value)
@@ -97,7 +101,7 @@ sumher <- function(ss, ldscores,
     theta <- theta_new
     loglik_old <- loglik_new
     
-    h2_snp <- theta[1] * M / N_mean
+    h2_snp <- theta[1]
     
     if (abs(diff) < tol) {
       converged <- TRUE
@@ -105,7 +109,7 @@ sumher <- function(ss, ldscores,
   }
 
   # Final estimates
-  h2_snp <- theta[1] * M / N_mean
+  h2_snp <- theta[1]
   intercept <- 1
   if (fit_intercept) {
     intercept <- 1 + theta[2]
@@ -115,7 +119,7 @@ sumher <- function(ss, ldscores,
   W <- 1 / D_inv
   W_sqrt <- sqrt(W)
   X <- matrix(0, nrow = M, ncol = n_params)
-  X[, 1] <- W_sqrt * N_scaled * ldscores
+  X[, 1] <- W_sqrt * M * N_scaled * q * ldscores
   if (fit_intercept) {
     X[, 2] <- W_sqrt * N_scaled
   }
@@ -126,7 +130,7 @@ sumher <- function(ss, ldscores,
     matrix(NA, nrow = n_params, ncol = n_params)
   })
   
-  se_h2 <- sqrt(vcov[1, 1]) * M / N_mean
+  se_h2 <- sqrt(vcov[1, 1])
   
   return(list(
     h2_snp = h2_snp,
@@ -159,7 +163,8 @@ sumher_cov <- function(ss1, ss2, ldscores,
                         sample_overlap = 0,
                         fit_intercept = TRUE,
                         tol = 1e-6,
-                        max_iter = 100) {
+                        max_iter = 100,
+                        alpha = -0.25) {
   
   # Input validation
   if (nrow(ss1) != nrow(ss2) || nrow(ss1) != length(ldscores)) {
@@ -167,7 +172,10 @@ sumher_cov <- function(ss1, ss2, ldscores,
   }
   
   M <- length(ldscores)
-  
+  MAF <- ss$MAF
+  q <- (MAF * (1 - MAF))^(1 + alpha)
+  q <- q / sum(q) 
+
   # Scale sample sizes
   N_mean_1 <- mean(ss1$N)
   N_mean_2 <- mean(ss2$N)
@@ -186,11 +194,12 @@ sumher_cov <- function(ss1, ss2, ldscores,
   if (is.null(h2_1)) {
     # cat("Estimating h2 for Trait 1...\n")
     res1 <- sumher(
-      data.frame(SNP = ss1$Predictor, N = ss1$N, Chisq = ss1$Chisq),
+      data.frame(SNP = ss1$Predictor, N = ss1$N, Chisq = ss1$Chisq, MAF = ss$MAF),
       ldscores = ldscores,
       fit_intercept = TRUE,
       tol = tol,
-      max_iter = max_iter
+      max_iter = max_iter,
+      alpha = alpha
     )
     h2_1 <- res1$h2_snp
   }
@@ -198,11 +207,12 @@ sumher_cov <- function(ss1, ss2, ldscores,
   if (is.null(h2_2)) {
     #cat("Estimating h2 for Trait 2...\n")
     res2 <- sumher(
-      data.frame(SNP = ss2$Predictor, N = ss2$N, Chisq = ss2$Chisq),
+      data.frame(SNP = ss2$Predictor, N = ss2$N, Chisq = ss2$Chisq, MAF = ss$MAF),
       ldscores = ldscores,
       fit_intercept = TRUE,
       tol = tol,
-      max_iter = max_iter
+      max_iter = max_iter,
+      alpha = alpha
     )
     h2_2 <- res2$h2_snp
   }
@@ -229,11 +239,11 @@ sumher_cov <- function(ss1, ss2, ldscores,
   }
   
   # Compute expectations from parameters
-  compute_expectations <- function(theta, N_cross_scaled, ldscores, 
+  compute_expectations <- function(theta, N_cross_scaled, ldscores, q, M,
                                   sample_overlap, fit_intercept) {
     # E[Z_A * Z_B] = c_AB + h2_AB * N_cross * ldscores
     mu <- rep(sample_overlap, length(ldscores)) + 
-          theta[1] * N_cross_scaled * ldscores
+          theta[1] * M * N_cross_scaled * q * ldscores
     
     if (fit_intercept) {
       # Intercept captures additional sample overlap effects
@@ -257,7 +267,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
     W_sqrt <- sqrt(W)
     
     X <- matrix(0, nrow = M, ncol = n_params)
-    X[, 1] <- W_sqrt * N_cross_scaled * ldscores
+    X[, 1] <- W_sqrt * M * N_cross_scaled * q * ldscores
     if (fit_intercept) {
       X[, 2] <- W_sqrt * N_cross_scaled
     }
@@ -277,7 +287,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
     })
     
     # Update expectations
-    mu <- compute_expectations(theta_new, N_cross_scaled, ldscores, 
+    mu <- compute_expectations(theta_new, N_cross_scaled, ldscores, q, M,
                                sample_overlap, fit_intercept)
     
     # Update weights for NEXT iteration
@@ -294,7 +304,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
     loglik_old <- loglik_new
     
     # Convert to genetic covariance and correlation
-    h2_AB <- theta[1] * M / N_cross_mean
+    h2_AB <- theta[1]
     
     if (abs(diff) < tol) {
       converged <- TRUE
@@ -302,7 +312,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
   }
   
   # Final estimates
-  h2_AB <- theta[1] * M / N_cross_mean
+  h2_AB <- theta[1]
   rg <- NA_real_
   if (!is.na(h2_1) && !is.na(h2_2) && h2_1 > 0 && h2_2 > 0) {
     rg <- h2_AB / sqrt(h2_1 * h2_2)
@@ -329,7 +339,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
   })
   
   # SE for h2_AB
-  se_h2_AB <- sqrt(vcov[1, 1]) * M / N_cross_mean
+  se_h2_AB <- sqrt(vcov[1, 1])
   
   # SE for rg using delta method: SE(rg) ≈ SE(h2_AB) / sqrt(h2_1 * h2_2)
   se_rg <- NA_real_

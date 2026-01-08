@@ -52,8 +52,6 @@ ldsc_cor <- function(ss1, ss2, ldscores) {
   intercept_h2_2 <- coef(fit_h2_2)[1]
 
   # Genetic correlation - can only compute when h1 and h2 are positive
-  rg <- cov_g / sqrt(max(h2_1, 0.001) * max(h2_2, 0.001))
-
   rg <- NA_real_
   if (!is.na(h2_1) && !is.na(h2_2) && h2_1 > 0 && h2_2 > 0) {
     rg <- cov_g / sqrt(h2_1 * h2_2)
