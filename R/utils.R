@@ -320,3 +320,143 @@ compute_gencov_checks <- function(strata, filename, nr_blocks, outfile,
   
   return(TRUE)
 }
+
+#' @keywords internal
+compute_gencov_checks <- function(strata, filename, nr_blocks, outfile, 
+                                   SumHer, ss_list, lds) {
+  
+  # Check 1: strata object validation
+  if (missing(strata) || is.null(strata)) {
+    stop("'strata' argument is required and cannot be NULL")
+  }
+  
+  if (!is.list(strata)) {
+    stop("'strata' must be a list object returned from stratify()")
+  }
+  
+  required_strata_fields <- c("K", "y", "info")
+  missing_fields <- setdiff(required_strata_fields, names(strata))
+  if (length(missing_fields) > 0) {
+    stop("'strata' object is missing required fields: ", 
+         paste(missing_fields, collapse = ", "))
+  }
+  
+  # Check K is valid
+  if (!is.numeric(strata$K) || strata$K < 3 || strata$K != round(strata$K)) {
+    stop("'strata$K' must be an integer >= 3")
+  }
+  
+  K <- strata$K
+  
+  # Check that group1, group2, ..., groupK exist
+  for (k in 1:K) {
+    group_name <- paste0("group", k)
+    if (!group_name %in% names(strata)) {
+      stop("'strata' is missing '", group_name, "' (expected K=", K, " groups)")
+    }
+    
+    # Check group structure
+    if (!is.data.frame(strata[[group_name]]) && !is.matrix(strata[[group_name]])) {
+      stop("'strata$", group_name, "' must be a data.frame or matrix")
+    }
+    
+    if (ncol(strata[[group_name]]) < 3) {
+      stop("'strata$", group_name, "' must have at least 3 columns (FID, IID, phenotype)")
+    }
+  }
+
+  # Check 2: Genotype files exist
+  if (missing(filename) || is.null(filename) || !is.character(filename)) {
+    stop("'filename' must be a character string specifying the .bed file prefix")
+  }
+
+  required_files <- paste0(filename, c(".bed", ".bim", ".fam"))
+  missing_files <- required_files[!file.exists(required_files)]
+  if (length(missing_files) > 0) {
+    stop("Required genotype files not found: ", paste(missing_files, collapse = ", "))
+  }
+
+  # Check 3: nr_blocks validation
+  if (!is.numeric(nr_blocks) || nr_blocks < 1 || nr_blocks != round(nr_blocks)) {
+    stop("'nr_blocks' must be a positive integer")
+  }
+
+  # Check 4: outfile validation
+  if (missing(outfile) || is.null(outfile) || !is.character(outfile)) {
+    stop("'outfile' must be a character string")
+  }
+
+  # Check if output directory exists
+  outdir <- dirname(outfile)
+  if (outdir != "." && !dir.exists(outdir)) {
+    stop("Output directory does not exist: ", outdir)
+  }
+
+  # Check 5: SumHer parameter
+  if (!is.logical(SumHer) || length(SumHer) != 1) {
+    stop("'SumHer' must be a single logical value (TRUE or FALSE)")
+  }
+
+  # Check 6: ss_list validation (if provided)
+  if (!is.null(ss_list)) {
+    if (!is.list(ss_list)) {
+      stop("'ss_list' must be a list")
+    }
+    
+    K_tot <- K + 2
+    if (length(ss_list) != K_tot) {
+      stop("'ss_list' must have length K+2 = ", K_tot, ", but has length ", 
+           length(ss_list))
+    }
+    
+    # Check each summary statistic data frame
+    required_ss_cols <- c("Predictor", "N", "Chisq", "Beta", "SE")
+    for (i in 1:K_tot) {
+      if (!is.data.frame(ss_list[[i]])) {
+        stop("'ss_list[[", i, "]]' must be a data.frame")
+      }
+      
+      missing_cols <- setdiff(required_ss_cols, names(ss_list[[i]]))
+      if (length(missing_cols) > 0) {
+        stop("'ss_list[[", i, "]]' is missing columns: ", 
+             paste(missing_cols, collapse = ", "))
+      }
+      
+      # Check for NAs in critical columns
+      if (any(is.na(ss_list[[i]]$N))) {
+        stop("'ss_list[[", i, "]]$N' contains NA values")
+      }
+      
+      # Check all ss have same number of SNPs
+      if (i > 1 && nrow(ss_list[[i]]) != nrow(ss_list[[1]])) {
+        stop("All summary statistics must have the same number of SNPs. ",
+             "ss_list[[1]] has ", nrow(ss_list[[1]]), " rows, but ",
+             "ss_list[[", i, "]] has ", nrow(ss_list[[i]]), " rows")
+      }
+    }
+  }
+  
+  # Check 7: lds validation (if provided)
+  if (!is.null(lds)) {
+    if (!is.data.frame(lds)) {
+      stop("'lds' must be a data.frame")
+    }
+    
+    required_ld_cols <- c("Predictor", "Tagging")
+    missing_cols <- setdiff(required_ld_cols, names(lds))
+    if (length(missing_cols) > 0) {
+      stop("'lds' is missing required columns: ", 
+           paste(missing_cols, collapse = ", "))
+    }
+    
+    if (any(is.na(lds$Tagging))) {
+      stop("'lds$Tagging' contains NA values")
+    }
+    
+    if (any(lds$Tagging < 0)) {
+      stop("'lds$Tagging' contains negative values")
+    }
+  }
+  
+  return(TRUE)
+}
