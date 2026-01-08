@@ -1,6 +1,4 @@
-#' LD score regression
-#'
-#' Compute genetic covariance of subgroups using LD score regression
+#' Estimate genetic covariance of strata
 #'
 #' @useDynLib StratGWAS, .registration = TRUE
 #' @importFrom Rcpp sourceCpp
@@ -13,7 +11,7 @@
 #' @param lds Optional: data frame containing LD scores 
 #' @return Returns covariance matrix of the strata
 #' @export
-gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T, ss_list = NULL, lds = NULL) {
+compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T, ss_list = NULL, lds = NULL) {
 
   # <performs some checks here> #
 
@@ -29,9 +27,6 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T,
     multi[!is.na(multi[,k]),k] = scale(as.numeric(multi[!is.na(multi[,k]),k]))
   }
   rownames(multi) <- ids
-
-  # Perform a linear regression on the data
-  #linear_gwas(filename, multi, nr_blocks, outfile)
 
   # Perform a linear regression on the data: (i) subtypes; (ii) disease; (iii) stratification variable
   if(is.null(ss_list)){
@@ -51,7 +46,7 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T,
   # Compute LD scores for a subset of at most 1000 samples
   if(is.null(lds)){
     if (length(ids) > 1000) {
-      geno_set <- sample(1:length(ids), size = 1000)
+      geno_set <- sample(1:length(ids), size = 1000) # nolint
     } else {
       geno_set <- 1:length(ids)
     }
@@ -88,18 +83,18 @@ gencov_ldsc <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T,
     for(i in 1:K_tot){
       for(j in i:K_tot){
         if(i == j){
-          ldsc <- ldsc_likelihood(ss_list[[i]], ldscores)
-          gencov[i,j] <- ldsc$h2_snp
-          hers[i] <- ldsc$h2_snp
+          sum <- sumher(ss_list[[i]], ldscores)
+          gencov[i,j] <- sum$h2_snp
+          hers[i] <- sum$h2_snp
 
-          cat(sprintf("SNP heritability of trait %d: %.4f (SE = %.4f)\n", i, ldsc$h2_snp, ldsc$se_h2))
+          cat(sprintf("SNP heritability of trait %d: %.4f (SE = %.4f)\n", i, sum$h2_snp, sum$se_h2))
         } else {
           ss1 = ss_list[[i]]
           ss2 = ss_list[[j]]
-          ldsc = ldsc_gencor(ss_list[[i]], ss_list[[j]], ldscores)
-          gencov[i,j] = gencov[j,i] = ldsc$h2_AB
+          sum_cov = sumher_cov(ss_list[[i]], ss_list[[j]], ldscores)
+          gencov[i,j] = gencov[j,i] = sum_cov$h2_AB
 
-          cat(sprintf("Genetic covariance between trait %d and %d: %.4f (SE = %.4f)\n", i, j, ldsc$h2_AB, ldsc$se_h2_AB))
+          cat(sprintf("Genetic covariance between trait %d and %d: %.4f (SE = %.4f)\n", i, j, sum_cov$h2_AB, sum_cov$se_h2_AB))
         }
       }
     }

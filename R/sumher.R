@@ -1,4 +1,4 @@
-#' Likelihood-based LD Score Regression
+#' Implementation of SumHer for estimating SNP Heritability
 #'
 #' @param ss Summary statistics data.frame with columns: SNP, N, Chisq
 #' @param ldscores Numeric vector of LD scores
@@ -8,7 +8,7 @@
 #' @param weights Optional weights (default: 1/ldscores)
 #' @return List with heritability estimates and likelihood
 #' @export
-ldsc_likelihood <- function(ss, ldscores, 
+sumher <- function(ss, ldscores, 
                            fit_intercept = TRUE,
                            tol = 1e-6,
                            max_iter = 100) {
@@ -145,7 +145,7 @@ ldsc_likelihood <- function(ss, ldscores,
 }
 
 
-#' Likelihood-based Genetic Correlation Estimation
+#' Implementation of SumHer for estimating genetic covariance
 #'
 #' @param ss1 Summary statistics for trait 1: data.frame with SNP, N, Z
 #' @param ss2 Summary statistics for trait 2: data.frame with SNP, N, Z
@@ -158,7 +158,7 @@ ldsc_likelihood <- function(ss, ldscores,
 #' @param max_iter Maximum iterations (default 100)
 #' @return List with genetic correlation and covariance estimates
 #' @export
-ldsc_gencor <- function(ss1, ss2, ldscores,
+sumher_cov <- function(ss1, ss2, ldscores,
                         h2_1 = NULL, h2_2 = NULL,
                         sample_overlap = 0,
                         fit_intercept = TRUE,
