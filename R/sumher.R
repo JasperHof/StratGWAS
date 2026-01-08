@@ -172,7 +172,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
   }
   
   M <- length(ldscores)
-  MAF <- ss$MAF
+  MAF <- ss1$MAF
   q <- (MAF * (1 - MAF))^(1 + alpha)
   q <- q / sum(q) 
 
