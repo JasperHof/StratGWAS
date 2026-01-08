@@ -9,7 +9,8 @@
 #' @export
 stratify <- function(pheno, strat, K = 5) {
   
-  # < perform some checks here > 
+  # Check input data
+  stratify_checks(pheno, strat, K)
 
   # Read in summary statistics
   strata <- vector("list")

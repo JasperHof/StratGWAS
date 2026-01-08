@@ -9,9 +9,9 @@
 #' @return List with heritability estimates and likelihood
 #' @export
 sumher <- function(ss, ldscores, 
-                           fit_intercept = TRUE,
-                           tol = 1e-6,
-                           max_iter = 100) {
+                    fit_intercept = TRUE,
+                    tol = 1e-6,
+                    max_iter = 100) {
 
   M <- length(ldscores)
   N_mean <- mean(ss$N)
@@ -98,15 +98,11 @@ sumher <- function(ss, ldscores,
     loglik_old <- loglik_new
     
     h2_snp <- theta[1] * M / N_mean
-    #cat(sprintf("%d\t%.4f\t\t%.6f\t%.4f\n", iter, loglik_new, diff, h2_snp))
     
     if (abs(diff) < tol) {
       converged <- TRUE
     }
   }
-  
-  #cat("Iter\tLogLik\t\tDiff\t\tH2_SNP\n")
-  #cat(sprintf("%d\t%.4f\t\t%.6f\t%.4f\n", iter, loglik_new, diff, h2_snp))
 
   # Final estimates
   h2_snp <- theta[1] * M / N_mean
@@ -197,7 +193,6 @@ sumher_cov <- function(ss1, ss2, ldscores,
       max_iter = max_iter
     )
     h2_1 <- res1$h2_snp
-    # cat(sprintf("Trait 1 h2 = %.4f (SE = %.4f)\n\n", h2_1, res1$se_h2))
   }
   
   if (is.null(h2_2)) {
@@ -210,7 +205,6 @@ sumher_cov <- function(ss1, ss2, ldscores,
       max_iter = max_iter
     )
     h2_2 <- res2$h2_snp
-    # cat(sprintf("Trait 2 h2 = %.4f (SE = %.4f)\n\n", h2_2, res2$se_h2))
   }
   
   # Initialize parameters
@@ -342,11 +336,6 @@ sumher_cov <- function(ss1, ss2, ldscores,
   if (!is.na(h2_1) && !is.na(h2_2) && h2_1 > 0 && h2_2 > 0) {
     se_rg <- se_h2_AB / sqrt(h2_1 * h2_2)
   }
-  
-  #cat("\n")
-  #cat(sprintf("Genetic Correlation: %.4f (SE = %.4f)\n", rg, se_rg))
-  #cat(sprintf("Genetic Covariance: %.4f (SE = %.4f)\n", h2_AB, se_h2_AB))
-  #cat(sprintf("Intercept: %.4f\n", intercept))
   
   return(list(
     rg = rg,

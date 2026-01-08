@@ -23,6 +23,8 @@ compute_gencov(
 
 \item{outfile}{Name of output file (should match previous step)}
 
+\item{SumHer}{Indicates whether an implementation of SumHer will be used (default: SumHer = T) or LDSC (SumHer = F)}
+
 \item{ss_list}{Optional: list of length K+2, containing input summary statistics specific to strata, binary trait, and stratification variable}
 
 \item{lds}{Optional: data frame containing LD scores}

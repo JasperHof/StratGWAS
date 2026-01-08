@@ -7,13 +7,15 @@
 #' @param filename Prefix of genotype .bed file
 #' @param nr_blocks Block size for reading in genotype data (default: 1000)
 #' @param outfile Name of output file (should match previous step)
+#' @param SumHer Indicates whether an implementation of SumHer will be used (default: SumHer = T) or LDSC (SumHer = F)
 #' @param ss_list Optional: list of length K+2, containing input summary statistics specific to strata, binary trait, and stratification variable
 #' @param lds Optional: data frame containing LD scores 
 #' @return Returns covariance matrix of the strata
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T, ss_list = NULL, lds = NULL) {
 
-  # <performs some checks here> #
+  # Check input data
+  compute_gencov_checks(strata, filename, nr_blocks = 1000, outfile, SumHer = T, ss_list = NULL, lds = NULL)
 
   # Read in data as multivariate phenotype
   K <- strata$K
@@ -100,10 +102,20 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
     }
   }
 
+  cat("\n")
+
   # Compute genetic covariance matrix
   gencor <- gencov
-  for(k in 1:K_tot) gencor[k,] <- gencor[k,] / sqrt(hers[k])
-  for(k in 1:K_tot) gencor[,k] <- gencor[,k] / sqrt(hers[k])
+  for(k in 1:K_tot){
+    if(hers[k] < 0){
+      cat(sprintf("SNP heritability of trait %d is negative, so will not compute genetic correlation \n", k))
+      gencor[k,] <- NA
+      gencor[,k] <- NA
+    } else {
+      gencor[k,] <- gencor[k,] / sqrt(hers[k])
+      gencor[,k] <- gencor[,k] / sqrt(hers[k])
+    }
+  } 
 
   write.table(hers, paste0(outfile,".hers"), quote = F, row = F, col = F)
   write.table(gencov, paste0(outfile,".gencov"), quote = F, row = F, col = F)
