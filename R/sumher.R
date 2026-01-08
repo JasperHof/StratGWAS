@@ -194,7 +194,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
   if (is.null(h2_1)) {
     # cat("Estimating h2 for Trait 1...\n")
     res1 <- sumher(
-      data.frame(SNP = ss1$Predictor, N = ss1$N, Chisq = ss1$Chisq, MAF = ss$MAF),
+      data.frame(SNP = ss1$Predictor, N = ss1$N, Chisq = ss1$Chisq, MAF = ss1$MAF),
       ldscores = ldscores,
       fit_intercept = TRUE,
       tol = tol,
@@ -207,7 +207,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
   if (is.null(h2_2)) {
     #cat("Estimating h2 for Trait 2...\n")
     res2 <- sumher(
-      data.frame(SNP = ss2$Predictor, N = ss2$N, Chisq = ss2$Chisq, MAF = ss$MAF),
+      data.frame(SNP = ss2$Predictor, N = ss2$N, Chisq = ss2$Chisq, MAF = ss1$MAF),
       ldscores = ldscores,
       fit_intercept = TRUE,
       tol = tol,
