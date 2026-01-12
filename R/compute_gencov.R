@@ -30,19 +30,22 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
   }
   rownames(multi) <- ids
 
-  # Perform a linear regression on the data: (i) subtypes; (ii) disease; (iii) stratification variable
-  if(is.null(ss_list)){
-  multi = cbind(multi, as.numeric(scale(strata$y[match(ids, strata$y[,1]),3])), as.numeric(scale(strata$info[match(ids, strata$info[,1]),3])))
+  # Create new phenotype file
+  multi = cbind(multi, as.numeric(scale(strata$y[match(ids, strata$y[,1]),3])), as.numeric(scale(strata$Z[match(ids, strata$Z[,1]),3])))
   multi_pheno <- cbind(ids, ids, multi)
+  miss <- colMeans(is.na(multi_pheno[,-c(1,2)]))
+
   write.table(multi_pheno, paste0(outfile, ".strata"), quote = F, row = F, col = F)
 
-  linear_gwas(filename, multi, nr_blocks, outfile)
+  # Perform a linear regression on the data: (i) subtypes; (ii) disease; (iii) stratification variable
+  if(is.null(ss_list)){
+    linear_gwas(filename, multi, nr_blocks, outfile)
 
-  # Read in the linear regressions in list
-  ss_list = vector("list", K_tot)
-  for(k in 1:K_tot){
-    ss_list[[k]] = read.table(paste0(outfile, ".pheno",k), head = T)
-  }
+    # Read in the linear regressions in list
+    ss_list = vector("list", K_tot)
+    for(k in 1:K_tot){
+      ss_list[[k]] = read.table(paste0(outfile, ".pheno",k), head = T)
+    }
   }
 
   # Compute LD scores for a subset of at most 1000 samples
@@ -103,6 +106,12 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
   }
 
   cat("\n")
+
+  # Adjust values for missingness
+  for(k in 1:K_tot){
+    gencov[k,] <- gencov[k,] * sqrt(1 / (1 - miss))
+    gencov[,k] <- gencov[,k] * sqrt(1 / (1 - miss))
+  } 
 
   # Compute genetic covariance matrix
   gencor <- gencov
