@@ -15,6 +15,7 @@ sumher <- function(ss, ldscores,
                     alpha = -0.25) {
 
   M <- length(ldscores)
+  N <- ss$N
   N_mean <- mean(ss$N)
   N_scaled <- ss$N / N_mean
   chisq_obs <- ss$Chisq
@@ -45,9 +46,11 @@ sumher <- function(ss, ldscores,
   
   # Compute expectations from parameters
   compute_expectations <- function(theta, N_scaled, ldscores, q, M, fit_intercept) {
-    mu <- rep(1, length(ldscores)) + theta[1] * M * N_scaled * q * ldscores
+    #mu <- rep(1, length(ldscores)) + theta[1] * M * N_scaled * q * ldscores
+    mu <- rep(1, length(ldscores)) + theta[1] * N * q * ldscores
     if (fit_intercept) {
-      mu <- mu + theta[2] * N_scaled
+      #mu <- mu + theta[2] * N_scaled
+      mu <- mu + theta[2] * N
     }
     mu <- pmax(mu, 1e-6)
     return(mu)
@@ -68,9 +71,11 @@ sumher <- function(ss, ldscores,
     W_sqrt <- sqrt(W)
     
     X <- matrix(0, nrow = M, ncol = n_params)
-    X[, 1] <- W_sqrt * M * N_scaled * q * ldscores
+    #X[, 1] <- W_sqrt * M * N_scaled * q * ldscores
+    X[, 1] <- W_sqrt * N * q * ldscores
     if (fit_intercept) {
-      X[, 2] <- W_sqrt * N_scaled
+      #X[, 2] <- W_sqrt * N_scaled
+      X[, 2] <- W_sqrt * N
     }
     
     # Weighted response: sqrt(W) * (S - 1)
@@ -242,12 +247,13 @@ sumher_cov <- function(ss1, ss2, ldscores,
   compute_expectations <- function(theta, N_cross_scaled, ldscores, q, M,
                                   sample_overlap, fit_intercept) {
     # E[Z_A * Z_B] = c_AB + h2_AB * N_cross * ldscores
-    mu <- rep(sample_overlap, length(ldscores)) + 
-          theta[1] * M * N_cross_scaled * q * ldscores
-    
+    #mu <- rep(sample_overlap, length(ldscores)) + 
+    #      theta[1] * M * N_cross_scaled * q * ldscores
+    mu <- sample_overlap + theta[1] * N_cross * q * ldscores
     if (fit_intercept) {
       # Intercept captures additional sample overlap effects
-      mu <- mu + theta[2] * N_cross_scaled
+      #mu <- mu + theta[2] * N_cross_scaled
+      mu <- mu + theta[2] * N_cross
     }
     
     return(mu)
@@ -267,9 +273,11 @@ sumher_cov <- function(ss1, ss2, ldscores,
     W_sqrt <- sqrt(W)
     
     X <- matrix(0, nrow = M, ncol = n_params)
-    X[, 1] <- W_sqrt * M * N_cross_scaled * q * ldscores
+    #X[, 1] <- W_sqrt * M * N_cross_scaled * q * ldscores
+    X[, 1] <- W_sqrt * N_cross * q * ldscores
     if (fit_intercept) {
-      X[, 2] <- W_sqrt * N_cross_scaled
+      #X[, 2] <- W_sqrt * N_cross_scaled
+      X[, 2] <- W_sqrt * N_cross
     }
     
     # Weighted response: sqrt(W) * (Z_A * Z_B - c_AB)
