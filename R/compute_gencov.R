@@ -124,7 +124,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
       gencor[k,] <- gencor[k,] / sqrt(hers[k])
       gencor[,k] <- gencor[,k] / sqrt(hers[k])
     }
-  } 
+  }
 
   write.table(hers, paste0(outfile,".hers"), quote = F, row = F, col = F)
   write.table(gencov, paste0(outfile,".gencov"), quote = F, row = F, col = F)
