@@ -48,7 +48,7 @@ transform <- function(strata, gencov, outfile) {
     trans_pheno <- rbind(trans_pheno, trans_pheno_add)
 
     # Sort back to original order
-    trans_pheno <- trans_pheno[match(ids, trans_pheno[, 1]), ]
+    trans_pheno <- trans_pheno[match(strata$ids, trans_pheno[, 1]), ]
   }
 
   # Write to phenotype
