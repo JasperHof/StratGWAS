@@ -23,20 +23,26 @@ transform <- function(strata, gencov, outfile) {
   cum = cumsum(table(strata$info$groups))
   medians = (cum - 1/2 * (cum - c(0, cum[-length(cum)])))/max(cum)
 
-  # Smooth medians through transformation
-  fit <- smooth.spline(medians, as.numeric(trans), spar = 0.2)
-  trans_pred <- predict(fit, strata$info$order)$y
-  names(trans_pred) = strata$info[,1]
+  if(strata$sparse){    
+    # Make the transformed phenotype - directly from eigendecomposition
+    trans_pheno = cbind(ids, ids, 0)
+    for(k in 1:K) trans_pheno[ids %in% strata$info[strata$info$groups == k,1],3] <- trans[k]
+  } else {
+    # Smooth medians through transformation
+    fit <- smooth.spline(medians, as.numeric(trans), spar = 0.2)
+    trans_pred <- predict(fit, strata$info$order)$y
+    names(trans_pred) = strata$info[,1]
 
-  # Make the transformed phenotype
-  trans_pheno = cbind(ids, ids, 0)
-  idx = match(names(trans_pred), trans_pheno[,1])
-  valid <- !is.na(idx)
+    # Make the transformed phenotype
+    trans_pheno = cbind(ids, ids, 0)
+    idx = match(names(trans_pred), trans_pheno[,1])
+    valid <- !is.na(idx)
 
-  trans_pheno[idx[valid],3] = trans_pred[valid]
-  colnames(trans_pheno) = c("FID", "IID", "Pheno")
+    trans_pheno[idx[valid],3] = trans_pred[valid]
+  } 
 
   # Write to phenotype
+  colnames(trans_pheno) = c("FID", "IID", "Pheno")
   write.table(trans_pheno, paste0(outfile, ".pheno"), quote = F, row = F)
 
   # Also compute the inflation factor - need a2, gencor, and h2_Z

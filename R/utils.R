@@ -136,7 +136,7 @@ stratify_checks <- function(pheno, strat, K) {
     warning(n_cases_missing_strat, " cases (", 
             round(100 * n_cases_missing_strat / n_cases, 1), 
             "%) have missing stratification values. ",
-            "These will be imputed with the mean.")
+            "These will be imputed with the median.")
   }
   
   # Check that there are enough cases per stratum

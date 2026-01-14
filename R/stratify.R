@@ -16,14 +16,21 @@ stratify <- function(pheno, strat, K = 5) {
   strata <- vector("list")
   strat = as.data.frame(strat[match(pheno[,1], strat[,1]),]) # match stratification variable with phenotype
 
-  # <performs some checks here> #
-  # what to do with missing stratification variable?
-
   # Extract stratification variable and compute quintiles
   strat_cases = strat[which(pheno[,3] == 1),]
   strat_cases[,3][is.na(strat_cases[,3])] = median(strat_cases[,3], na.rm = T)
   strat_cases$order = rank(strat_cases[,3])/length(strat_cases[,3])
-  strat_cases$groups = cut(strat_cases$order, breaks = c(0,1:(K-1)/K,Inf), labels = 1:5)
+
+  # Define groups 
+  if(length(unique(strat[,3])) >= 10){
+    strat_cases$groups = cut(strat_cases$order, breaks = c(0,1:(K-1)/K,Inf), labels = 1:5)
+    sparse = F
+  } else {
+    strat_cases$groups = match(strat_cases[,3], unique(strat[,3]))
+    K = length(unique(strat[!is.na(strat[,3]),3]))
+    sparse = T
+    message("Less than 10 unique stratification values, so will performe sparse StratGWAS")
+  }
 
   # Create list with phenotype file for separate NORMALIZED strata
   for(k in 1:K){
@@ -36,6 +43,7 @@ stratify <- function(pheno, strat, K = 5) {
   strata[["y"]] = pheno
   strata[["Z"]] = strat
   strata[["info"]] = strat_cases
+  strata[["sparse"]] = sparse
 
   return(strata)
 }
