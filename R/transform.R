@@ -43,8 +43,12 @@ transform <- function(strata, gencov, outfile) {
 
   # Add back cases with missing stratification variable
   if(length(strata$strat_miss) > 0){
-    trans_pheno_add = cbind(strata$strat_miss, strata$strat_miss,
+    trans_pheno_add <- cbind(strata$strat_miss, strata$strat_miss,
                             mean(trans_pred[valid]))
+    trans_pheno <- rbind(trans_pheno, trans_pheno_add)
+
+    # Sort back to original order
+    trans_pheno <- trans_pheno[match(ids, trans_pheno[, 1]), ]
   }
 
   # Write to phenotype

@@ -10,15 +10,16 @@
 stratify <- function(pheno, strat, K = 5) {
   
   # Check input data
-  stratify_checks(pheno, strat, K)
+  #stratify_checks(pheno, strat, K)
 
   # Track individuals with missing stratification variable
+  ids <- pheno[,1]
   cases <- pheno[which(pheno[, 3] == 1),1]
   cases_nostrat <- strat[which(strat[, 1] %in% cases & is.na(strat[, 3])), 1]
 
   # These are removed for now and later added
-  pheno <- pheno[!pheno[,1] %in% cases_nostrat,]
-  strat <- strat[!strat[,1] %in% cases_nostrat,]
+  pheno <- pheno[!(pheno[,1] %in% cases_nostrat),]
+  strat <- strat[!(strat[,1] %in% cases_nostrat),]
 
   # Read in summary statistics
   strata <- vector("list")
@@ -50,6 +51,7 @@ stratify <- function(pheno, strat, K = 5) {
   strata[["y"]] = pheno
   strata[["Z"]] = strat
   strata[["info"]] = strat_cases
+  strata[["ids"]] = ids
   strata[["strat_miss"]] = cases_nostrat
   strata[["sparse"]] = sparse
 
