@@ -335,9 +335,11 @@ sumher_cov <- function(ss1, ss2, ldscores,
   W <- 1 / D_inv
   W_sqrt <- sqrt(W)
   X <- matrix(0, nrow = M, ncol = n_params)
-  X[, 1] <- W_sqrt * M * N_cross_scaled * q * ldscores
+  #X[, 1] <- W_sqrt * M * N_cross_scaled * q * ldscores
+  X[, 1] <- W_sqrt * N_cross * q * ldscores
   if (fit_intercept) {
-    X[, 2] <- W_sqrt * N_cross_scaled
+    #X[, 2] <- W_sqrt * N_cross_scaled
+    X[, 2] <- W_sqrt * N_cross
   }
   
   vcov <- tryCatch({

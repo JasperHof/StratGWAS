@@ -107,11 +107,11 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
 
   cat("\n")
 
-  # Adjust values for missingness
-  for(k in 1:K_tot){
-    gencov[k,] <- gencov[k,] * sqrt(1 / (1 - miss))
-    gencov[,k] <- gencov[,k] * sqrt(1 / (1 - miss))
-  } 
+  # Adjust values for missingness - not needed
+  #for(k in 1:K_tot){
+  # gencov[k,] <- gencov[k,] * sqrt(1 / (1 - miss))
+  # gencov[,k] <- gencov[,k] * sqrt(1 / (1 - miss))
+  #} 
 
   # Compute genetic covariance matrix
   gencor <- gencov

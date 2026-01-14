@@ -43,19 +43,24 @@ transform <- function(strata, gencov, outfile) {
   if(gencov[K+1, K+1] * gencov[K+2, K+2] < 0){
     message(paste0("Can not compute expected inflation criterion due to negative h2 estimate of binary trait or stratification variable"))
   } else {
-    # Compute a2
+
+    # Prepare variables
     Z = strata$Z[,3]
     Z[is.na(Z)] = mean(Z, na.rm=T)
-    Z = as.numeric(scale(Z))
     y = strata$y[,3]
     y[is.na(y)] = mean(y, na.rm=T)
+
+    # Scale variables
+    Z = as.numeric(scale(Z))
     y = as.numeric(scale(y))
     Y_trans = as.numeric(scale(trans_pheno[,3]))
 
+    # Fit regression to compute a2
     fit = lm(Y_trans ~ y + Z - 1)
     coefs = fit$coefficients
     a2 = coefs["Z"]
 
+    # Compute inflation criterion using genetic correlation
     rg = gencov[K+1, K+2] / sqrt(gencov[K+1, K+1] * gencov[K+2, K+2])
     exp_inflation = a2^2 * (1 - rg^2) * gencov[K+2, K+2]
     message(paste0("Expected inflation criterion is ",round(exp_inflation, 4)))
