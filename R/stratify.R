@@ -21,7 +21,7 @@ stratify <- function(pheno, strat, K = 5) {
 
   # Extract stratification variable and compute quintiles
   strat_cases = strat[which(pheno[,3] == 1),]
-  strat_cases[,3][is.na(strat_cases[,3])] = mean(strat_cases[,3], na.rm = T)
+  strat_cases[,3][is.na(strat_cases[,3])] = median(strat_cases[,3], na.rm = T)
   strat_cases$order = rank(strat_cases[,3])/length(strat_cases[,3])
   strat_cases$groups = cut(strat_cases$order, breaks = c(0,1:(K-1)/K,Inf), labels = 1:5)
 
