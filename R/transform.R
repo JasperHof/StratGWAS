@@ -41,6 +41,12 @@ transform <- function(strata, gencov, outfile) {
     trans_pheno[idx[valid],3] = trans_pred[valid]
   } 
 
+  # Add back cases with missing stratification variable
+  if(length(strata$strat_miss) > 0){
+    trans_pheno_add = cbind(strata$strat_miss, strata$strat_miss,
+                            mean(trans_pred[valid]))
+  }
+
   # Write to phenotype
   colnames(trans_pheno) = c("FID", "IID", "Pheno")
   write.table(trans_pheno, paste0(outfile, ".pheno"), quote = F, row = F)

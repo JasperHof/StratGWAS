@@ -33,7 +33,6 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
   # Create new phenotype file
   multi = cbind(multi, as.numeric(scale(strata$y[match(ids, strata$y[,1]),3])), as.numeric(scale(strata$Z[match(ids, strata$Z[,1]),3])))
   multi_pheno <- cbind(ids, ids, multi)
-  miss <- colMeans(is.na(multi_pheno[,-c(1,2)]))
 
   write.table(multi_pheno, paste0(outfile, ".strata"), quote = F, row = F, col = F)
 
@@ -106,12 +105,6 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
   }
 
   cat("\n")
-
-  # Adjust values for missingness - not needed
-  #for(k in 1:K_tot){
-  # gencov[k,] <- gencov[k,] * sqrt(1 / (1 - miss))
-  # gencov[,k] <- gencov[,k] * sqrt(1 / (1 - miss))
-  #} 
 
   # Compute genetic covariance matrix
   gencor <- gencov

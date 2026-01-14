@@ -12,13 +12,20 @@ stratify <- function(pheno, strat, K = 5) {
   # Check input data
   stratify_checks(pheno, strat, K)
 
+  # Track individuals with missing stratification variable
+  cases <- pheno[which(pheno[, 3] == 1),1]
+  cases_nostrat <- strat[which(strat[, 1] %in% cases & is.na(strat[, 3])), 1]
+
+  # These are removed for now and later added
+  pheno <- pheno[!pheno[,1] %in% cases_nostrat,]
+  strat <- strat[!strat[,1] %in% cases_nostrat,]
+
   # Read in summary statistics
   strata <- vector("list")
   strat = as.data.frame(strat[match(pheno[,1], strat[,1]),]) # match stratification variable with phenotype
 
   # Extract stratification variable and compute quintiles
   strat_cases = strat[which(pheno[,3] == 1),]
-  strat_cases[,3][is.na(strat_cases[,3])] = median(strat_cases[,3], na.rm = T)
   strat_cases$order = rank(strat_cases[,3])/length(strat_cases[,3])
 
   # Define groups 
@@ -38,11 +45,12 @@ stratify <- function(pheno, strat, K = 5) {
     strata[[paste0("group",k)]][,3] = as.numeric(scale(strata[[paste0("group",k)]][,3]))
   }
 
-  # < build in checks - check case distribution >
+  # Return list with information
   strata[["K"]] = K
   strata[["y"]] = pheno
   strata[["Z"]] = strat
   strata[["info"]] = strat_cases
+  strata[["strat_miss"]] = cases_nostrat
   strata[["sparse"]] = sparse
 
   return(strata)
