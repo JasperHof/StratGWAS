@@ -33,17 +33,19 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
 
   # regress covariates from phenotype
   if(!is.null(cov)){
-    
-    # create covariate matrix for performing linear regression
-    cov_mat <- cbind(ids, ids, cov[match(ids, cov[, 1]), -c(1, 2)])
-    for(i in 3:dim(cov_mat)[2]) cov_mat[,i] <- as.numeric(cov_mat[,i])
-    for(i in 3:dim(cov_mat)[2]) cov_mat[,i] <- mean(cov_mat[,i], na.rm = T)
-    
-    y <- pheno[, 3]
-    names(y) <- ids
+    cov_df <- cov[match(ids, cov[,1]), -(1:2)]
+    cov_df[] <- lapply(cov_df, function(x) {
+        x <- as.numeric(x)
+        x[is.na(x)] <- mean(x, na.rm = TRUE)
+        x
+    })
 
-    fit <- lm(y ~ cov_mat)
-    multi[match(names(fit$residuals), ids), 1] <- fit$residuals
+    y <- pheno[match(ids, pheno[,1]), 3]
+    names(y) <- ids
+    rownames(cov_df) <- ids
+
+    fit <- lm(y ~ ., data = cov_df)
+    multi[match(names(residuals(fit)), ids), 1] <- residuals(fit)
   }
 
   # normalize all columns
