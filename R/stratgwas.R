@@ -31,6 +31,21 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
   multi[match(strat[,1], ids),4] <- 1 + .5 * strat[, 3]^3
   rownames(multi) = ids
 
+  # regress covariates from phenotype
+  if(!is.null(cov)){
+    
+    # create covariate matrix for performing linear regression
+    cov_mat <- cbind(ids, ids, cov[match(ids, cov[, 1]), -c(1, 2)])
+    for(i in 3:dim(cov_mat)[2]) cov_mat[,i] <- as.numeric(cov_mat[,i])
+    for(i in 3:dim(cov_mat)[2]) cov_mat[,i] <- mean(cov_mat[,i], na.rm = T)
+    
+    y <- pheno[, 3]
+    names(y) <- ids
+
+    fit <- lm(y ~ cov_mat)
+    multi[match(names(fit$residuals), ids), 1] <- fit$residuals
+  }
+
   # normalize all columns
   for(i in 1:dim(multi)[2]) multi[, i] = as.numeric(scale(multi[, i]))
 
@@ -55,11 +70,26 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
   #U1 %*% t(cor_e) %*% t(U1)
   #U1 %*% t(cor_g) %*% t(U1)
 
+  # compute genetic correlation
+  hers <- diag(cor_g)
+  rg <- cor_g
+  for(k in 1:dim(rg)[1]){
+    if(hers[k] < 0){
+      cat(sprintf("SNP heritability of trait %d is negative, so will not compute genetic correlation \n", k))
+      rg[k,] <- NA
+      rg[,k] <- NA
+    } else {
+      rg[k,] <- rg[k,] / sqrt(hers[k])
+      rg[,k] <- rg[,k] / sqrt(hers[k])
+    }
+  }
+
   # Return list with information
   object = vector("list")
   object[["pheno"]] = trans_pheno
   object[["cor_g"]] = cor_g
   object[["cor_e"]] = cor_e
+  object[["rg"]] = rg
   object[["weights"]] = weights
 
   return(object)
