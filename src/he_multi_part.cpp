@@ -64,13 +64,13 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
     pheno = pheno_sub;
     int n_inds = pheno.nrow(); // note that this is different from n_total_inds (genotype dim)
 
-    Rcout << "Will be using " << n_inds << " overlapping individuals\n";
+    Rcout << "Number of individuals with complete data: " << n_inds << "\n";
 
     // Output matrix
     Rcpp::NumericMatrix gencors(n_pheno, n_pheno);
 
     // Block size
-    int nr_blocks = n_snps / block_size;
+    int nr_blocks = (n_snps + block_size - 1) / block_size;
 
     // Set up random vectors
     std::mt19937 rng(12345);
@@ -79,8 +79,8 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
 
     for(int b = 0; b < nr_blocks; ++b){
 
-        if (b % 100 == 1) {
-            Rcpp::Rcout << "Processing genotype block " << b << "/" << nr_blocks << "\n";
+        if (b % 100 == 0) {
+            Rcpp::Rcout << "Processing genotype block " << b + 1 << "/" << nr_blocks << "\n";
         }
     
         int block_start = b * block_size;
@@ -92,7 +92,7 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
             filename + ".bed", 
             n_total_inds, n_snps, 
             0, n_total_inds - 1,              // full range of individuals
-            block_start, block_end      // full range of SNPs
+            block_start, block_end            // full range of SNPs
         );
 
         // Subset to matched individuals
@@ -118,16 +118,39 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
             
             Eigen::VectorXd v = X.col(col);
            
-            // double w = weights[col]; 
-            // v*=w;
-
-            double mean = v.mean();
-            double stddev = std::sqrt((v.array() - mean).square().sum() / (v.size() - 1));
+            // Calculate mean excluding missing values (coded as -1)
+            double sum = 0.0;
+            int n_valid = 0;
+            for (int i = 0; i < v.size(); ++i) {
+                if (v[i] != -1) {
+                    sum += v[i];
+                    n_valid++;
+                }
+            }
             
-            if (stddev > 0) {
+            if (n_valid == 0) {
+                // All missing, set column to zero
+                X.col(col).setZero();
+                continue;
+            }
+            
+            double mean = sum / n_valid;
+
+            // Impute missing values with mean and calculate standard deviation
+            double sq_sum = 0.0;
+            for (int i = 0; i < v.size(); ++i) {
+                if (v[i] == -1) {
+                    v[i] = mean;  // Impute with mean
+                }
+                sq_sum += (v[i] - mean) * (v[i] - mean);
+            }
+
+            double stddev = std::sqrt(sq_sum / (v.size() - 1));
+            
+            if (stddev > 1e-10) {  // Use small epsilon instead of exact 0
                 X.col(col) = (v.array() - mean) / stddev;
             } else {
-                // trivial column (all same value), set to zero
+                // Monomorphic SNP (all same value), set to zero
                 X.col(col).setZero();
             }
         }
@@ -137,17 +160,69 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
         double tr_KK = 0.0;
 
         for (int r = 0; r < nmcmc; ++r) {
+            // Eigen::VectorXd z(n_inds);
+            // for (int i = 0; i < n_inds; ++i) z[i] = norm(rng);
+
+            // Generate random normal vector using R's RNG
+            NumericVector z_r = rnorm(n_inds, 0.0, 1.0);
+            Eigen::VectorXd z = Eigen::Map<Eigen::VectorXd>(z_r.begin(), n_inds);
+            
+            // Compute K*z = (XX'/m)*z = X*(X'*z)/m
+            Eigen::VectorXd Xtz = X.transpose() * z;
+            Eigen::VectorXd Kz = (X * Xtz) / n_snps_block;
+            
+            // Compute K²*z = K*(K*z) = (XX'/m)*((XX'/m)*z)
+            Eigen::VectorXd XtKz = X.transpose() * Kz;
+            Eigen::VectorXd KKz = (X * XtKz) / n_snps_block;
+            
+            // E[z'*K²*z] = tr(K²)
+            tr_KK += z.dot(KKz) / nmcmc;
+
+            /*
             Eigen::VectorXd z(n_inds);
             for (int i = 0; i < n_inds; ++i) z[i] = norm(rng);
 
             Eigen::VectorXd Kz = X * (X.transpose() * z);
             tr_KK += Kz.squaredNorm() / (nmcmc * n_snps_block * n_snps_block);
+            */
         }
+
+        // Convert phenotype matrix to Eigen for efficient computation
+        Eigen::MatrixXd Y(n_inds, n_pheno);
+        for(int i = 0; i < n_pheno; ++i){
+            Y.col(i) = Eigen::Map<Eigen::VectorXd>(pheno.column(i).begin(), n_inds);
+        }
+
+        // Compute X'Y once for all phenotypes
+        // Eigen::MatrixXd XtY = X.transpose() * Y / n_snps_block;
+        Eigen::MatrixXd XtY = X.transpose() * Y;
 
         // Haseman-Elston equations
         for(int i = 0; i < n_pheno; ++i){
             for(int j = i; j < n_pheno; ++j){
                 
+                // y_i' K y_j = y_i' (XX'/m) y_j = (X'y_i)' (X'y_j) / m
+                double yKyt = XtY.col(i).dot(XtY.col(j)) / n_snps_block;
+                
+                // y_i' y_j
+                double yyt = Y.col(i).dot(Y.col(j));
+
+                // Set up system: [tr(K^2)  tr(K)] [h2]   = [y'Ky]
+                //                [tr(K)    N   ] [e2]     [y'y ]
+                Eigen::Matrix2d A;
+                A << tr_KK, tr_K,
+                     tr_K,  n_inds;
+
+                Eigen::Vector2d B(yKyt, yyt);
+                Eigen::Vector2d sol = A.colPivHouseholderQr().solve(B);
+
+                // Accumulate genetic covariance (first component)
+                gencors(i, j) += sol[0];
+                if (i != j) {
+                    gencors(j, i) += sol[0];
+                }
+
+                /*
                 Eigen::VectorXd yi = Eigen::Map<Eigen::VectorXd>(pheno.column(i).begin(), n_inds);
                 Eigen::VectorXd yj = Eigen::Map<Eigen::VectorXd>(pheno.column(j).begin(), n_inds);
 
@@ -163,6 +238,7 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
 
                 gencors(i, j) += sol[0];
                 if (i != j) gencors(j, i) += sol[0];
+                */
             }
         }
     }

@@ -3,6 +3,7 @@
 export(compute_gencov)
 export(gencov_he)
 export(ldsc_cor)
+export(stratgwas)
 export(stratify)
 export(sumher)
 export(sumher_cov)
