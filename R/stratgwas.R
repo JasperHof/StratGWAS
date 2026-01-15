@@ -49,8 +49,18 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
   V = eigen(M)$vectors                                                # now compute U for downstream use
   U1 = t(V) %*% S_inv
 
+  # retrieve weightings and compute transformed phenotype
+  weights = U1[1,]
+  trans_pheno = cbind(ids, ids, multi %*% weights)
   #U1 %*% t(cor_e) %*% t(U1)
   #U1 %*% t(cor_g) %*% t(U1)
 
-  return(U1[1,])
+  # Return list with information
+  object = vector("list")
+  object[["pheno"]] = trans_pheno
+  object[["cor_g"]] = cor_g
+  object[["cor_e"]] = cor_e
+  object[["weights"]] = weights
+
+  return(object)
 }
