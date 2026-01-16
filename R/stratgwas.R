@@ -10,7 +10,7 @@
 #' @param filename Prefix of input .bed file
 #' @return Returns covariance matrix of the strata
 #' @export
-stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
+stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_g = NULL) {
   
   # <performs some checks here> #
 
@@ -52,27 +52,51 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
   # normalize all columns
   for(i in 1:dim(multi)[2]) multi[, i] = as.numeric(scale(multi[, i]))
 
-  # make sure the phenotype is numerical matrix; IDs provided as rownames
-  cor_g = he_multi_part(filename, multi, block_size)
+  # compute genetic covariance using randomized HE regression
+  if(is.null(cor_g)) cor_g = he_multi_part(filename, multi, block_size)
 
   # compute genetic correlation
   cor_total = cor(multi, use = "complete.obs")
   cor_e = cor_total - cor_g
 
+  # check for negative heritability
+  hers <- diag(cor_g)
+  her_neg <- which(hers < 0)
+
+  if(length(her_neg) > 0){
+    # Create informative message about which terms are being removed
+    term_names <- c("binary", "linear", "quadratic", "cubic")[her_neg]
+    message("Heritability of ", paste(term_names, collapse = ", "), 
+            " term(s) is negative and will be ignored.")
+    
+    if(length(her_neg) >= 3){
+      warning("Too many terms have negative heritability.")
+    }
+    
+    # Remove negative heritability terms
+    cor_g_use <- cor_g[-her_neg, -her_neg]
+    cor_e_use <- cor_e[-her_neg, -her_neg]
+    multi_use <- multi[, -her_neg]
+  } else {
+    # Use full matrices if no negative heritabilities
+    cor_g_use <- cor_g
+    cor_e_use <- cor_e
+    multi_use <- multi
+  }
+
   # perform double decomposition
-  P = eigen(cor_e)                                                    # decompose cor_e = U E UT
-  S_inv = P$vectors %*% diag(1/sqrt(P$values)) %*% t(P$vectors)       # get S_inv = U E^{-1/2} U^T
-  S = P$vectors %*% diag(sqrt(P$values)) %*% t(P$vectors)             # get S = U E^{1/2} U^T
-  M = S_inv %*% as.matrix(cor_g) %*% S_inv                            # transform G into environment space - and decompose after
-  V = eigen(M)$vectors                                                # now compute U for downstream use
-  U1 = t(V) %*% S_inv
+  P <- eigen(cor_e_use)
+  S_inv <- P$vectors %*% diag(1/sqrt(P$values)) %*% t(P$vectors)
+  S <- P$vectors %*% diag(sqrt(P$values)) %*% t(P$vectors)
+  M <- S_inv %*% as.matrix(cor_g_use) %*% S_inv
+  V <- eigen(M)$vectors
+  U1 <- t(V) %*% S_inv
 
   # retrieve weightings and compute transformed phenotype
-  weights = U1[1,]
-  trans_pheno = cbind(ids, ids, multi %*% weights)
+  weights <- U1[1,]
+  trans_pheno <- cbind(ids, ids, multi_use %*% weights)
 
   # compute genetic correlation
-  hers <- diag(cor_g)
   rg <- cor_g
   
   for(k in 1:dim(rg)[1]){
