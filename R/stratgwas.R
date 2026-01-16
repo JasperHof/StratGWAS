@@ -22,7 +22,8 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
 
   # reduce and scale stratification variable 
   strat <- strat[strat[, 1] %in% pheno[which(pheno[, 3] == 1), 1], ]
-  strat[,3] <- as.numeric(scale(rank(as.numeric(strat[, 3]))))
+  #strat[,3] <- as.numeric(scale(rank(as.numeric(strat[, 3]))))
+  strat[,3] <- as.numeric(scale(as.numeric(strat[, 3])))
 
   # create multivariate phenotype file for HE regression
   multi <- cbind(pheno[,3], 0, 0, 0)
@@ -69,12 +70,11 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
   # retrieve weightings and compute transformed phenotype
   weights = U1[1,]
   trans_pheno = cbind(ids, ids, multi %*% weights)
-  #U1 %*% t(cor_e) %*% t(U1)
-  #U1 %*% t(cor_g) %*% t(U1)
 
   # compute genetic correlation
   hers <- diag(cor_g)
   rg <- cor_g
+  
   for(k in 1:dim(rg)[1]){
     if(hers[k] < 0){
       cat(sprintf("SNP heritability of trait %d is negative, so will not compute genetic correlation \n", k))
@@ -86,12 +86,37 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500) {
     }
   }
 
+  # compute inflation criterion
+  gamma = rg[1,2]
+
+  if(is.na(gamma)){
+    message("Can not compute inflation criterion due to negative heritability.")
+  } else {
+    h2_Z = cor_g[2,2]
+
+    # compute a2 - the correlation between stratification Y' and Z
+    y_trans = as.numeric(scale(trans_pheno[,3]))
+    y = as.numeric(scale(multi[,1]))
+    z = as.numeric(scale(multi[,2]))
+
+    # fit regression
+    fit = lm(y_trans ~ y + z - 1)
+    coefs = fit$coefficients
+    a2 = coefs["z"]
+
+    # Compute inflation criterion using genetic correlation
+    criterion = a2^2 * (1 - gamma^2) * h2_Z
+    message(paste0("Expected inflation criterion is ",round(criterion, 4)))
+    if(criterion > 0.01) warning("Inflation criterion is greater than 0.01.")
+  }
+
   # Return list with information
   object = vector("list")
   object[["pheno"]] = trans_pheno
   object[["cor_g"]] = cor_g
   object[["cor_e"]] = cor_e
   object[["rg"]] = rg
+  object[["criterion"]] = criterion
   object[["weights"]] = weights
 
   return(object)
