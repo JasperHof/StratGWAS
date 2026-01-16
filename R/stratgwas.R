@@ -23,6 +23,14 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   # reduce and scale stratification variable 
   strat <- strat[strat[, 1] %in% pheno[which(pheno[, 3] == 1), 1], ]
   #strat[,3] <- as.numeric(scale(rank(as.numeric(strat[, 3]))))
+
+  # Set outliers to 0.01/ / 0.99 quantiles
+  q01 <- quantile(strat[, 3], 0.01, na.rm = TRUE)
+  q99 <- quantile(strat[, 3], 0.99, na.rm = TRUE)
+
+  # Winsorize
+  strat[strat[, 3] < q01, 3] <- q01
+  strat[strat[, 3] > q99, 3] <- q99
   strat[,3] <- as.numeric(scale(as.numeric(strat[, 3])))
 
   # create multivariate phenotype file for HE regression
