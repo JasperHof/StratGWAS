@@ -42,19 +42,29 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
 
   # regress covariates from phenotype
   if(!is.null(cov)){
-    cov_df <- cov[match(ids, cov[,1]), -(1:2)]
+    cov_df <- cov[match(ids, cov[,1]), -(1:2), drop = F]
     cov_df[] <- lapply(cov_df, function(x) {
         x <- as.numeric(x)
         x[is.na(x)] <- mean(x, na.rm = TRUE)
         x
     })
-
-    y <- pheno[match(ids, pheno[,1]), 3]
-    names(y) <- ids
     rownames(cov_df) <- ids
 
-    fit <- lm(y ~ ., data = cov_df)
-    multi[match(names(residuals(fit)), ids), 1] <- residuals(fit)
+    # regress from all columns of multi
+    for(i in 1:ncol(multi)){
+      y <- multi[, i]
+      names(y) <- ids
+
+      fit <- lm(y ~ ., data = cov_df)
+      multi[match(names(residuals(fit)), ids), i] <- residuals(fit)
+    }
+
+    # regress only from phenotype
+    #y <- pheno[match(ids, pheno[,1]), 3]
+    #names(y) <- ids
+    #
+    #fit <- lm(y ~ ., data = cov_df)
+    #multi[match(names(residuals(fit)), ids), 1] <- residuals(fit)
   }
 
   # normalize all columns
