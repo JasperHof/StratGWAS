@@ -35,10 +35,10 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
 
   # create multivariate phenotype file for HE regression
   multi <- cbind(pheno[,3], 0, 0, 0)
-  multi[match(strat[,1], ids),2] <- 1 + .5 * strat[, 3]
-  multi[match(strat[,1], ids),3] <- 1 + .5 * strat[, 3]^2
-  multi[match(strat[,1], ids),4] <- 1 + .5 * strat[, 3]^3
-  rownames(multi) = ids
+  multi[match(strat[,1], ids),2] <- 0.5 + .5 * strat[, 3]
+  multi[match(strat[,1], ids),3] <- 0.5 + .5 * strat[, 3]^2
+  multi[match(strat[,1], ids),4] <- 0.5 + .5 * strat[, 3]^3
+  rownames(multi) <- ids
 
   # regress covariates from phenotype
   if(!is.null(cov)){
