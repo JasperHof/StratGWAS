@@ -35,7 +35,7 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
     #multi <- cbind(pheno[, 3], strat_cov, matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
 
     multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
-    multi[match(strat[, 1], ids), -c(1,2)] <- strat_mat
+    multi[match(strat[, 1], ids), -c(1)] <- strat_mat
 
     rownames(multi) <- ids
   } else {
