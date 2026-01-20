@@ -21,26 +21,17 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   ids <- pheno[,1]
 
   if(is.null(strat_mat)){
-    # reduce stratification variable
+    
+    # reducing stratification variable
     strat <- strat[strat[, 1] %in% pheno[which(pheno[, 3] == 1), 1], ]
-
-    # Set outliers to 0.01 / 0.99 quantiles and impute missing values as mean
-    q01 <- quantile(strat[, 3], 0.01, na.rm = TRUE)
-    q99 <- quantile(strat[, 3], 0.99, na.rm = TRUE)
     strat[is.na(strat[, 3]), 3] <- mean(strat[is.na(strat[, 3]), 3], na.rm = TRUE)
-
-    strat[strat[, 3] < q01, 3] <- q01
-    strat[strat[, 3] > q99, 3] <- q99
     strat[,3] <- as.numeric(scale(as.numeric(strat[, 3])))
 
-    # Apply basis functions
-    n_basis <- length(funs)
-    multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = n_basis))
-    
-    for (i in seq_along(funs)) {
-      basis_vals <- funs[[i]](strat[, 3])
-      multi[match(strat[, 1], ids), i + 1] <- 0.5 + 0.5 * basis_vals
-    }
+    # construct multivariate phenotype
+    strat_mat <- spline_manual(strat[, 3])
+    multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))    
+    multi[match(strat[, 1], ids), -1] <- 0.5 + 0.5 * strat_mat
+
     rownames(multi) <- ids
   } else {
     multi <- strat_mat

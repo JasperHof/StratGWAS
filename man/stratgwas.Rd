@@ -4,7 +4,16 @@
 \alias{stratgwas}
 \title{Compute transformed phenotype using StratGWAS}
 \usage{
-stratgwas(pheno, strat, filename, cov = NULL, block_size = 500)
+stratgwas(
+  pheno,
+  strat,
+  filename,
+  cov = NULL,
+  block_size = 500,
+  cor_g = NULL,
+  strat_mat = NULL,
+  funs = list(function(x) x, function(x) x^2, function(x) x^3)
+)
 }
 \arguments{
 \item{pheno}{Matrix containing binary outcome in PLINK format}

@@ -460,3 +460,23 @@ compute_gencov_checks <- function(strata, filename, nr_blocks, outfile,
   
   return(TRUE)
 }
+
+#' @keywords internal
+spline_manual <- function(x){
+  x <- as.numeric(x)
+  
+  # quantiles as interior knots
+  k <- quantile(x, probs = c(1/3, 2/3))
+  
+  tp <- function(z) pmax(z, 0)^3
+  
+  B <- cbind(
+    x,
+    x^2,
+    x^3,
+    tp(x - k[1]),
+    tp(x - k[2])
+  )
+  
+  return(B)
+}
