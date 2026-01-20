@@ -29,8 +29,13 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
 
     # construct multivariate phenotype
     strat_mat <- spline_manual(strat[, 3])
-    multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))    
-    multi[match(strat[, 1], ids), -1] <- 0.5 + 0.5 * strat_mat
+
+    #strat_cov <- strat[match(ids, strat[, 1]), 3]
+    #strat_cov[is.na(strat_cov)] <- mean(strat_cov, na.rm = T)
+    #multi <- cbind(pheno[, 3], strat_cov, matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
+
+    multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
+    multi[match(strat[, 1], ids), -c(1,2)] <- strat_mat
 
     rownames(multi) <- ids
   } else {
@@ -73,7 +78,32 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   # compute genetic covariance using randomized HE regression
   if(is.null(cor_g)) cor_g = he_multi_part(filename, multi, block_size)
 
+  ############
   # compute genetic correlation
+  ############
+
+  rg <- cor_g
+  
+  for(k in 1:dim(rg)[1]){
+    if(hers[k] < 0){
+      cat(sprintf("SNP heritability of trait %d is negative, so will not compute genetic correlation \n", k))
+      rg[k,] <- NA
+      rg[,k] <- NA
+    } else {
+      rg[k,] <- rg[k,] / sqrt(hers[k])
+      rg[,k] <- rg[,k] / sqrt(hers[k])
+    }
+  }
+
+  # store genetic correlation between binary trait and auxiliary variable
+  gamma <- rg[1, 2]
+  h2_Z <- cor_g[2, 2]
+
+  # now remove this variable from cor_g and multi, not further used
+  #cor_g <- cor_g[-2, -2]
+  #multi <- multi[, -2]
+
+  # compute environmenta; correlation
   cor_total = cor(multi, use = "complete.obs")
   cor_e = cor_total - cor_g
 
@@ -84,13 +114,13 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   if(length(her_neg) > 0){
     # Create informative message about which terms are being removed
     term_names <- c("binary", "linear", "quadratic", "cubic")[her_neg]
-    message("Heritability of ", paste(term_names, collapse = ", "), 
+    message("Heritability of ", paste(term_names, collapse = ", "),
             " term(s) is negative and will be ignored.")
-    
+
     if(length(her_neg) >= 3){
       warning("Too many terms have negative heritability.")
     }
-    
+
     # Remove negative heritability terms
     cor_g_use <- cor_g[-her_neg, -her_neg]
     cor_e_use <- cor_e[-her_neg, -her_neg]
@@ -114,28 +144,10 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   weights <- U1[1,]
   trans_pheno <- cbind(ids, ids, multi_use %*% weights)
 
-  # compute genetic correlation
-  rg <- cor_g
-  
-  for(k in 1:dim(rg)[1]){
-    if(hers[k] < 0){
-      cat(sprintf("SNP heritability of trait %d is negative, so will not compute genetic correlation \n", k))
-      rg[k,] <- NA
-      rg[,k] <- NA
-    } else {
-      rg[k,] <- rg[k,] / sqrt(hers[k])
-      rg[,k] <- rg[,k] / sqrt(hers[k])
-    }
-  }
-
   # compute inflation criterion
-  gamma = rg[1,2]
-
   if(is.na(gamma)){
     message("Can not compute inflation criterion due to negative heritability.")
   } else {
-    h2_Z = cor_g[2,2]
-
     # compute a2 - the correlation between stratification Y' and Z
     y_trans = as.numeric(scale(trans_pheno[,3]))
     y = as.numeric(scale(multi[,1]))
