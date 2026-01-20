@@ -10,7 +10,7 @@
 #' @param filename Prefix of input .bed file
 #' @return Returns covariance matrix of the strata
 #' @export
-stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_g = NULL) {
+stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_g = NULL, funs = list(function(x) x, function(x) x^2, function(x) sin(x), function(x) cos(x))) {
   
   # <performs some checks here> #
 
@@ -20,27 +20,36 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   pheno <- pheno[pheno[, 1] %in% fam[, 1], ]
   ids <- pheno[,1]
 
-  # reduce and scale stratification variable 
+  # reduce stratification variable
   strat <- strat[strat[, 1] %in% pheno[which(pheno[, 3] == 1), 1], ]
-  #strat[,3] <- as.numeric(scale(rank(as.numeric(strat[, 3]))))
 
-  # Set outliers to 0.01/ / 0.99 quantiles
+  # Set outliers to 0.01 / 0.99 quantiles and impute missing values as mean
   q01 <- quantile(strat[, 3], 0.01, na.rm = TRUE)
   q99 <- quantile(strat[, 3], 0.99, na.rm = TRUE)
+  strat[is.na(strat[, 3]), 3] <- mean(strat[is.na(strat[, 3]), 3], na.rm = TRUE)
 
-  # Winsorize
   strat[strat[, 3] < q01, 3] <- q01
   strat[strat[, 3] > q99, 3] <- q99
   strat[,3] <- as.numeric(scale(as.numeric(strat[, 3])))
 
-  # create multivariate phenotype file for HE regression
-  multi <- cbind(pheno[,3], 0, 0, 0, 0)
-  multi[match(strat[,1], ids),2] <- 0.5 + .5 * strat[, 3]
-  multi[match(strat[,1], ids),3] <- 0.5 + .5 * strat[, 3]^2
-  #multi[match(strat[,1], ids),4] <- 0.5 + .5 * strat[, 3]^3
-  multi[match(strat[,1], ids),4] <- 0.5 + .5 * sin(strat[, 3])
-  multi[match(strat[,1], ids),5] <- 0.5 + .5 * cos(strat[, 3])
+  # Apply basis functions
+  n_basis <- length(funs)
+  multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = n_basis))
+  
+  for (i in seq_along(funs)) {
+    basis_vals <- funs[[i]](strat[, 3])
+    multi[match(strat[, 1], ids), i + 1] <- 0.5 + 0.5 * basis_vals
+  }
   rownames(multi) <- ids
+
+  # create multivariate phenotype file for HE regression
+  #multi <- cbind(pheno[,3], 0, 0, 0, 0)
+  #multi[match(strat[,1], ids),2] <- 0.5 + .5 * strat[, 3]
+  #multi[match(strat[,1], ids),3] <- 0.5 + .5 * strat[, 3]^2
+  #multi[match(strat[,1], ids),4] <- 0.5 + .5 * strat[, 3]^3
+  #multi[match(strat[,1], ids),4] <- 0.5 + .5 * sin(strat[, 3])
+  #multi[match(strat[,1], ids),5] <- 0.5 + .5 * cos(strat[, 3])
+  #rownames(multi) <- ids
 
   # regress covariates from phenotype
   if(!is.null(cov)){
@@ -60,13 +69,6 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
       fit <- lm(y ~ ., data = cov_df)
       multi[match(names(residuals(fit)), ids), i] <- residuals(fit)
     }
-
-    # regress only from phenotype
-    #y <- pheno[match(ids, pheno[,1]), 3]
-    #names(y) <- ids
-    #
-    #fit <- lm(y ~ ., data = cov_df)
-    #multi[match(names(residuals(fit)), ids), 1] <- residuals(fit)
   }
 
   # normalize all columns
