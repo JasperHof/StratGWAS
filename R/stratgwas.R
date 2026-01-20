@@ -35,7 +35,7 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
     #multi <- cbind(pheno[, 3], strat_cov, matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
 
     multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
-    multi[match(strat[, 1], ids), -c(1)] <- alpha + alpha * strat_mat
+    multi[match(strat[, 1], ids), -1] <- alpha + strat_mat
 
     rownames(multi) <- ids
   } else {
@@ -89,13 +89,13 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   her_neg <- which(hers < 0)
   
   for(k in 1:dim(rg)[1]){
-    if(hers[k] < 0){
+    if(hers[k] < 0) {
       cat(sprintf("SNP heritability of trait %d is negative, so will not compute genetic correlation \n", k))
-      rg[k,] <- NA
-      rg[,k] <- NA
+      rg[k, ] <- NA
+      rg[, k] <- NA
     } else {
-      rg[k,] <- rg[k,] / sqrt(hers[k])
-      rg[,k] <- rg[,k] / sqrt(hers[k])
+      rg[k, ] <- rg[k, ] / sqrt(hers[k])
+      rg[, k] <- rg[, k] / sqrt(hers[k])
     }
   }
 
