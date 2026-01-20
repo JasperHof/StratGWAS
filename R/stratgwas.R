@@ -10,7 +10,7 @@
 #' @param filename Prefix of input .bed file
 #' @return Returns covariance matrix of the strata
 #' @export
-stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_g = NULL, strat_mat = NULL, funs = list(function(x) x, function(x) x^2, function(x) x^3)) {
+stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_g = NULL, strat_mat = NULL, alpha = 0) {
   
   # <performs some checks here> #
 
@@ -35,7 +35,7 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
     #multi <- cbind(pheno[, 3], strat_cov, matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
 
     multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
-    multi[match(strat[, 1], ids), -c(1)] <- strat_mat
+    multi[match(strat[, 1], ids), -c(1)] <- alpha + alpha * strat_mat
 
     rownames(multi) <- ids
   } else {
