@@ -83,6 +83,10 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   ############
 
   rg <- cor_g
+
+  # check for negative heritability
+  hers <- diag(cor_g)
+  her_neg <- which(hers < 0)
   
   for(k in 1:dim(rg)[1]){
     if(hers[k] < 0){
@@ -106,10 +110,6 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   # compute environmenta; correlation
   cor_total = cor(multi, use = "complete.obs")
   cor_e = cor_total - cor_g
-
-  # check for negative heritability
-  hers <- diag(cor_g)
-  her_neg <- which(hers < 0)
 
   if(length(her_neg) > 0){
     # Create informative message about which terms are being removed
