@@ -1,4 +1,183 @@
 #' @keywords internal  
+validate_stratgwas_inputs <- function(pheno, filename, strat_cont = NULL, 
+                                      strat_cat = NULL, cov = NULL,
+                                      block_size = 500, cor_g = NULL, 
+                                      alpha = 0) {
+  
+  # Check pheno
+  if(is.null(pheno)) {
+    stop("pheno cannot be NULL")
+  }
+  
+  if(!is.matrix(pheno) && !is.data.frame(pheno)) {
+    stop("pheno must be a matrix or data.frame")
+  }
+  
+  if(ncol(pheno) < 3) {
+    stop("pheno must have at least 3 columns: FID, IID, and phenotype")
+  }
+  
+  # Check phenotype is binary (0/1 or 1/2)
+  pheno_vals <- unique(pheno[, 3])
+  pheno_vals <- pheno_vals[!is.na(pheno_vals)]
+  
+  if(!all(pheno_vals %in% c(0, 1))) {
+    stop("Phenotype column (column 3) must contain binary values (0/1)")
+  }
+  
+  if(sum(pheno[, 3] == 1, na.rm = TRUE) < 10) {
+    stop("Too few cases in phenotype. Need at least 10 cases")
+  }
+  
+  # Check for duplicate IDs
+  if(any(duplicated(pheno[, 1]))) {
+    stop("Duplicate IDs found in pheno")
+  }
+  
+  # Check filename and associated files
+  if(is.null(filename) || !is.character(filename)) {
+    stop("filename must be a character string")
+  }
+  
+  required_files <- c(paste0(filename, ".bed"),
+                     paste0(filename, ".bim"),
+                     paste0(filename, ".fam"))
+  
+  missing_files <- required_files[!file.exists(required_files)]
+  if(length(missing_files) > 0) {
+    stop("Missing required files: ", paste(missing_files, collapse = ", "))
+  }
+  
+  # Check strat_cont
+  if(!is.null(strat_cont)) {
+    if(!is.matrix(strat_cont) && !is.data.frame(strat_cont)) {
+      stop("strat_cont must be a matrix or data.frame")
+    }
+    
+    if(ncol(strat_cont) < 3) {
+      stop("strat_cont must have at least 3 columns: FID, IID, and at least one continuous variable")
+    }
+    
+    # Check that continuous columns are numeric
+    cont_cols <- strat_cont[, -(1:2), drop = FALSE]
+    for(i in 1:ncol(cont_cols)) {
+      if(!is.numeric(as.numeric(cont_cols[, i]))) {
+        stop("Column ", i + 2, " in strat_cont cannot be coerced to numeric")
+      }
+    }
+    
+    # Check for overlap with pheno IDs
+    overlap <- sum(strat_cont[, 1] %in% pheno[, 1])
+    if(overlap == 0) {
+      stop("No overlapping IDs between strat_cont and pheno")
+    }
+    if(overlap < nrow(strat_cont) * 0.5) {
+      warning("Less than 50% of strat_cont IDs found in pheno")
+    }
+  }
+  
+  # Check strat_cat
+  if(!is.null(strat_cat)) {
+    if(!is.matrix(strat_cat) && !is.data.frame(strat_cat)) {
+      stop("strat_cat must be a matrix or data.frame")
+    }
+    
+    if(ncol(strat_cat) < 3) {
+      stop("strat_cat must have at least 3 columns: FID, IID, and at least one categorical variable")
+    }
+    
+    # Check that categorical columns have reasonable number of levels
+    cat_cols <- strat_cat[, -(1:2), drop = FALSE]
+    for(i in 1:ncol(cat_cols)) {
+      n_unique <- length(unique(cat_cols[!is.na(cat_cols[, i]), i]))
+      
+      if(n_unique == 0) {
+        stop("Column ", i + 2, " in strat_cat has no non-missing values")
+      }
+      
+      if(n_unique == 1) {
+        warning("Column ", i + 2, " in strat_cat has only one unique value")
+      }
+      
+      if(n_unique > 10) {
+        warning("Column ", i + 2, " in strat_cat has ", n_unique,
+                " levels. Are you sure this is categorical?")
+      }
+    }
+    
+    # Check for overlap with pheno IDs
+    overlap <- sum(strat_cat[, 1] %in% pheno[, 1])
+    if(overlap == 0) {
+      stop("No overlapping IDs between strat_cat and pheno")
+    }
+    if(overlap < nrow(strat_cat) * 0.5) {
+      warning("Less than 50% of strat_cat IDs found in pheno")
+    }
+  }
+  
+  # Check that at least one stratification variable is provided
+  if(is.null(strat_cont) && is.null(strat_cat)) {
+    stop("Must provide at least one of strat_cont or strat_cat")
+  }
+  
+  # Check cov
+  if(!is.null(cov)) {
+    if(!is.matrix(cov) && !is.data.frame(cov)) {
+      stop("cov must be a matrix or data.frame")
+    }
+    
+    if(ncol(cov) < 3) {
+      stop("cov must have at least 3 columns: FID, IID, and at least one covariate")
+    }
+    
+    # Check for overlap with pheno IDs
+    overlap <- sum(cov[, 1] %in% pheno[, 1])
+    if(overlap == 0) {
+      stop("No overlapping IDs between cov and pheno")
+    }
+    if(overlap < nrow(cov) * 0.5) {
+      warning("Less than 50% of cov IDs found in pheno")
+    }
+  }
+  
+  # Check block_size
+  if(!is.numeric(block_size) || block_size <= 50) {
+    stop("block_size must be a positive number > 50")
+  }
+  
+  if(block_size < 100) {
+    warning("block_size is very small (< 100). This may be inefficient.")
+  }
+  
+  # Check cor_g
+  if(!is.null(cor_g)) {
+    if(!is.matrix(cor_g)) {
+      stop("cor_g must be a matrix")
+    }
+    
+    if(nrow(cor_g) != ncol(cor_g)) {
+      stop("cor_g must be a square matrix")
+    }
+    
+    if(!isSymmetric(cor_g)) {
+      warning("cor_g is not symmetric")
+    }
+  }
+  
+  # Check alpha
+  if(!is.numeric(alpha) || length(alpha) != 1) {
+    stop("alpha must be a single numeric value")
+  }
+  
+  if(abs(alpha) > 10) {
+    warning("alpha value is large (|alpha| > 10).")
+  }
+  
+  # All checks passed
+  invisible(NULL)
+}
+
+#' @keywords internal  
 stratify_checks <- function(pheno, strat, K) {
   
   # Check 1: pheno validation
@@ -464,12 +643,12 @@ compute_gencov_checks <- function(strata, filename, nr_blocks, outfile,
 #' @keywords internal
 spline_manual <- function(x){
   x <- as.numeric(x)
-  
+
   # quantiles as interior knots
   k <- quantile(x, probs = c(1/3, 2/3))
-  
+
   tp <- function(z) pmax(z, 0)^3
-  
+
   B <- cbind(
     x,
     x^2,
@@ -477,6 +656,6 @@ spline_manual <- function(x){
     tp(x - k[1]),
     tp(x - k[2])
   )
-  
+
   return(B)
 }

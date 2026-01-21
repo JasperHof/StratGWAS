@@ -12,8 +12,9 @@
 #' @export
 stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov = NULL,
                       block_size = 500, cor_g = NULL, alpha = 0) {
-
-  # <performs some checks here> #
+  # Validate input data
+  validate_stratgwas_inputs(pheno, filename, strat_cont, strat_cat,
+                           cov, block_size, cor_g, alpha)
 
   fam <- read.table(paste0(filename, ".fam"))
 
@@ -219,6 +220,7 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
   # Return list with information
   object = vector("list")
   object[["pheno"]] <- trans_pheno
+  object[["multi"]] <- multi
   object[["cor_g"]] <- cor_g
   object[["cor_e"]] <- cor_e
   object[["rg"]] <- rg
