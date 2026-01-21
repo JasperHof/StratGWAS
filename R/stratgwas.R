@@ -10,47 +10,105 @@
 #' @param filename Prefix of input .bed file
 #' @return Returns covariance matrix of the strata
 #' @export
-stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_g = NULL, strat_mat = NULL, alpha = 0) {
-  
+stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov = NULL,
+                      block_size = 500, cor_g = NULL, alpha = 0) {
+
   # <performs some checks here> #
 
   fam <- read.table(paste0(filename, ".fam"))
 
   # reduce phenotype
   pheno <- pheno[pheno[, 1] %in% fam[, 1], ]
-  ids <- pheno[,1]
+  ids <- pheno[, 1]
 
-  if(is.null(strat_mat)){
-    
-    # reducing stratification variable
-    strat <- strat[strat[, 1] %in% pheno[which(pheno[, 3] == 1), 1], ]
-    strat[is.na(strat[, 3]), 3] <- mean(strat[is.na(strat[, 3]), 3], na.rm = TRUE)
-    strat[,3] <- as.numeric(scale(as.numeric(strat[, 3])))
+  # construct multivariate phenotype for HE-regression
+  multi <- pheno[, 3]
 
-    # construct multivariate phenotype
-    strat_mat <- spline_manual(strat[, 3])
+  # add continuous variables
+  if(!is.null(strat_cont)){
+    # reducing continuous stratification variable
+    strat_cont <- strat_cont[strat_cont[, 1] %in% pheno[which(pheno[, 3] == 1), 1], ]
 
-    #strat_cov <- strat[match(ids, strat[, 1]), 3]
-    #strat_cov[is.na(strat_cov)] <- mean(strat_cov, na.rm = T)
-    #multi <- cbind(pheno[, 3], strat_cov, matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
+    # Get all continuous columns (excluding first 2 ID columns)
+    cont_cols <- strat_cont[, -(1:2), drop = FALSE]
 
-    multi <- cbind(pheno[, 3], matrix(0, nrow = nrow(pheno), ncol = ncol(strat_mat)))
-    multi[match(strat[, 1], ids), -1] <- alpha + strat_mat
+    # Initialize list to store spline basis for each continuous variable
+    spline_list <- list()
 
-    rownames(multi) <- ids
-  } else {
-    multi <- strat_mat
-    rownames(multi) <- ids
+    # Process each continuous column
+    for(col_idx in 1:ncol(cont_cols)){
+      col_data <- cont_cols[, col_idx]
+
+      # Handle missing values - impute with mean
+      col_data <- as.numeric(col_data)
+      col_data[is.na(col_data)] <- mean(col_data, na.rm = TRUE)
+
+      # Standardize
+      col_data <- as.numeric(scale(col_data))
+
+      # Apply spline transformation
+      spline_mat <- spline_manual(col_data)
+      spline_list[[col_idx]] <- spline_mat
+    }
+
+    # Combine all spline matrices
+    if(length(spline_list) > 0){
+      all_splines <- do.call(cbind, spline_list)
+      n_splines <- ncol(all_splines)
+      
+      # Add spline columns to multi
+      multi <- cbind(multi, matrix(0, nrow = nrow(pheno), ncol = n_splines))
+      multi[match(strat_cont[, 1], ids), (ncol(multi) - n_splines + 1):ncol(multi)] <- alpha + all_splines
+    }
   }
 
-  # create multivariate phenotype file for HE regression
-  #multi <- cbind(pheno[,3], 0, 0, 0, 0)
-  #multi[match(strat[,1], ids),2] <- 0.5 + .5 * strat[, 3]
-  #multi[match(strat[,1], ids),3] <- 0.5 + .5 * strat[, 3]^2
-  #multi[match(strat[,1], ids),4] <- 0.5 + .5 * strat[, 3]^3
-  #multi[match(strat[,1], ids),4] <- 0.5 + .5 * sin(strat[, 3])
-  #multi[match(strat[,1], ids),5] <- 0.5 + .5 * cos(strat[, 3])
-  #rownames(multi) <- ids
+  # add categorical variables
+  if(!is.null(strat_cat)){
+    # reducing continuous stratification variable
+    strat_cat <- strat_cat[strat_cat[, 1] %in% pheno[which(pheno[, 3] == 1), 1], ]
+
+    cat_cols <- strat_cat[, -(1:2), drop = FALSE]
+    dummy_list <- list()
+
+    # Process each categorical column
+    for(col_idx in 1:ncol(cat_cols)){
+      col_data <- cat_cols[, col_idx]
+
+      # Handle missing values - replace with most common category (not ideal)
+      if(any(is.na(col_data))){
+        most_common <- names(sort(table(col_data), decreasing = TRUE))[1]
+        col_data[is.na(col_data)] <- most_common
+      }
+
+      # Convert to factor if not already
+      col_data <- as.factor(col_data)
+
+      # Get unique levels (categories)
+      levels_vec <- levels(col_data)
+      n_levels <- length(levels_vec)
+
+      # Create dummy variables
+      if(n_levels > 1){
+        dummy_mat <- matrix(0, nrow = length(col_data), ncol = n_levels - 1)
+        for(i in 2:n_levels){
+          dummy_mat[, i - 1] <- as.numeric(col_data == levels_vec[i])
+        }
+        dummy_list[[col_idx]] <- dummy_mat
+      }
+    }
+
+    # Combine all dummy matrices
+    if(length(dummy_list) > 0){
+      all_dummies <- do.call(cbind, dummy_list)
+      n_dummies <- ncol(all_dummies)
+      
+      # Add dummy columns to multi
+      multi <- cbind(multi, matrix(0, nrow = nrow(pheno), ncol = n_dummies))
+      multi[match(strat_cat[, 1], ids), (ncol(multi) - n_dummies + 1):ncol(multi)] <- alpha + all_dummies
+    }
+  }
+
+  rownames(multi) <- ids
 
   # regress covariates from phenotype
   if(!is.null(cov)){
@@ -79,7 +137,7 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   if(is.null(cor_g)) cor_g = he_multi_part(filename, multi, block_size)
 
   ############
-  # compute genetic correlation
+  # continue computing correlation and transformation variable
   ############
 
   rg <- cor_g
@@ -87,7 +145,7 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   # check for negative heritability
   hers <- diag(cor_g)
   her_neg <- which(hers < 0)
-  
+
   for(k in 1:dim(rg)[1]){
     if(hers[k] < 0) {
       cat(sprintf("SNP heritability of trait %d is negative, so will not compute genetic correlation \n", k))
@@ -103,30 +161,24 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
   gamma <- rg[1, 2]
   h2_Z <- cor_g[2, 2]
 
-  # now remove this variable from cor_g and multi, not further used
-  #cor_g <- cor_g[-2, -2]
-  #multi <- multi[, -2]
-
-  # compute environmenta; correlation
+  # compute environmental correlation
   cor_total = cor(multi, use = "complete.obs")
   cor_e = cor_total - cor_g
 
   if(length(her_neg) > 0){
-    # Create informative message about which terms are being removed
-    term_names <- c("binary", "linear", "quadratic", "cubic")[her_neg]
-    message("Heritability of ", paste(term_names, collapse = ", "),
-            " term(s) is negative and will be ignored.")
+    message("Heritability of term(s) ", paste(her_neg, collapse = ", "),
+            " is negative and will be ignored.")
 
     if(length(her_neg) >= 3){
       warning("Too many terms have negative heritability.")
     }
 
-    # Remove negative heritability terms
+    # remove negative heritability terms from analysis
     cor_g_use <- cor_g[-her_neg, -her_neg]
     cor_e_use <- cor_e[-her_neg, -her_neg]
     multi_use <- multi[, -her_neg]
   } else {
-    # Use full matrices if no negative heritabilities
+    # use full matrices if no negative heritabilities
     cor_g_use <- cor_g
     cor_e_use <- cor_e
     multi_use <- multi
@@ -166,12 +218,12 @@ stratgwas <- function(pheno, strat, filename, cov = NULL, block_size = 500, cor_
 
   # Return list with information
   object = vector("list")
-  object[["pheno"]] = trans_pheno
-  object[["cor_g"]] = cor_g
-  object[["cor_e"]] = cor_e
-  object[["rg"]] = rg
-  object[["criterion"]] = criterion
-  object[["weights"]] = weights
+  object[["pheno"]] <- trans_pheno
+  object[["cor_g"]] <- cor_g
+  object[["cor_e"]] <- cor_e
+  object[["rg"]] <- rg
+  object[["criterion"]] <- criterion
+  object[["weights"]] <- weights
 
   return(object)
 }
