@@ -19,6 +19,7 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
   fam <- read.table(paste0(filename, ".fam"))
 
   # reduce phenotype
+  pheno <- pheno[!is.na(pheno[, 3]), ]
   pheno <- pheno[pheno[, 1] %in% fam[, 1], ]
   ids <- pheno[, 1]
 
@@ -132,10 +133,10 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
   }
 
   # normalize all columns
-  for(i in 1:dim(multi)[2]) multi[, i] = as.numeric(scale(multi[, i]))
+  for(i in 1:dim(multi)[2]) multi[, i] <- as.numeric(scale(multi[, i]))
 
   # compute genetic covariance using randomized HE regression
-  if(is.null(cor_g)) cor_g = he_multi_part(filename, multi, block_size)
+  if(is.null(cor_g)) cor_g <- he_multi_part(filename, multi, block_size)
 
   ############
   # continue computing correlation and transformation variable
