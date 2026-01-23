@@ -6,21 +6,23 @@
 \usage{
 stratgwas(
   pheno,
-  strat,
   filename,
+  strat_cont = NULL,
+  strat_cat = NULL,
   cov = NULL,
   block_size = 500,
   cor_g = NULL,
-  strat_mat = NULL,
-  funs = list(function(x) x, function(x) x^2, function(x) x^3)
+  alpha = 0,
+  constrain_inflation = TRUE,
+  max_criterion = 0.01
 )
 }
 \arguments{
 \item{pheno}{Matrix containing binary outcome in PLINK format}
 
-\item{strat}{Matrix containing stratification variable in PLINK format}
-
 \item{filename}{Prefix of input .bed file}
+
+\item{strat}{Matrix containing stratification variable in PLINK format}
 }
 \value{
 Returns covariance matrix of the strata

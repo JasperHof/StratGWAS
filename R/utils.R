@@ -1,4 +1,4 @@
-#' @keywords internal  
+#' @keywords internal
 validate_stratgwas_inputs <- function(pheno, filename, strat_cont = NULL, 
                                       strat_cat = NULL, cov = NULL,
                                       block_size = 500, cor_g = NULL, 
@@ -658,4 +658,124 @@ spline_manual <- function(x){
   )
 
   return(B)
+}
+
+#' @keywords internal
+greedy_variable_selection <- function(cor_g, cor_e, min_improvement = 0.01, verbose = TRUE) {
+  # Input validation
+  n_vars <- ncol(cor_g)
+  if (n_vars < 2) {
+    stop("Need at least 2 variables for variable selection")
+  }
+  
+  # Check for negative heritabilities
+  hers <- diag(cor_g)
+  her_neg <- which(hers < 0)
+  
+  if (length(her_neg) > 0) {
+    if (verbose) {
+      message("Removing variables with negative heritability: ", 
+              paste(her_neg, collapse = ", "))
+    }
+    valid_vars <- setdiff(1:n_vars, her_neg)
+  } else {
+    valid_vars <- 1:n_vars
+  }
+  
+  # Helper function to compute first eigenvalue for a subset of variables
+  compute_first_eigenvalue <- function(var_indices) {
+    if (length(var_indices) < 2) return(0)
+    
+    cor_g_sub <- cor_g[var_indices, var_indices, drop = FALSE]
+    cor_e_sub <- cor_e[var_indices, var_indices, drop = FALSE]
+    
+    # Perform double decomposition
+    P <- eigen(cor_e_sub)
+    
+    # Check for numerical issues
+    if (any(P$values <= 0)) {
+      return(0)
+    }
+    
+    S_inv <- P$vectors %*% diag(1/sqrt(P$values)) %*% t(P$vectors)
+    M <- S_inv %*% as.matrix(cor_g_sub) %*% S_inv
+    
+    # Get first eigenvalue
+    first_eigenvalue <- eigen(M, only.values = TRUE)$values[1]
+    
+    return(Re(first_eigenvalue))  # Take real part in case of numerical issues
+  }
+  
+  # Initialize with the first valid variable (typically the trait of interest)
+  selected_vars <- valid_vars[1]
+  remaining_vars <- valid_vars[-1]
+  
+  current_eigenvalue <- 0  # Can't compute with just 1 variable
+  
+  if (verbose) {
+    cat("Starting greedy variable selection...\n")
+    cat(sprintf("Initial variable: %d\n\n", selected_vars[1]))
+  }
+  
+  iteration <- 1
+  
+  while (length(remaining_vars) > 0) {
+    best_improvement <- 0
+    best_var <- NULL
+    best_eigenvalue <- current_eigenvalue
+    
+    # Try adding each remaining variable
+    for (var in remaining_vars) {
+      candidate_vars <- c(selected_vars, var)
+      candidate_eigenvalue <- compute_first_eigenvalue(candidate_vars)
+      
+      # Calculate improvement
+      if (current_eigenvalue > 0) {
+        improvement <- (candidate_eigenvalue - current_eigenvalue) / current_eigenvalue
+      } else {
+        # First iteration: use absolute value as improvement
+        improvement <- candidate_eigenvalue
+      }
+      
+      if (improvement > best_improvement) {
+        best_improvement <- improvement
+        best_var <- var
+        best_eigenvalue <- candidate_eigenvalue
+      }
+    }
+    
+    # Check if improvement meets threshold
+    if (current_eigenvalue > 0 && best_improvement < min_improvement) {
+      if (verbose) {
+        cat(sprintf("Iteration %d: Best improvement %.4f%% < %.1f%% threshold. Stopping.\n",
+                    iteration, best_improvement * 100, min_improvement * 100))
+      }
+      break
+    }
+    
+    # Add the best variable
+    selected_vars <- c(selected_vars, best_var)
+    remaining_vars <- setdiff(remaining_vars, best_var)
+    current_eigenvalue <- best_eigenvalue
+    
+    if (verbose) {
+      cat(sprintf("Iteration %d: Added variable %d | Eigenvalue: %.6f | Improvement: %.4f%%\n",
+                  iteration, best_var, current_eigenvalue, 
+                  best_improvement * 100))
+    }
+    
+    iteration <- iteration + 1
+  }
+  
+  if (verbose) {
+    cat(sprintf("\nFinal selection: %d variables selected\n", length(selected_vars)))
+    cat("Selected variables:", paste(selected_vars, collapse = ", "), "\n")
+    cat(sprintf("Final first eigenvalue: %.6f\n", current_eigenvalue))
+  }
+  
+  return(list(
+    selected_vars = selected_vars,
+    final_eigenvalue = current_eigenvalue,
+    n_selected = length(selected_vars)
+  ))
 }

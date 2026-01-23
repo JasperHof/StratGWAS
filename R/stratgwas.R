@@ -11,7 +11,8 @@
 #' @return Returns covariance matrix of the strata
 #' @export
 stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov = NULL,
-                      block_size = 500, cor_g = NULL, alpha = 0) {
+                      block_size = 500, cor_g = NULL, alpha = 0,
+                      constrain_inflation = TRUE, max_criterion = 0.01) {
   # Validate input data
   validate_stratgwas_inputs(pheno, filename, strat_cont, strat_cat,
                            cov, block_size, cor_g, alpha)
@@ -167,6 +168,39 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
   cor_total = cor(multi, use = "complete.obs")
   cor_e = cor_total - cor_g
 
+  #if(length(her_neg) > 0){
+  #  message("Heritability of term(s) ", paste(her_neg, collapse = ", "),
+  #          " is negative and will be ignored.")
+
+  #  if(length(her_neg) >= 3){
+  #    warning("Too many terms have negative heritability.")
+  #  }
+
+  #  # remove negative heritability terms from analysis
+  #  cor_g_use <- cor_g[-her_neg, -her_neg]
+  #  cor_e_use <- cor_e[-her_neg, -her_neg]
+  #  multi_use <- multi[, -her_neg]
+  #} else {
+  #  # use full matrices if no negative heritabilities
+  #  cor_g_use <- cor_g
+  #  cor_e_use <- cor_e
+  #  multi_use <- multi
+  #}
+
+  # perform double decomposition
+  #P <- eigen(cor_e_use)
+  #S_inv <- P$vectors %*% diag(1/sqrt(P$values)) %*% t(P$vectors)
+  #S <- P$vectors %*% diag(sqrt(P$values)) %*% t(P$vectors)
+  #M <- S_inv %*% as.matrix(cor_g_use) %*% S_inv
+  #V <- eigen(M)$vectors
+  #U1 <- t(V) %*% S_inv
+
+  # compute estimated new heritability
+  #D <- U1 %*% t(cor_g_use) %*% t(U1)
+  #cat(sprintf("SNP heritability of transformed phenotype: %.4f\n\n", diag(D)[1]))
+
+  ### New implementation that corrects for inflation criterion
+
   if(length(her_neg) > 0){
     message("Heritability of term(s) ", paste(her_neg, collapse = ", "),
             " is negative and will be ignored.")
@@ -176,31 +210,68 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
     }
 
     # remove negative heritability terms from analysis
-    cor_g_use <- cor_g[-her_neg, -her_neg]
-    cor_e_use <- cor_e[-her_neg, -her_neg]
-    multi_use <- multi[, -her_neg]
+    cor_g_temp <- cor_g[-her_neg, -her_neg]
+    cor_e_temp <- cor_e[-her_neg, -her_neg]
+    multi_temp <- multi[, -her_neg]
   } else {
     # use full matrices if no negative heritabilities
-    cor_g_use <- cor_g
-    cor_e_use <- cor_e
-    multi_use <- multi
+    cor_g_temp <- cor_g
+    cor_e_temp <- cor_e
+    multi_temp <- multi
   }
 
-  # perform double decomposition
-  P <- eigen(cor_e_use)
-  S_inv <- P$vectors %*% diag(1/sqrt(P$values)) %*% t(P$vectors)
-  S <- P$vectors %*% diag(sqrt(P$values)) %*% t(P$vectors)
-  M <- S_inv %*% as.matrix(cor_g_use) %*% S_inv
-  V <- eigen(M)$vectors
-  U1 <- t(V) %*% S_inv
+  # Apply inflation constraint if requested
+  if(constrain_inflation && ncol(multi_temp) >= 2) {
+    opt_result <- find_optimal_scaling(cor_g_temp, cor_e_temp, multi_temp, 
+                                       max_criterion = max_criterion, 
+                                       verbose = TRUE)
+    
+    cor_g_use <- opt_result$cor_g_scaled
+    cor_e_use <- cor_e_temp    # check later - should this be updated to cor_total - cor_g_use?
+    multi_use <- multi_temp
+    weights <- opt_result$weights
+    
+    # Compute D for reporting heritability
+    P <- eigen(cor_e_use)
+    S_inv <- P$vectors %*% diag(1/sqrt(P$values)) %*% t(P$vectors)
+    M <- S_inv %*% as.matrix(cor_g_use) %*% S_inv
+    D <- t(weights) %*% cor_g_use %*% weights
+    
+    cat(sprintf("SNP heritability of transformed phenotype: %.4f\n\n", as.numeric(D)))
+    
+    scaling_applied <- opt_result$scaling_applied
+    
+  } else {
+    # Original code without constraint
+    cor_g_use <- cor_g_temp
+    cor_e_use <- cor_e_temp
+    multi_use <- multi_temp
+    
+    # perform double decomposition
+    P <- eigen(cor_e_use)
+    S_inv <- P$vectors %*% diag(1/sqrt(P$values)) %*% t(P$vectors)
+    S <- P$vectors %*% diag(sqrt(P$values)) %*% t(P$vectors)
+    M <- S_inv %*% as.matrix(cor_g_use) %*% S_inv
+    V <- eigen(M)$vectors
+    U1 <- t(V) %*% S_inv
 
-  # retrieve weightings and compute transformed phenotype
-  weights <- U1[1,]
+    # compute estimated new heritability
+    D <- U1 %*% t(cor_g_use) %*% t(U1)
+    cat(sprintf("SNP heritability of transformed phenotype: %.4f\n\n", diag(D)[1]))
+
+    # retrieve weightings
+    weights <- U1[1,]
+    
+    scaling_applied <- FALSE
+  }
+
+  # compute transformed phenotype
   trans_pheno <- cbind(ids, ids, multi_use %*% weights)
 
   # compute inflation criterion
   if(is.na(gamma)){
     message("Can not compute inflation criterion due to negative heritability.")
+    criterion = NA
   } else {
     # compute a2 - the correlation between stratification Y' and Z
     y_trans = as.numeric(scale(trans_pheno[,3]))
@@ -212,21 +283,40 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
     coefs = fit$coefficients
     a2 = coefs["z"]
 
-    # Compute inflation criterion using genetic correlation
-    criterion = a2^2 * (1 - gamma^2) * h2_Z
-    message(paste0("Expected inflation criterion is ",round(criterion, 4)))
-    if(criterion > 0.01) warning("Inflation criterion is greater than 0.01.")
+    # Compute inflation criterion using ORIGINAL genetic correlation
+    rg_original <- cor_g
+    hers_original <- diag(cor_g)
+    
+    for(k in 1:nrow(rg_original)) {
+      if(hers_original[k] > 0) {
+        rg_original[k, ] <- rg_original[k, ] / sqrt(hers_original[k])
+        rg_original[, k] <- rg_original[, k] / sqrt(hers_original[k])
+      }
+    }
+    
+    gamma_original <- rg_original[1, 2]
+    h2_Z_original <- cor_g[2, 2]
+
+    criterion = a2^2 * (1 - gamma_original^2) * h2_Z_original
+    message(paste0("Expected inflation criterion is ", round(criterion, 4)))
+    if(criterion > max_criterion) {
+      warning(sprintf("Inflation criterion (%.4f) is greater than %.2f.", 
+                     criterion, max_criterion))
+    }
   }
 
   # Return list with information
   object = vector("list")
   object[["pheno"]] <- trans_pheno
   object[["multi"]] <- multi
-  object[["cor_g"]] <- cor_g
+  object[["cor_g"]] <- cor_g  # Original genetic correlation
+  object[["cor_g_scaled"]] <- cor_g_use  # Scaled genetic correlation (if constrained)
   object[["cor_e"]] <- cor_e
   object[["rg"]] <- rg
   object[["criterion"]] <- criterion
   object[["weights"]] <- weights
+  object[["constrained"]] <- constrain_inflation
+  object[["scaling_applied"]] <- scaling_applied
 
   return(object)
 }
