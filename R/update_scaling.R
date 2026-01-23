@@ -59,8 +59,10 @@ find_optimal_scaling <- function(cor_g, cor_e, multi, max_criterion = 0.01,
     a2 <- coefs["z"]
     
     # Compute genetic correlation
-    rg <- cor_g_scaled
-    hers <- diag(cor_g_scaled)
+    #rg <- cor_g_scaled
+    #hers <- diag(cor_g_scaled)
+    rg <- cor_g
+    hers <- diag(cor_g)
     
     for(k in 1:nrow(rg)) {
       if(hers[k] > 0) {
@@ -70,7 +72,8 @@ find_optimal_scaling <- function(cor_g, cor_e, multi, max_criterion = 0.01,
     }
     
     gamma <- rg[1, 2]
-    h2_Z <- cor_g_scaled[2, 2]
+    #h2_Z <- cor_g_scaled[2, 2]
+    h2_Z <- cor_g[2, 2]
     
     if(is.na(gamma) || is.na(a2)) {
       criterion <- NA
