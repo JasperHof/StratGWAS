@@ -12,7 +12,7 @@
 #' @export
 stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov = NULL,
                       block_size = 500, cor_g = NULL, alpha = 0,
-                      constrain_inflation = TRUE, max_criterion = 0.01) {
+                      max_criterion = 0.01) {
   # Validate input data
   validate_stratgwas_inputs(pheno, filename, strat_cont, strat_cat,
                            cov, block_size, cor_g, alpha)
@@ -252,8 +252,6 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
   object[["rg"]] <- rg
   object[["criterion"]] <- criterion
   object[["weights"]] <- weights
-  object[["constrained"]] <- constrain_inflation
-  object[["scaling_applied"]] <- scaling_applied
 
   return(object)
 }
