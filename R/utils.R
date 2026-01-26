@@ -159,9 +159,9 @@ validate_stratgwas_inputs <- function(pheno, filename, strat_cont = NULL,
       stop("cor_g must be a square matrix")
     }
     
-    if(!isSymmetric(cor_g)) {
-      warning("cor_g is not symmetric")
-    }
+    #if(!isSymmetric(cor_g)) {
+    #  warning("cor_g is not symmetric")
+    #}
   }
   
   # Check alpha

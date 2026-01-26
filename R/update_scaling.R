@@ -136,7 +136,7 @@ find_optimal_scaling <- function(cor_g, cor_e, multi, max_criterion = 0.01,
                   iter, mid, result$criterion))
     }
     
-    if((abs(result$criterion - max_criterion) < tolerance) & 
+    if((abs(result$criterion - max_criterion) < tolerance) &
          (result$criterion <= max_criterion)) {
       if(verbose) cat("Converged!\n")
       return(list(
