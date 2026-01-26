@@ -25,7 +25,7 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
                       min_improvement = 0.05, verbose = TRUE) {
   # Validate input data
   validate_stratgwas_inputs(pheno, filename, strat_cont, strat_cat,
-                           cov, block_size, cor_g, alpha)
+                            cov, block_size, cor_g, alpha)
 
   fam <- read.table(paste0(filename, ".fam"))
 
@@ -387,7 +387,8 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
   object[["cor_e"]] <- cor_e
   object[["rg"]] <- rg
   object[["criterion"]] <- criterion
-  object[["weights"]] <- weights
+  object[["weights"]] <- weights_full           # Weights for all variables (zeros for unselected)
+  object[["weights_selected"]] <- weights_selected  # Weights for selected variables only
 
   return(object)
 }
