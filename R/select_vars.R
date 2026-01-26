@@ -12,7 +12,7 @@
 #'   - weights: Final weight vector for selected variables
 #'
 #' @keywords internal
-select_vars <- function(cor_g, cor_e, min_improvement = 0.05, verbose = TRUE) {
+select_vars_greedy <- function(cor_g, cor_e, min_improvement = 0.05, verbose = TRUE) {
   
   n_vars <- nrow(cor_g)
   

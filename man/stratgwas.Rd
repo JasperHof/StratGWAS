@@ -13,8 +13,10 @@ stratgwas(
   block_size = 500,
   cor_g = NULL,
   alpha = 0,
-  constrain_inflation = TRUE,
-  max_criterion = 0.01
+  max_criterion = 0.01,
+  greedy_selection = TRUE,
+  min_improvement = 0.05,
+  verbose = TRUE
 )
 }
 \arguments{
@@ -22,10 +24,28 @@ stratgwas(
 
 \item{filename}{Prefix of input .bed file}
 
-\item{strat}{Matrix containing stratification variable in PLINK format}
+\item{strat_cont}{Matrix containing continuous stratification variables in PLINK format}
+
+\item{strat_cat}{Matrix containing categorical stratification variables in PLINK format}
+
+\item{cov}{Matrix containing covariates in PLINK format}
+
+\item{block_size}{Block size for HE regression}
+
+\item{cor_g}{Pre-computed genetic covariance matrix (optional)}
+
+\item{alpha}{Offset for stratification variables}
+
+\item{max_criterion}{Maximum allowed inflation criterion}
+
+\item{greedy_selection}{Use greedy variable selection (default TRUE)}
+
+\item{min_improvement}{Minimum relative improvement for variable selection (default 0.05 = 5\%)}
+
+\item{verbose}{Print detailed progress information}
 }
 \value{
-Returns covariance matrix of the strata
+Returns list with transformed phenotype and diagnostic information
 }
 \description{
 Compute genetic covariance of subgroups using Haseman-Elston regression
