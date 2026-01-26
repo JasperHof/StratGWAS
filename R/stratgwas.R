@@ -195,6 +195,9 @@ stratgwas <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, cov 
   V <- eigen(M)$vectors
   U1 <- t(V) %*% S_inv
 
+  #get weights
+  weights <- U1[1,]
+
   # compute estimated new heritability
   D <- U1 %*% t(cor_g_use) %*% t(U1)
   cat(sprintf("SNP heritability of transformed phenotype: %.4f\n\n", diag(D)[1]))
