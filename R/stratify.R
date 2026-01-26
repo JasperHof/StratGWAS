@@ -47,20 +47,22 @@ stratify <- function(pheno, strat, K = 5) {
     strat_cases$groups <- match(strat_cases[, 3], sort(unique(strat[, 3])))
   } else {
     # Quantile-based stratification with jittered ranks for tie-breaking
-    strat_cases$groups <- assign_to_quantiles(strat_cases[, 3], K)
+    result <- assign_to_quantiles(strat_cases[, 3], K)
+    strat_cases$groups <- result$groups
+    strat_cases$order <- result$order
   }
 
   # Create stratified phenotype lists
   strata <- create_strata_list(pheno, strat_cases, K)
 
   # Return list with information
-  strata[["K"]] = K
-  strata[["y"]] = pheno
-  strata[["Z"]] = strat
-  strata[["info"]] = strat_cases
-  strata[["ids"]] = ids
-  strata[["strat_miss"]] = cases_nostrat
-  strata[["sparse"]] = sparse
+  strata[["K"]] <- K
+  strata[["y"]] <- pheno
+  strata[["Z"]] <- strat
+  strata[["info"]] <- strat_cases
+  strata[["ids"]] <- ids
+  strata[["strat_miss"]] <- cases_nostrat
+  strata[["sparse"]] <- sparse
 
   return(strata)
 }
@@ -71,27 +73,29 @@ stratify <- function(pheno, strat, K = 5) {
 #' @param K Number of quantile groups
 #' @return Integer vector of group assignments (1 to K)
 assign_to_quantiles <- function(x, K = 5) {
-
   # Calculate ranks (handles ties by averaging)
   ranks <- rank(x, ties.method = "average")
-
-  # Convert to percentiles
+  
+  # Convert to percentiles (this becomes the "order" variable)
   percentiles <- ranks / length(ranks)
-
-  # Add minimal jitter to break remaining ties
+  
+  # Add minimal jitter to break remaining ties for group assignment
   set.seed(123)  # For reproducibility
   percentiles_jittered <- percentiles + rnorm(length(percentiles),
-                                              mean = 0,
-                                              sd = 1e-6)
-
+                                               mean = 0,
+                                               sd = 1e-6)
+  
   # Assign to quantile groups
   breaks <- seq(0, 1, length.out = K + 1)
   groups <- cut(percentiles_jittered,
                 breaks = breaks,
                 labels = 1:K,
                 include.lowest = TRUE)
-
-  return(as.integer(groups))
+  
+  return(list(
+    groups = as.integer(groups),
+    order = percentiles  # Return the percentile ranks as the order
+  ))
 }
 
 #' Create list of stratified phenotypes
