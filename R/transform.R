@@ -25,6 +25,7 @@ transform <- function(strata, gencov, outfile) {
   group_table <- table(strata$info$groups)
   cum <- cumsum(group_table)
   medians <- (cum - 0.5 * (cum - c(0, cum[-length(cum)]))) / max(cum)
+  medians_obs <- lapply(1:K, function(x) mean(strata$info[which(strata$info$groups == x), 3], na.rm = TRUE))
 
   if(strata$sparse){
     # Make the transformed phenotype - directly from eigendecomposition
@@ -37,10 +38,15 @@ transform <- function(strata, gencov, outfile) {
 
   } else {
     # Smooth medians through transformation
-    fit <- smooth.spline(medians, as.numeric(trans), spar = 0.2)
-    trans_pred <- predict(fit, strata$info$order)$y
-    names(trans_pred) <- strata$info[, 1]
+    #fit <- smooth.spline(medians, as.numeric(trans), spar = 0.2)
+    #trans_pred <- predict(fit, strata$info$order)$y
+    #names(trans_pred) <- strata$info[, 1]
     
+    # Alternative, smooth directly through values
+    fit <- smooth.spline(medians_obs, as.numeric(trans), spar = 0.2)
+    trans_pred <- predict(fit, strata$info[, 3])$y
+    names(trans_pred) <- strata$info[, 1]
+
     # Make the transformed phenotype
     trans_pheno <- cbind(ids, ids, 0)
     idx <- match(names(trans_pred), trans_pheno[, 1])

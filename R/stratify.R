@@ -19,25 +19,26 @@ stratify <- function(pheno, strat, K = 5) {
   # Store IDs
   ids <- pheno[, 1]
 
+  # Match with phenotype
+  strat <- strat[match(ids, strat[, 1]), ]
+  strat[, 1] <- strat[, 2] <- ids
+
   # Identify cases with missing stratification variables
   cases <- pheno[which(pheno[, 3] == 1), 1]
   cases_nostrat <- strat[which(strat[, 1] %in% cases & is.na(strat[, 3])), 1]
 
   # These are removed for now and later added
-  pheno <- pheno[!(pheno[, 1] %in% cases_nostrat), ]
-  strat <- strat[!(strat[, 1] %in% cases_nostrat), ]
-
-  # Match with phenotype
-  strat <- strat[match(pheno[, 1], strat[, 1]), ]
+  #pheno <- pheno[!(pheno[, 1] %in% cases_nostrat), ]
+  #strat <- strat[!(strat[, 1] %in% cases_nostrat), ]
 
   # Extract stratification variable and compute quintiles
-  strat_cases <- strat[which(pheno[,3] == 1), ]
+  strat_cases <- strat[which(pheno[, 3] == 1 & !(pheno[, 1] %in% cases_nostrat)), ]
 
   # Determine stratification approach
   n_unique <- length(unique(strat[!is.na(strat[, 3]), 3]))
   sparse <- n_unique < 10
 
-  # Define groups 
+  # Define groups
   if (sparse) {
     # Groups defined by input groups
     message(sprintf("Only %d unique stratification values detected. 
