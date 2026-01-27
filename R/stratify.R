@@ -8,7 +8,7 @@
 #' @return Returns list containing subgroup phenotypes
 #' @export
 stratify <- function(pheno, strat, K = 5, cov = NULL) {
-  
+
   # Check input data
   stratify_checks(pheno, strat, K)
 
@@ -50,7 +50,7 @@ stratify <- function(pheno, strat, K = 5, cov = NULL) {
   }
 
   # Create stratified phenotype lists
-  strata <- create_strata_list(pheno, strat_cases, K)
+  strata <- create_strata_list(pheno, strat_cases, K, cov = cov, ids = ids)
 
   # Return list with information
   strata[["K"]] <- K
@@ -126,18 +126,17 @@ create_strata_list <- function(pheno, strat_cases, K, cov = NULL, ids) {
     if (!is.null(cov)) {
       y <- stratum_pheno[, 3]
       names(y) <- stratum_pheno[, 1]
-      
+
       # Match covariate rows to stratum samples
       stratum_ids <- stratum_pheno[, 1]
       stratum_cov <- cov_df[match(stratum_ids, ids), , drop = FALSE]
-      
+
       fit <- lm(y ~ ., data = stratum_cov)
       stratum_pheno[match(names(residuals(fit)), stratum_pheno[, 1]), 3] <- residuals(fit)
     }
 
     # Normalize phenotype (mean 0, sd 1)
     stratum_pheno[, 3] <- as.numeric(scale(stratum_pheno[, 3]))
-
     strata[[k]] <- stratum_pheno
   }
 

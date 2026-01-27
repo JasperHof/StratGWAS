@@ -30,10 +30,12 @@ transform <- function(strata, gencov, outfile) {
   strat_scale <- as.numeric(scale(strata$info[, 3]))
   medians_obs <- unlist(lapply(1:K, function(x) mean(strat_scale[which(strata$info$groups == x)], na.rm = TRUE)))
 
-  if(strata$sparse){
-    # Make the transformed phenotype - directly from eigendecomposition
-    trans_pheno <- cbind(ids, ids, 0)
+  # Initialize transformed phenotype with controls
+  trans_pheno <- cbind(ids, ids, 0)
+  control_ids <- strata$y[strata$y[, 3] == 0, 1]
 
+  if(strata$sparse){
+    # For sparse case: use transformation weights on residualized case phenotypes
     for (k in 1:K) {
       group_ids <- strata$info[strata$info$groups == k, 1]
       trans_pheno[ids %in% group_ids, 3] <- trans[k]
@@ -48,13 +50,29 @@ transform <- function(strata, gencov, outfile) {
     # Alternative, smooth directly through values
     fit <- smooth.spline(medians_obs, as.numeric(trans), spar = 0.2)
     trans_pred <- predict(fit, strat_scale)$y
+
+    # Make the transformed phenotype (27-01-26)
     names(trans_pred) <- strata$info[, 1]
 
-    # Make the transformed phenotype
-    trans_pheno <- cbind(ids, ids, 0)
-    idx <- match(names(trans_pred), trans_pheno[, 1])
-    valid <- !is.na(idx)
-    trans_pheno[idx[valid], 3] <- trans_pred[valid]
+    # Scale phenotype to 0 / 1, then multiply with weight
+    for (k in 1:K) {
+      stratum <- strata[[k]]
+      stratum[, 3] <- stratum[, 3] - mean(stratum[stratum[, 1] %in% control_ids, 3], na.rm = T)
+      stratum[, 3] <- stratum[, 3] / mean(stratum[!stratum[, 1] %in% control_ids, 3], na.rm = T)
+
+      weights <- trans_pred[match(stratum[, 1], names(trans_pred))]
+      weights[is.na(weights)] <- mean(weights, na.rm = T)
+
+      trans_pheno[match(stratum[, 1], trans_pheno[, 1]), 3] <- stratum[, 3] * weights
+    }
+
+    trans_pheno[trans_pheno[, 1] %in% control_ids, ] <- trans_pheno[trans_pheno[, 1] %in% control_ids, ] / K
+    
+    # Make the transformed phenotype (26-01-26)
+    #names(trans_pred) <- strata$info[, 1]
+    #idx <- match(names(trans_pred), trans_pheno[, 1])
+    #valid <- !is.na(idx)
+    #trans_pheno[idx[valid], 3] <- trans_pred[valid]
   } 
 
   # Add back cases with missing stratification variable
@@ -63,10 +81,10 @@ transform <- function(strata, gencov, outfile) {
     case_ids <- strata$y[strata$y[, 3] == 1, 1]
     case_indices <- trans_pheno[, 1] %in% case_ids
     mean_case_pheno <- mean(as.numeric(trans_pheno[case_indices, 3]), na.rm = TRUE)
-    
+
     trans_pheno_add <- cbind(strata$strat_miss, strata$strat_miss, mean_case_pheno)
     trans_pheno <- rbind(trans_pheno, trans_pheno_add)
-    
+
     # Sort back to original order
     trans_pheno <- trans_pheno[match(strata$ids, trans_pheno[, 1]), ]
   }

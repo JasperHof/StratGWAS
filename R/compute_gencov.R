@@ -55,7 +55,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
   write.table(multi_pheno, paste0(outfile, ".strata"), 
               quote = FALSE, row.names = FALSE, col.names = FALSE)
 
-  # Perform a linear regression on the data: (i) subtypes; (ii) disease; (iii) stratification variable
+  # Perform a linear regression on K+2-dimensional phenotype: (i) K subtypes; (ii) disease; (iii) stratification variable
   if (is.null(ss_list)) {
     linear_gwas(filename, multi, nr_blocks, outfile)
 
