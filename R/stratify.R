@@ -7,7 +7,7 @@
 #' @param filename Prefix of input .bed file
 #' @return Returns list containing subgroup phenotypes
 #' @export
-stratify <- function(pheno, strat, K = 5) {
+stratify <- function(pheno, strat, K = 5, cov = NULL) {
   
   # Check input data
   stratify_checks(pheno, strat, K)
@@ -26,10 +26,6 @@ stratify <- function(pheno, strat, K = 5) {
   # Identify cases with missing stratification variables
   cases <- pheno[which(pheno[, 3] == 1), 1]
   cases_nostrat <- strat[which(strat[, 1] %in% cases & is.na(strat[, 3])), 1]
-
-  # These are removed for now and later added
-  #pheno <- pheno[!(pheno[, 1] %in% cases_nostrat), ]
-  #strat <- strat[!(strat[, 1] %in% cases_nostrat), ]
 
   # Extract stratification variable and compute quintiles
   strat_cases <- strat[which(pheno[, 3] == 1 & !(pheno[, 1] %in% cases_nostrat)), ]
@@ -105,15 +101,39 @@ assign_to_quantiles <- function(x, K = 5) {
 #' @param strat_cases Stratification info for cases
 #' @param K Number of strata
 #' @return List of phenotype data.frames, one per stratum
-create_strata_list <- function(pheno, strat_cases, K) {
+create_strata_list <- function(pheno, strat_cases, K, cov = NULL, ids) {
 
   strata <- vector("list", K)
   names(strata) <- paste0("group", 1:K)
+
+  # Prepare covariate data if provided
+  if (!is.null(cov)) {
+    cov_df <- cov[match(ids, cov[, 1]), -(1:2), drop = FALSE]
+    cov_df[] <- lapply(cov_df, function(x) {
+      x <- as.numeric(x)
+      x[is.na(x)] <- mean(x, na.rm = TRUE)
+      x
+    })
+    rownames(cov_df) <- ids
+  }
 
   for (k in 1:K) {
     # Select controls (pheno == 0) and cases from stratum k
     cases_in_stratum <- strat_cases[strat_cases$groups == k, 1]
     stratum_pheno <- pheno[pheno[, 3] == 0 | pheno[, 1] %in% cases_in_stratum, ]
+
+    # Regress covariates from phenotype if provided
+    if (!is.null(cov)) {
+      y <- stratum_pheno[, 3]
+      names(y) <- stratum_pheno[, 1]
+      
+      # Match covariate rows to stratum samples
+      stratum_ids <- stratum_pheno[, 1]
+      stratum_cov <- cov_df[match(stratum_ids, ids), , drop = FALSE]
+      
+      fit <- lm(y ~ ., data = stratum_cov)
+      stratum_pheno[match(names(residuals(fit)), stratum_pheno[, 1]), 3] <- residuals(fit)
+    }
 
     # Normalize phenotype (mean 0, sd 1)
     stratum_pheno[, 3] <- as.numeric(scale(stratum_pheno[, 3]))
