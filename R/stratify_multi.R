@@ -55,24 +55,12 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
       colnames(strat_cases) <- c("FID", "IID", "strat_val")
       strat_cases_vals <- strat_cases[, 3]
       
-      # Determine stratification approach
-      n_unique <- length(unique(strat_cases_vals[!is.na(strat_cases_vals)]))
-      sparse <- n_unique < 10
-      
       # Define groups
-      if (sparse) {
-        message(sprintf("Continuous variable %d: Only %d unique values detected. Using K=%d strata",
-                        i, n_unique, n_unique))
-        K_use <- n_unique
-        strat_cases$groups <- match(strat_cases_vals, sort(unique(strat_cases_vals)))
-        strat_cases$order <- NA
-      } else {
-        K_use <- K
-        result <- assign_to_quantiles(strat_cases_vals, K)
-        strat_cases$groups <- result$groups
-        strat_cases$order <- result$order
-      }
-      
+      K_use <- K
+      result <- assign_to_quantiles(strat_cases_vals, K)
+      strat_cases$groups <- result$groups
+      strat_cases$order <- result$order
+
       # Create stratified phenotype lists for this variable
       for(k in 1:K_use) {
         K_total <- K_total + 1
@@ -91,6 +79,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
       # Store stratification info
       all_strat_info[[length(all_strat_info) + 1]] <- list(
         data = strat_cases,
+        original = strat_cont[, c(1, 2, 2 + i)],
         type = "continuous",
         K = K_use,
         cases_nostrat = cases_nostrat,
@@ -186,10 +175,10 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
 
     colnames(var_add) <- paste0(all_strat_info[[k]]$type, "_", all_strat_info[[k]]$var_index, "_", 1:all_strat_info[[k]]$K)
 
-    # In the case of a continuous variable, add this
+    # In the case of a continuous variable, add this (INCLUDING ALL CASES!)
     if(all_strat_info[[k]]$type == "continuous"){
       add_cont <- rep(NA, length(ids))
-      add_cont[match(all_strat_info[[k]]$data[, 1], ids)] <- all_strat_info[[k]]$data[, 3]
+      add_cont[match(all_strat_info[[k]]$original[, 1], ids)] <- all_strat_info[[k]]$original[, 3]
       var_add <- cbind(var_add, add_cont)
 
       colnames(var_add)[ncol(var_add)] <- paste0(all_strat_info[[k]]$type, "_", all_strat_info[[k]]$var_index)
