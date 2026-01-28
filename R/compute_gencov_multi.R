@@ -50,7 +50,7 @@ compute_gencov_multi <- function(strata, filename, nr_blocks = 1000, outfile,
 
   # Write phenotype file
   multi_pheno_out <- cbind(fam_ids, fam_ids, multi_matched)
-  write.table(multi_pheno_out, paste0(outfile, ".strata"), 
+  write.table(multi_pheno_out, paste0(outfile, ".strata"),
               quote = FALSE, row.names = FALSE, col.names = FALSE)
 
   # Perform linear regression on all phenotypes

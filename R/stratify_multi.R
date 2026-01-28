@@ -84,9 +84,6 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
           stratum_pheno <- apply_covariate_regression_single(stratum_pheno, cov, ids)
         }
         
-        # Normalize phenotype
-        stratum_pheno[, 3] <- as.numeric(scale(stratum_pheno[, 3]))
-        
         # Store in strata list
         strata[[paste0("group", K_total)]] <- stratum_pheno
       }
@@ -141,9 +138,6 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
         if(!is.null(cov)) {
           stratum_pheno <- apply_covariate_regression_single(stratum_pheno, cov, ids)
         }
-        
-        # Normalize phenotype
-        stratum_pheno[, 3] <- as.numeric(scale(stratum_pheno[, 3]))
         
         # Store in strata list
         strata[[paste0("group", K_total)]] <- stratum_pheno
@@ -206,7 +200,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
 
   # Determine if covariates were used
   cov_used <- !is.null(cov)
-  
+
   # Return list with information (matching original structure)
   strata[["K"]] <- K_total
   strata[["y"]] <- pheno
@@ -248,4 +242,35 @@ apply_covariate_regression_single <- function(stratum_pheno, cov, ids) {
   stratum_pheno[match(names(residuals(fit)), stratum_pheno[, 1]), 3] <- residuals(fit)
   
   return(stratum_pheno)
+}
+
+#' Assign values to quantile-based groups
+#'
+#' @param x Numeric vector to stratify
+#' @param K Number of quantile groups
+#' @return Integer vector of group assignments (1 to K)
+assign_to_quantiles <- function(x, K = 5) {
+  # Calculate ranks (handles ties by averaging)
+  ranks <- rank(x, ties.method = "average")
+  
+  # Convert to percentiles (this becomes the "order" variable)
+  percentiles <- ranks / length(ranks)
+  
+  # Add minimal jitter to break remaining ties for group assignment
+  set.seed(123)  # For reproducibility
+  percentiles_jittered <- percentiles + rnorm(length(percentiles),
+                                               mean = 0,
+                                               sd = 1e-6)
+  
+  # Assign to quantile groups
+  breaks <- seq(0, 1, length.out = K + 1)
+  groups <- cut(percentiles_jittered,
+                breaks = breaks,
+                labels = 1:K,
+                include.lowest = TRUE)
+  
+  return(list(
+    groups = as.integer(groups),
+    order = percentiles  # Return the percentile ranks as the order
+  ))
 }
