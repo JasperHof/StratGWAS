@@ -52,6 +52,9 @@ stratify <- function(pheno, strat, K = 5, cov = NULL) {
   # Create stratified phenotype lists
   strata <- create_strata_list(pheno, strat_cases, K, cov = cov, ids = ids)
 
+  # More information variables
+  cov_used <- is.null(cov)
+
   # Return list with information
   strata[["K"]] <- K
   strata[["y"]] <- pheno
