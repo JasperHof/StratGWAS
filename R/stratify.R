@@ -63,6 +63,7 @@ stratify <- function(pheno, strat, K = 5, cov = NULL) {
   strata[["ids"]] <- ids
   strata[["strat_miss"]] <- cases_nostrat
   strata[["sparse"]] <- sparse
+  strata[["cov_used"]] <- cov_used
 
   return(strata)
 }

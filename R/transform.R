@@ -24,7 +24,6 @@ transform <- function(strata, gencov, outfile) {
   # Compute medians for smoothing stratification variables
   group_table <- table(strata$info$groups)
   cum <- cumsum(group_table)
-  medians <- (cum - 0.5 * (cum - c(0, cum[-length(cum)]))) / max(cum)
 
   # Compute medians for scaled stratification variable
   strat_scale <- as.numeric(scale(strata$info[, 3]))
@@ -42,38 +41,33 @@ transform <- function(strata, gencov, outfile) {
     }
 
   } else {
-    # Smooth medians through transformation
-    #fit <- smooth.spline(medians, as.numeric(trans), spar = 0.2)
-    #trans_pred <- predict(fit, strata$info$order)$y
-    #names(trans_pred) <- strata$info[, 1]
-    
-    # Alternative, smooth directly through values
+    # Smooth through values
     fit <- smooth.spline(medians_obs, as.numeric(trans), spar = 0.2)
     trans_pred <- predict(fit, strat_scale)$y
 
     # Make the transformed phenotype (27-01-26)
     names(trans_pred) <- strata$info[, 1]
 
-    # Scale phenotype to 0 / 1, then multiply with weight
-    for (k in 1:K) {
-      stratum <- strata[[k]]
-      stratum[, 3] <- stratum[, 3] - mean(stratum[stratum[, 1] %in% control_ids, 3], na.rm = T)
-      stratum[, 3] <- stratum[, 3] / mean(stratum[!stratum[, 1] %in% control_ids, 3], na.rm = T)
+    if(strata$cov_used){
+      for (k in 1:K) {
+        # Scale phenotype to 0 / 1, then multiply with weight
+        stratum <- strata[[k]]
+        stratum[, 3] <- stratum[, 3] - mean(stratum[stratum[, 1] %in% control_ids, 3], na.rm = T)
+        stratum[, 3] <- stratum[, 3] / mean(stratum[!stratum[, 1] %in% control_ids, 3], na.rm = T)
 
-      weights <- trans_pred[match(stratum[, 1], names(trans_pred))]
-      weights[is.na(weights)] <- mean(weights, na.rm = T)
+        weights <- trans_pred[match(stratum[, 1], names(trans_pred))]
+        weights[is.na(weights)] <- mean(weights, na.rm = T)
 
-      trans_pheno[match(stratum[, 1], trans_pheno[, 1]), 3] <- stratum[, 3] * weights
+        trans_pheno[match(stratum[, 1], trans_pheno[, 1]), 3] <- stratum[, 3] * weights
+      }
+      trans_pheno[trans_pheno[, 1] %in% control_ids, 3] <- trans_pheno[trans_pheno[, 1] %in% control_ids, 3] / K
+      
+    } else {
+      idx <- match(names(trans_pred), trans_pheno[, 1])
+      valid <- !is.na(idx)
+      trans_pheno[idx[valid], 3] <- trans_pred[valid]
     }
-
-    trans_pheno[trans_pheno[, 1] %in% control_ids, 3] <- trans_pheno[trans_pheno[, 1] %in% control_ids, 3] / K
-    
-    # Make the transformed phenotype (26-01-26)
-    #names(trans_pred) <- strata$info[, 1]
-    #idx <- match(names(trans_pred), trans_pheno[, 1])
-    #valid <- !is.na(idx)
-    #trans_pheno[idx[valid], 3] <- trans_pred[valid]
-  } 
+  }
 
   # Add back cases with missing stratification variable
   if (length(strata$strat_miss) > 0) {
