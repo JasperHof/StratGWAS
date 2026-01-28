@@ -1,4 +1,4 @@
-#' Stratify cases
+#' Stratify cases based on multiple auxiliary variabales
 #'
 #' Compute case subgroups by stratification based on input variable
 #'
