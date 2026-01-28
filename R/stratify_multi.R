@@ -161,7 +161,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
   }))
   
   # Create a multivariate dataframe for linear regression + SumHer
-  multi <- cbind(ids, ids)
+  multi <- cbind(ids, ids, pheno[, 3])
 
   for(k in 1:length(all_strat_info)){
     var_add  <- NULL
@@ -178,7 +178,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
     # In the case of a continuous variable, add this (INCLUDING ALL CASES!)
     if(all_strat_info[[k]]$type == "continuous"){
       add_cont <- rep(NA, length(ids))
-      add_cont[match(all_strat_info[[k]]$original[, 1], ids)] <- all_strat_info[[k]]$original[, 3]
+      add_cont <- all_strat_info[[k]]$original[match(ids, all_strat_info[[k]]$original[, 1]), 3]
       var_add <- cbind(var_add, add_cont)
 
       colnames(var_add)[ncol(var_add)] <- paste0(all_strat_info[[k]]$type, "_", all_strat_info[[k]]$var_index)
