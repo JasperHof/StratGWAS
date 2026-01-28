@@ -66,7 +66,7 @@ transform <- function(strata, gencov, outfile) {
       trans_pheno[match(stratum[, 1], trans_pheno[, 1]), 3] <- stratum[, 3] * weights
     }
 
-    trans_pheno[trans_pheno[, 1] %in% control_ids, ] <- trans_pheno[trans_pheno[, 1] %in% control_ids, ] / K
+    trans_pheno[trans_pheno[, 1] %in% control_ids, 3] <- trans_pheno[trans_pheno[, 1] %in% control_ids, 3] / K
     
     # Make the transformed phenotype (26-01-26)
     #names(trans_pred) <- strata$info[, 1]
