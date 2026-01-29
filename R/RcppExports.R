@@ -29,6 +29,10 @@ linear_gwas <- function(filename, pheno_mat, block_size, out_file) {
     .Call(`_StratGWAS_linear_gwas`, filename, pheno_mat, block_size, out_file)
 }
 
+linear_gwas_parallel <- function(filename, pheno_mat, block_size, out_file) {
+    .Call(`_StratGWAS_linear_gwas_parallel`, filename, pheno_mat, block_size, out_file)
+}
+
 readBedBlock <- function(filename, n_ind, n_snp, start_ind, end_ind, start_snp, end_snp) {
     .Call(`_StratGWAS_readBedBlock`, filename, n_ind, n_snp, start_ind, end_ind, start_snp, end_snp)
 }

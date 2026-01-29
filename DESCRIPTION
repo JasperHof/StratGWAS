@@ -7,6 +7,8 @@ License: GPL-3
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.3
-Imports: Rcpp
-LinkingTo: Rcpp, RcppEigen
-
+LinkingTo: Rcpp, RcppEigen, RcppParallel
+Imports: 
+    Rcpp,
+    RcppParallel
+SystemRequirements: GNU make, C++11
