@@ -73,7 +73,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
         }
         
         # Store in strata list
-        strata[[paste0("group", K_total)]] <- stratum_pheno
+        #strata[[paste0("group", K_total)]] <- stratum_pheno
       }
       
       # Store stratification info
@@ -129,7 +129,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
         }
         
         # Store in strata list
-        strata[[paste0("group", K_total)]] <- stratum_pheno
+        #strata[[paste0("group", K_total)]] <- stratum_pheno
       }
       
       # Store stratification info
@@ -162,6 +162,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
   
   # Create a multivariate dataframe for linear regression + SumHer
   multi <- cbind(ids, ids, pheno[, 3])
+  colnames(multi) <- c("FID", "IID", "pheno")
 
   for(k in 1:length(all_strat_info)){
     var_add  <- NULL
