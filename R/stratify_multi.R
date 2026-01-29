@@ -72,8 +72,6 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
           stratum_pheno <- apply_covariate_regression_single(stratum_pheno, cov, ids)
         }
         
-        # Store in strata list
-        #strata[[paste0("group", K_total)]] <- stratum_pheno
       }
       
       # Store stratification info
@@ -192,7 +190,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
   cov_used <- !is.null(cov)
 
   # Return list with information (matching original structure)
-  strata[["K"]] <- K_total
+  strata[["K"]] <- K
   strata[["y"]] <- pheno
   strata[["multi"]] <- multi
   strata[["info"]] <- all_cases_combined

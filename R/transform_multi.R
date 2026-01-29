@@ -28,6 +28,26 @@ transform_multi <- function(strata, gencov_multi) {
   gencov_use <- gencov[idx, idx]
   multi_use <- strata$multi[, colnames(strata$multi) %in% names]
 
+  # Update observed scale heritabilities of categorical groups
+  for(k in 1:length(strata$strat_details)){
+    if(strata$strat_details[[k]]$type == "categorical"){
+      vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
+
+      h2_obs <- diag(gencov_use[vars, vars])
+      prevs <- colMeans(multi_use[, vars], na.rm = T)
+
+      # compute relative to prevalence 1 / K (used for cont. variables)
+      fac <- (1/strata$K * (1 - 1/strata$K)) / (prevs * (1 - prevs))
+      h2_adj <- h2_obs * fac
+
+      # update genetic covariance
+      for(i in 1:length(vars)){
+        gencov_use[vars[i], ] <- gencov_use[vars[i], ] * sqrt(fac[i])
+        gencov_use[, vars[i]] <- gencov_use[, vars[i]] * sqrt(fac[i])
+      }
+    } 
+  } 
+
   # Compute eigenvector transformation
   trans <- eigen(gencov_use)$vectors[, 1]
   names(trans) <- names
