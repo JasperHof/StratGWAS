@@ -12,25 +12,25 @@
 stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, cov = NULL) {
 
   # Store IDs
-  ids <- pheno[, 1]
-  control_ids <- pheno[which(pheno[, 3] == 0), 1]
+  ids <- pheno[, 2]
+  control_ids <- pheno[which(pheno[, 3] == 0), 2]
 
   # Convert to data.frame
   pheno <- as.data.frame(pheno)
 
   if(!is.null(strat_cont)){
     strat_cont <- as.data.frame(strat_cont)
-    strat_cont <- strat_cont[match(ids, strat_cont[, 1]), ]
+    strat_cont <- strat_cont[match(ids, strat_cont[, 2]), ]
     strat_cont[, 1] <- strat_cont[, 2] <- ids
   }
   if(!is.null(strat_bin)){
     strat_bin <- as.data.frame(strat_bin)
-    strat_bin <- strat_bin[match(ids, strat_bin[, 1]), ]
+    strat_bin <- strat_bin[match(ids, strat_bin[, 2]), ]
     strat_bin[, 1] <- strat_bin[, 2] <- ids
   }
 
   # Identify cases
-  cases <- pheno[which(pheno[, 3] == 1), 1]
+  cases <- pheno[which(pheno[, 3] == 1), 2]
   
   # Initialize for tracking all strata
   all_strat_info <- list()
@@ -47,11 +47,11 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
       strat_col <- strat_cont[, 2 + i]
       
       # Identify cases with missing stratification
-      cases_nostrat <- strat_cont[which(strat_cont[, 1] %in% cases & is.na(strat_col)), 1]
+      cases_nostrat <- strat_cont[which(strat_cont[, 2] %in% cases & is.na(strat_col)), 2]
       all_cases_nostrat <- c(all_cases_nostrat, cases_nostrat)
       
       # Extract stratification variable for cases only
-      strat_cases <- strat_cont[which(pheno[, 3] == 1 & !(pheno[, 1] %in% cases_nostrat)), c(1, 2, 2 + i)]
+      strat_cases <- strat_cont[which(pheno[, 3] == 1 & !(pheno[, 2] %in% cases_nostrat)), c(1, 2, 2 + i)]
       colnames(strat_cases) <- c("FID", "IID", "strat_val")
       strat_cases_vals <- strat_cases[, 3]
       
@@ -64,8 +64,8 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
       # Create stratified phenotype lists for this variable
       for(k in 1:K_use) {
         K_total <- K_total + 1
-        cases_in_stratum <- strat_cases[strat_cases$groups == k, 1]
-        stratum_pheno <- pheno[pheno[, 3] == 0 | pheno[, 1] %in% cases_in_stratum, ]
+        cases_in_stratum <- strat_cases[strat_cases$groups == k, 2]
+        stratum_pheno <- pheno[pheno[, 3] == 0 | pheno[, 2] %in% cases_in_stratum, ]
         
         # Regress covariates if provided
         if(!is.null(cov)) {
@@ -97,11 +97,11 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
       strat_col <- strat_bin[, 2 + i]
       
       # Identify cases with missing stratification
-      cases_nostrat <- strat_bin[which(strat_bin[, 1] %in% cases & is.na(strat_col)), 1]
+      cases_nostrat <- strat_bin[which(strat_bin[, 2] %in% cases & is.na(strat_col)), 2]
       all_cases_nostrat <- c(all_cases_nostrat, cases_nostrat)
       
       # Extract stratification variable for cases only
-      strat_cases <- strat_bin[which(pheno[, 3] == 1 & !(pheno[, 1] %in% cases_nostrat)), c(1, 2, 2 + i)]
+      strat_cases <- strat_bin[which(pheno[, 3] == 1 & !(pheno[, 2] %in% cases_nostrat)), c(1, 2, 2 + i)]
       colnames(strat_cases) <- c("FID", "IID", "strat_val")
       strat_cases_vals <- strat_cases[, 3]
       
@@ -118,8 +118,8 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
       # Create stratified phenotype lists for this variable
       for(c in 1:C) {
         K_total <- K_total + 1
-        cases_in_stratum <- strat_cases[strat_cases$groups == c, 1]
-        stratum_pheno <- pheno[pheno[, 3] == 0 | pheno[, 1] %in% cases_in_stratum, ]
+        cases_in_stratum <- strat_cases[strat_cases$groups == c, 2]
+        stratum_pheno <- pheno[pheno[, 3] == 0 | pheno[, 2] %in% cases_in_stratum, ]
         
         # Regress covariates if provided
         if(!is.null(cov)) {
@@ -168,7 +168,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
     for(j in all_strat_info[[k]]$group_start:all_strat_info[[k]]$group_end){
       add <- rep(NA, length(ids))
       add[which(ids %in% control_ids)] <- 0
-      add[which(ids %in% all_cases_combined[all_cases_combined$groups == j, 1])] <- 1
+      add[which(ids %in% all_cases_combined[all_cases_combined$groups == j, 2])] <- 1
       var_add <- cbind(var_add, add)
     }
 
@@ -177,7 +177,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
     # In the case of a continuous variable, add this (INCLUDING ALL CASES!)
     if(all_strat_info[[k]]$type == "continuous"){
       add_cont <- rep(NA, length(ids))
-      add_cont <- all_strat_info[[k]]$original[match(ids, all_strat_info[[k]]$original[, 1]), 3]
+      add_cont <- all_strat_info[[k]]$original[match(ids, all_strat_info[[k]]$original[, 2]), 3]
       var_add <- cbind(var_add, add_cont)
 
       colnames(var_add)[ncol(var_add)] <- paste0(all_strat_info[[k]]$type, "_", all_strat_info[[k]]$var_index)
@@ -211,7 +211,7 @@ stratify_multi <- function(pheno, strat_cont = NULL, strat_bin = NULL, K = 5, co
 #' @param ids All individual IDs
 #' @return Phenotype dataframe with residualized values
 apply_covariate_regression_single <- function(stratum_pheno, cov, ids) {
-  cov_df <- cov[match(ids, cov[, 1]), -(1:2), drop = FALSE]
+  cov_df <- cov[match(ids, cov[, 2]), -(1:2), drop = FALSE]
   cov_df[] <- lapply(cov_df, function(x) {
     x <- as.numeric(x)
     x[is.na(x)] <- mean(x, na.rm = TRUE)
@@ -220,14 +220,14 @@ apply_covariate_regression_single <- function(stratum_pheno, cov, ids) {
   rownames(cov_df) <- ids
   
   y <- stratum_pheno[, 3]
-  names(y) <- stratum_pheno[, 1]
+  names(y) <- stratum_pheno[, 2]
   
   # Match covariate rows to stratum samples
-  stratum_ids <- stratum_pheno[, 1]
+  stratum_ids <- stratum_pheno[, 2]
   stratum_cov <- cov_df[match(stratum_ids, ids), , drop = FALSE]
   
   fit <- lm(y ~ ., data = stratum_cov)
-  stratum_pheno[match(names(residuals(fit)), stratum_pheno[, 1]), 3] <- residuals(fit)
+  stratum_pheno[match(names(residuals(fit)), stratum_pheno[, 2]), 3] <- residuals(fit)
   
   return(stratum_pheno)
 }

@@ -46,10 +46,8 @@ sumher <- function(ss, ldscores,
   
   # Compute expectations from parameters
   compute_expectations <- function(theta, N_scaled, ldscores, q, M, fit_intercept) {
-    #mu <- rep(1, length(ldscores)) + theta[1] * M * N_scaled * q * ldscores
     mu <- rep(1, length(ldscores)) + theta[1] * N * q * ldscores
     if (fit_intercept) {
-      #mu <- mu + theta[2] * N_scaled
       mu <- mu + theta[2] * N
     }
     mu <- pmax(mu, 1e-6)
@@ -62,6 +60,8 @@ sumher <- function(ss, ldscores,
   
   converged <- FALSE
   iter <- 0
+  singular_count <- 0  # Track consecutive singular matrices
+  max_singular <- 3     # Max consecutive singular matrices before giving up
   
   while (iter < max_iter && !converged) {
     iter <- iter + 1
@@ -71,10 +71,8 @@ sumher <- function(ss, ldscores,
     W_sqrt <- sqrt(W)
     
     X <- matrix(0, nrow = M, ncol = n_params)
-    #X[, 1] <- W_sqrt * M * N_scaled * q * ldscores
     X[, 1] <- W_sqrt * N * q * ldscores
     if (fit_intercept) {
-      #X[, 2] <- W_sqrt * N_scaled
       X[, 2] <- W_sqrt * N
     }
     
@@ -85,30 +83,59 @@ sumher <- function(ss, ldscores,
     XtX <- crossprod(X)
     Xty <- crossprod(X, y)
     
+    # Check for singularity before solving
+    is_singular <- FALSE
+
     theta_new <- tryCatch({
       solve(XtX, Xty)
     }, error = function(e) {
-      warning("Singular matrix, using previous theta")
+      is_singular <<- TRUE
+      warning(sprintf("Singular matrix at iteration %d, using previous theta", iter))
       theta
     })
     
+    # Track consecutive singular matrices
+    if (is_singular) {
+      singular_count <- singular_count + 1
+      if (singular_count >= max_singular) {
+        warning(sprintf("SumHer failed: %d consecutive singular matrices. Heritability may be near zero or data insufficient.", 
+                       singular_count))
+        break
+      }
+    } else {
+      singular_count <- 0  # Reset counter on successful iteration
+    }
+
     # Update expectations
     mu <- compute_expectations(theta_new, N_scaled, ldscores, q, M, fit_intercept)
     
     # Update weights for NEXT iteration (but keep D_inv_0 for likelihood)
-    # D_inv = ldscores * mu (where mu = expected value)
     D_inv <- pmax(ldscores, 1) * mu
     
     # Compute likelihood using FIXED initial weights
     loglik_new <- compute_loglik(mu, chisq_obs, D_inv_0)
     
+    # Check for valid likelihood
+    if (is.na(loglik_new) || is.infinite(loglik_new)) {
+      warning(sprintf("Invalid log-likelihood at iteration %d: %f", iter, loglik_new))
+      break
+    }
+
     diff <- loglik_new - loglik_old
+
+    # Check for valid convergence criterion
+    if (is.na(diff) || is.infinite(diff)) {
+      warning(sprintf("Invalid convergence criterion at iteration %d: diff = %f", iter, diff))
+      break
+    }
+
     theta <- theta_new
     loglik_old <- loglik_new
     
     h2_snp <- theta[1]
     
-    if (abs(diff) < tol) {
+    # Convergence check with NA safety
+    if (!is.na(diff) && abs(diff) < tol) {
       converged <- TRUE
     }
   }
@@ -132,10 +159,15 @@ sumher <- function(ss, ldscores,
   vcov <- tryCatch({
     solve(crossprod(X))
   }, error = function(e) {
+    warning("Cannot compute h2 standard errors: singular matrix at final iteration")
     matrix(NA, nrow = n_params, ncol = n_params)
   })
   
-  se_h2 <- sqrt(vcov[1, 1])
+  se_h2 <- if (!is.na(vcov[1, 1]) && vcov[1, 1] >= 0) {
+    sqrt(vcov[1, 1])
+  } else {
+    NA_real_
+  }
   
   return(list(
     h2_snp = h2_snp,
@@ -247,12 +279,9 @@ sumher_cov <- function(ss1, ss2, ldscores,
   compute_expectations <- function(theta, N_cross_scaled, ldscores, q, M,
                                   sample_overlap, fit_intercept) {
     # E[Z_A * Z_B] = c_AB + h2_AB * N_cross * ldscores
-    #mu <- rep(sample_overlap, length(ldscores)) + 
-    #      theta[1] * M * N_cross_scaled * q * ldscores
     mu <- sample_overlap + theta[1] * N_cross * q * ldscores
     if (fit_intercept) {
       # Intercept captures additional sample overlap effects
-      #mu <- mu + theta[2] * N_cross_scaled
       mu <- mu + theta[2] * N_cross
     }
     
@@ -287,30 +316,54 @@ sumher_cov <- function(ss1, ss2, ldscores,
     XtX <- crossprod(X)
     Xty <- crossprod(X, y)
     
+    is_singular <- FALSE
     theta_new <- tryCatch({
       solve(XtX, Xty)
     }, error = function(e) {
-      warning("Singular matrix, using previous theta")
+      is_singular <<- TRUE
+      warning(sprintf("Singular matrix at iteration %d, using previous theta", iter))
       theta
     })
     
+    if (is_singular) {
+      singular_count <- singular_count + 1
+      if (singular_count >= max_singular) {
+        warning(sprintf("Optimization failed: %d consecutive singular matrices.", singular_count))
+        break
+      }
+    } else {
+      singular_count <- 0
+    }
+
     # Update expectations
     mu <- compute_expectations(theta_new, N_cross_scaled, ldscores, q, M,
                                sample_overlap, fit_intercept)
     
-    # Update weights for NEXT iteration
-    # For cross-trait, weights depend on sqrt of individual trait expectations
-    # Approximate as: D_inv ≈ ldscores * sqrt(mu_1 * mu_2)
-    # Simpler approximation: use geometric mean of ldscores and absolute mu
+    # Update weights
     D_inv <- pmax(ldscores, 1) * pmax(abs(mu), 0.1)
     
     # Compute likelihood using FIXED initial weights
     loglik_new <- compute_loglik(mu, Z_product, D_inv_0)
     
+    if (is.na(loglik_new) || is.infinite(loglik_new)) {
+      warning(sprintf("Invalid log-likelihood at iteration %d", iter))
+      break
+    }
+
     diff <- loglik_new - loglik_old
+
+    if (is.na(diff) || is.infinite(diff)) {
+      warning(sprintf("Invalid convergence criterion at iteration %d", iter))
+      break
+    }
+
     theta <- theta_new
     loglik_old <- loglik_new
     
+    if (!is.na(diff) && abs(diff) < tol) {
+      converged <- TRUE
+    }
+
     # Convert to genetic covariance and correlation
     h2_AB <- theta[1]
     
@@ -335,21 +388,24 @@ sumher_cov <- function(ss1, ss2, ldscores,
   W <- 1 / D_inv
   W_sqrt <- sqrt(W)
   X <- matrix(0, nrow = M, ncol = n_params)
-  #X[, 1] <- W_sqrt * M * N_cross_scaled * q * ldscores
   X[, 1] <- W_sqrt * N_cross * q * ldscores
   if (fit_intercept) {
-    #X[, 2] <- W_sqrt * N_cross_scaled
     X[, 2] <- W_sqrt * N_cross
   }
   
   vcov <- tryCatch({
     solve(crossprod(X))
   }, error = function(e) {
+    warning("SumHer error: singular matrix for h2 se at final iteration")
     matrix(NA, nrow = n_params, ncol = n_params)
   })
   
   # SE for h2_AB
-  se_h2_AB <- sqrt(vcov[1, 1])
+  se_h2_AB <- if (!is.na(vcov[1, 1]) && vcov[1, 1] >= 0) {
+    sqrt(vcov[1, 1])
+  } else {
+    NA_real_
+  }
   
   # SE for rg using delta method: SE(rg) ≈ SE(h2_AB) / sqrt(h2_1 * h2_2)
   se_rg <- NA_real_

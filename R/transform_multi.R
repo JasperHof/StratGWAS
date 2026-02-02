@@ -14,8 +14,8 @@ transform_multi <- function(strata, gencov_multi) {
   # <performs some checks here> #
 
   # Get ids
-  ids <- strata$y[, 1]
-  control_ids <- strata$y[which(strata$y[, 3] == 0), 1]
+  ids <- strata$y[, 2]
+  control_ids <- strata$y[which(strata$y[, 3] == 0), 2]
 
   # Genetic covariance
   gencov <- gencov_multi$gencov
@@ -56,7 +56,7 @@ transform_multi <- function(strata, gencov_multi) {
   trans_pheno <- cbind(ids, ids, 0)
   colnames(trans_pheno) = c("FID", "IID", "Pheno")
 
-  control_ids <- strata$y[strata$y[, 3] == 0, 1]
+  control_ids <- strata$y[strata$y[, 3] == 0, 2]
 
   # Compute transformed phenotype separately for continuous and categorical
   for(k in 1:length(strata$strat_details)){
@@ -77,7 +77,7 @@ transform_multi <- function(strata, gencov_multi) {
       # Create a variable to add to transformation variable
       trans_add <- rep(NA, nrow(trans_pheno))
       trans_add[ids %in% control_ids] <- 0
-      trans_add[match(strata$strat_details[[k]]$data[, 1], ids)] <- trans_pred
+      trans_add[match(strata$strat_details[[k]]$data[, 2], ids)] <- trans_pred
       trans_add[is.na(trans_add)] <- mean(trans_pred, na.rm = T) # individuals with missing value for the stratificatin variable
 
     } else {

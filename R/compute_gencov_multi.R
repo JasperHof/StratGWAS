@@ -22,7 +22,7 @@ compute_gencov_multi <- function(strata, filename, nr_blocks = 1000, outfile,
   multi_pheno <- strata$multi
   
   # Extract IDs from first two columns
-  ids <- as.character(multi_pheno[, 1])
+  ids <- as.character(multi_pheno[, 2])
   
   # Get phenotype matrix (excluding first two ID columns)
   multi <- multi_pheno[, -(1:2), drop = FALSE]
