@@ -137,7 +137,7 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
       strat_col <- strat_cont[, 2 + i]
       
       # Identify cases with missing stratification
-      cases_nostrat <- strat_cont[which(strat_cont[, 2] %in% cases & is.na(strat_col)), 2]
+      cases_nostrat <- strat_cont[which(strat_cont[, 2] %in% cases & is.na(strat_col)), 2, drop = TRUE]
       all_cases_nostrat <- c(all_cases_nostrat, cases_nostrat)
       
       # Extract stratification variable for cases only
