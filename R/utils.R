@@ -94,7 +94,7 @@ check_stratify_inputs <- function(pheno, strat_cont, strat_cat, K) {
     
     # Check that stratification columns are numeric
     for (i in 3:ncol(strat_cont)) {
-      col_vals <- strat_cont[!is.na(strat_cont[, i]), i]
+      col_vals <- strat_cont[!is.na(strat_cont[, i]), i, drop = TRUE]
       if (length(col_vals) > 0 && !is.numeric(col_vals)) {
         tryCatch({
           test_numeric <- as.numeric(col_vals)
