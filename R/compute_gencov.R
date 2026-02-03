@@ -28,7 +28,8 @@
 #' # Basic usage
 #' data(pheno)
 #' data(strat_cont)
-#' filename <- system.file("extdata", "data", package = "StratGWAS")
+#' filename_bed <- system.file("extdata", "data.bed", package = "StratGWAS")
+#' filename <- gsub(".bed", "", filename_bed)
 #' outfile <- tempfile("gencov")
 #' 
 #' strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
@@ -43,9 +44,6 @@
 #' gencov_ldsc <- compute_gencov(strata, filename, nr_blocks = 1000, 
 #'                               outfile, SumHer = FALSE)
 #' 
-#' # Provide pre-computed summary statistics
-#' gencov_precomp <- compute_gencov(strata, filename, nr_blocks = 1000, 
-#'                                  outfile, ss_list = my_sumstats)
 #' }
 #' 
 #' @export

@@ -23,7 +23,8 @@
 #' # Basic usage
 #' data(pheno)
 #' data(strat_cont)
-#' filename <- system.file("extdata", "data", package = "StratGWAS")
+#' filename_bed <- system.file("extdata", "data.bed", package = "StratGWAS")
+#' filename <- gsub(".bed", "", filename_bed)
 #' outfile <- tempfile("transform")
 #' 
 #' strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
