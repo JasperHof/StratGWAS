@@ -2,6 +2,7 @@
 
 export(compute_gencov)
 export(ldsc_cor)
+export(linear)
 export(stratify)
 export(sumher)
 export(sumher_cov)

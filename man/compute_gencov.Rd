@@ -10,28 +10,60 @@ compute_gencov(
   nr_blocks = 1000,
   outfile,
   SumHer = TRUE,
-  ss_list = NULL,
   lds = NULL
 )
 }
 \arguments{
-\item{strata}{An object returned from stratify()}
+\item{strata}{An object returned from \code{\link{stratify}}}
 
-\item{filename}{Prefix of genotype .bed file}
+\item{filename}{Prefix of genotype .bed file (without the .bed extension)}
 
 \item{nr_blocks}{Block size for reading in genotype data (default: 1000)}
 
-\item{outfile}{Name of output file (should match previous step)}
+\item{outfile}{Name/path prefix for output files}
 
-\item{SumHer}{Indicates whether an implementation of SumHer will be used (default: SumHer = T) or LDSC (SumHer = F)}
+\item{SumHer}{Logical indicating whether to use SumHer implementation (default: TRUE)
+or LDSC (FALSE)}
 
-\item{ss_list}{Optional: list of length K_tot, containing input summary statistics}
-
-\item{lds}{Optional: data frame containing LD scores}
+\item{lds}{Optional: data frame containing LD scores. The first column should contain
+SNP IDs, while the second column contains LD scores. If NULL, LD scores will be
+computed from genotype data (using a random subset of 1000 individuals if N > 1000).}
 }
 \value{
-Returns covariance matrix of the strata
+Returns a list containing:
+\item{gencov}{Genetic covariance matrix between strata}
+\item{gencor}{Genetic correlation matrix between strata}
+\item{hers}{Vector of SNP heritabilities for each stratum}
+\item{var_names}{Names of variables/strata}
+\item{strat_details}{Detailed stratification information from input}
 }
 \description{
-Estimate genetic covariance of strata
+Compute genetic covariances and correlations between case strata using
+SumHer or LDSC. This is the second step in the StratGWAS workflow.
+}
+\examples{
+\dontrun{
+# Basic usage
+data(pheno)
+data(strat_cont)
+filename <- system.file("extdata", "data", package = "StratGWAS")
+outfile <- tempfile("gencov")
+
+strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
+gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
+
+# Examine results
+print(gencov$gencov)  # Genetic covariance matrix
+print(gencov$gencor)  # Genetic correlation matrix
+print(gencov$hers)    # SNP heritabilities
+
+# Use LDSC instead of SumHer
+gencov_ldsc <- compute_gencov(strata, filename, nr_blocks = 1000, 
+                              outfile, SumHer = FALSE)
+
+# Provide pre-computed summary statistics
+gencov_precomp <- compute_gencov(strata, filename, nr_blocks = 1000, 
+                                 outfile, ss_list = my_sumstats)
+}
+
 }

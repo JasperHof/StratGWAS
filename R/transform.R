@@ -1,13 +1,50 @@
-#' LD score regression
+#' Transform phenotype based on genetic covariance
 #'
-#' Compute genetic covariance of subgroups using SumHer
+#' Create a transformed phenotype that maximizes power to detect genetic
+#' associations by leveraging the genetic covariance structure between strata.
+#' This is the third step in the StratGWAS workflow.
 #'
 #' @useDynLib StratGWAS, .registration = TRUE
 #' @importFrom Rcpp sourceCpp
 #' 
-#' @param strata Object returned from stratify()
-#' @param gencov Genetic covariance matrix returned by compute_gencov()
-#' @return Returns covariance matrix of the strata
+#' @param strata Object returned from \code{\link{stratify}}
+#' @param gencov Genetic covariance object returned by \code{\link{compute_gencov}}
+#'   
+#' @return Returns a list containing:
+#'   \item{transformed_pheno}{Data frame with FID, IID, and transformed phenotype values}
+#'   \item{weights}{Named vector of transformation weights for each stratum}
+#'   \item{inflation_criteria}{Data frame with expected inflation statistics for 
+#'     continuous variables, including a2 (regression coefficient), genetic correlation 
+#'     with binary phenotype, heritability of stratification variable, and expected 
+#'     inflation factor}
+#' 
+#' @examples
+#' \dontrun{
+#' # Basic usage
+#' data(pheno)
+#' data(strat_cont)
+#' filename <- system.file("extdata", "data", package = "StratGWAS")
+#' outfile <- tempfile("transform")
+#' 
+#' strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
+#' gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
+#' trans <- transform(strata, gencov)
+#' 
+#' # Examine transformation results
+#' head(trans$transformed_pheno)      # Transformed phenotype values
+#' print(trans$weights)               # Weights for each stratum
+#' print(trans$inflation_criteria)    # Expected inflation (continuous vars only)
+#' 
+#' # Check distribution of transformed phenotype
+#' hist(trans$transformed_pheno[, 3], main = "Transformed Phenotype Distribution")
+#' 
+#' # With categorical variables
+#' data(strat_cat)
+#' strata_cat <- stratify(pheno, strat_cat = strat_cat)
+#' gencov_cat <- compute_gencov(strata_cat, filename, nr_blocks = 1000, outfile)
+#' trans_cat <- transform(strata_cat, gencov_cat)
+#' }
+#' 
 #' @export
 transform <- function(strata, gencov) {
   
@@ -34,7 +71,11 @@ transform <- function(strata, gencov) {
       vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
 
       h2_obs <- diag(gencov_use[vars, vars])
-      prevs <- colMeans(multi_use[, vars], na.rm = T)
+      
+      # Ensure we have a numeric matrix
+      multi_subset <- as.matrix(multi_use[, vars, drop = FALSE])
+      multi_subset <- apply(multi_subset, 2, as.numeric)
+      prevs <- colMeans(multi_subset, na.rm = TRUE)
 
       # compute relative to prevalence 1 / K (used for cont. variables)
       fac <- (1/strata$K * (1 - 1/strata$K)) / (prevs * (1 - prevs))
@@ -81,6 +122,7 @@ transform <- function(strata, gencov) {
 
       # Create subset of multi matrix for this variable
       multi_use_sub <- multi_use[, colnames(multi_use) %in% paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K), drop = FALSE]
+      multi_use_sub <- apply(multi_use_sub, 2, as.numeric)
       miss <- which(rowSums(is.na(multi_use_sub)) == ncol(multi_use_sub))
 
       multi_use_sub[is.na(multi_use_sub)] <- 0
@@ -158,6 +200,8 @@ transform <- function(strata, gencov) {
       )
     }
   }
+
+  cat("\n")
 
   return(list(
     transformed_pheno = trans_pheno,

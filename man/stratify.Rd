@@ -7,17 +7,103 @@
 stratify(pheno, strat_cont = NULL, strat_cat = NULL, K = 5)
 }
 \arguments{
-\item{pheno}{Binary input phenotype in PLINK format}
+\item{pheno}{Binary input phenotype in PLINK format (data frame or matrix with
+columns: FID, IID, phenotype). Phenotype should be coded as 0 (controls) and
+1 (cases). Missing values coded as NA.}
 
-\item{strat_cont}{Continuous stratification variables in PLINK format}
+\item{strat_cont}{Optional: continuous stratification variables in PLINK format
+(data frame or matrix with columns: FID, IID, variable1, variable2, ...).
+Each variable will be divided into K quantile-based groups.}
 
-\item{strat_cat}{Binary/categorical stratification variables in PLINK format}
+\item{strat_cat}{Optional: binary/categorical stratification variables in PLINK
+format (data frame or matrix with columns: FID, IID, variable1, variable2, ...).
+Categories are automatically detected from unique values.}
 
-\item{K}{Number of groups for continuous variables (default 5)}
+\item{K}{Number of quantile groups for continuous variables (default: 5).
+Categorical variables use their natural number of categories.}
 }
 \value{
-Returns list containing subgroup phenotypes
+Returns a list containing:
+\item{K}{Number of groups used for continuous variables}
+\item{y}{Input phenotype data frame}
+\item{multi}{Multi-phenotype matrix for genetic covariance estimation, with
+binary indicators for each stratum and continuous variables}
+\item{info}{Combined information about all strata with group assignments}
+\item{ids}{Vector of all individual IDs}
+\item{strat_miss}{Vector of case IDs with missing stratification values}
+\item{strat_details}{Detailed list for each stratification variable containing:
+\itemize{
+\item \code{data}: Stratification data for cases
+\item \code{original}: Original stratification variable data (for continuous)
+\item \code{type}: "continuous" or "categorical"
+\item \code{K}: Number of groups/categories
+\item \code{categories}: Category values (for categorical)
+\item \code{cases_nostrat}: Cases with missing values
+\item \code{var_index}: Variable index
+\item \code{group_start}, \code{group_end}: Global group indices
+}}
+\item{n_cont}{Number of continuous stratification variables}
+\item{n_bin}{Number of categorical stratification variables}
 }
 \description{
-Compute case subgroups by stratification based on multiple input variables
+Compute case subgroups by stratification based on multiple input variables.
+This function creates strata of cases based on continuous and/or categorical
+variables, which can then be used for genetic covariance estimation and
+phenotype transformation in stratified GWAS analysis.
+}
+\examples{
+\dontrun{
+# Load example data
+data(pheno)
+data(strat_cont)
+data(strat_cat)
+
+# Example 1: Stratify by single continuous variable (e.g., age at diagnosis)
+strata_cont <- stratify(pheno, strat_cont = strat_cont, K = 5)
+
+# View stratification summary
+table(strata_cont$info$groups)  # Cases per stratum
+length(strata_cont$strat_miss)  # Cases with missing values
+
+# Example 2: Stratify by categorical variable (e.g., disease subtype)
+strata_cat <- stratify(pheno, strat_cat = strat_cat)
+
+# Check detected categories
+strata_cat$strat_details[[1]]$categories
+strata_cat$strat_details[[1]]$K  # Number of categories
+
+# Example 3: Stratify by both continuous and categorical variables
+strata_both <- stratify(pheno, 
+                        strat_cont = strat_cont, 
+                        strat_cat = strat_cat, 
+                        K = 5)
+
+# Check structure
+strata_both$n_cont  # Number of continuous variables
+strata_both$n_bin   # Number of categorical variables
+
+# View multi-phenotype matrix (first few rows and columns)
+head(strata_both$multi[, 1:6])
+
+# Example 4: Use different number of quantiles
+strata_10 <- stratify(pheno, strat_cont = strat_cont, K = 10)
+
+# Example 5: Complete workflow
+filename_bed <- system.file("extdata", "data.bed", package = "StratGWAS")
+filename <- gsub(".bed", "", filename_bed)
+outfile <- tempfile("gwas_output")
+
+# Stratify
+strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
+
+# Compute genetic covariance
+gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
+
+# Transform phenotype
+trans <- transform(strata, gencov)
+
+# Run GWAS
+results <- linear(trans, filename, outfile, nr_blocks = 1000)
+}
+
 }

@@ -1,22 +1,59 @@
 #' Estimate genetic covariance of strata
 #'
+#' Compute genetic covariances and correlations between case strata using 
+#' SumHer or LDSC. This is the second step in the StratGWAS workflow.
+#' 
 #' @useDynLib StratGWAS, .registration = TRUE
 #' @importFrom Rcpp sourceCpp
 #'
-#' @param strata An object returned from stratify()
-#' @param filename Prefix of genotype .bed file
+#' @param strata An object returned from \code{\link{stratify}}
+#' @param filename Prefix of genotype .bed file (without the .bed extension)
 #' @param nr_blocks Block size for reading in genotype data (default: 1000)
-#' @param outfile Name of output file (should match previous step)
-#' @param SumHer Indicates whether an implementation of SumHer will be used (default: SumHer = T) or LDSC (SumHer = F)
-#' @param ss_list Optional: list of length K_tot, containing input summary statistics
-#' @param lds Optional: data frame containing LD scores
-#' @return Returns covariance matrix of the strata
+#' @param outfile Name/path prefix for output files
+#' @param SumHer Logical indicating whether to use SumHer implementation (default: TRUE) 
+#'   or LDSC (FALSE)
+#' @param lds Optional: data frame containing LD scores. The first column should contain
+#'   SNP IDs, while the second column contains LD scores. If NULL, LD scores will be 
+#'   computed from genotype data (using a random subset of 1000 individuals if N > 1000).
+#'
+#' @return Returns a list containing:
+#'   \item{gencov}{Genetic covariance matrix between strata}
+#'   \item{gencor}{Genetic correlation matrix between strata}
+#'   \item{hers}{Vector of SNP heritabilities for each stratum}
+#'   \item{var_names}{Names of variables/strata}
+#'   \item{strat_details}{Detailed stratification information from input}
+#'
+#' @examples
+#' \dontrun{
+#' # Basic usage
+#' data(pheno)
+#' data(strat_cont)
+#' filename <- system.file("extdata", "data", package = "StratGWAS")
+#' outfile <- tempfile("gencov")
+#' 
+#' strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
+#' gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
+#' 
+#' # Examine results
+#' print(gencov$gencov)  # Genetic covariance matrix
+#' print(gencov$gencor)  # Genetic correlation matrix
+#' print(gencov$hers)    # SNP heritabilities
+#' 
+#' # Use LDSC instead of SumHer
+#' gencov_ldsc <- compute_gencov(strata, filename, nr_blocks = 1000, 
+#'                               outfile, SumHer = FALSE)
+#' 
+#' # Provide pre-computed summary statistics
+#' gencov_precomp <- compute_gencov(strata, filename, nr_blocks = 1000, 
+#'                                  outfile, ss_list = my_sumstats)
+#' }
+#' 
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
-                           SumHer = TRUE, ss_list = NULL, lds = NULL) {
+                           SumHer = TRUE, lds = NULL) {
 
   # Check input data
-  # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, ss_list, lds)
+  # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, lds)
 
   # Get the multi phenotype matrix from strata
   multi_pheno <- strata$multi
@@ -55,14 +92,12 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
               quote = FALSE, row.names = FALSE, col.names = FALSE)
 
   # Perform linear regression on all phenotypes
-  if (is.null(ss_list)) {
-    linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
+  linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
 
-    # Read in linear regression results
-    ss_list <- vector("list", K_tot)
-    for (k in 1:K_tot) {
-      ss_list[[k]] <- read.table(paste0(outfile, ".pheno", k), header = TRUE)
-    }
+  # Read in linear regression results
+  ss_list <- vector("list", K_tot)
+  for (k in 1:K_tot) {
+    ss_list[[k]] <- read.table(paste0(outfile, ".pheno", k), header = TRUE)
   }
 
   # Compute LD scores if not provided

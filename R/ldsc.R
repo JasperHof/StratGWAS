@@ -41,9 +41,6 @@ ldsc_cor <- function(ss1, ss2, ldscores) {
   cov_g <- beta * M / N12
 
   # Heritabilities
-  ss1$Chisq_1 = ss1$Chisq - 1
-  ss2$Chisq_1 = ss2$Chisq - 1
-
   fit_h2_1 <- lm(ss1$Chisq ~ ldscores, weights = w)
   fit_h2_2 <- lm(ss2$Chisq ~ ldscores, weights = w)
   h2_1 <- coef(fit_h2_1)["ldscores"] * M / N1
