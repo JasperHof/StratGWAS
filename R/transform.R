@@ -139,6 +139,12 @@ transform <- function(strata, gencov) {
 
   }
 
+  # Write trans_pheno to output file
+  message(paste0("Writing transformed phenotype to ",
+                 paste0(outfile, ".transformed")))
+  write.table(trans_pheno, paste0(outfile, ".transformed"),
+              quote = FALSE, row.names = FALSE, col.names = FALSE)
+
   # Compute the inflation factors - need a2, gencor, and h2_Z
   h2_y <- gencov[1, 1]
 

@@ -91,6 +91,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
 
   # Perform linear regression on all phenotypes
   linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
+  cat("\n")
 
   # Read in linear regression results
   ss_list <- vector("list", K_tot)
@@ -111,7 +112,8 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     write.table(lds, paste0(outfile, ".ldscores"), 
                 quote = FALSE, row.names = FALSE, col.names = TRUE)
   }
-
+  cat("\n")
+  
   # Initialize results matrices
   hers <- rep(NA, K_tot)
   gencov <- matrix(NA, nrow = K_tot, ncol = K_tot)

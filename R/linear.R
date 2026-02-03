@@ -16,14 +16,13 @@
 #'   and covariate columns). Missing covariate values will be imputed to their
 #'   column means. Covariates will be regressed out of the transformed phenotype
 #'   before GWAS analysis.
-#' 
+#'
 #' @return Returns a list containing:
 #'   \item{results}{Data frame with GWAS results (predictor, effect size,
 #'     standard error, p-value, etc.)}
-#'   \item{phenotype_file}{Path to the transformed phenotype file}
 #'   \item{n_samples}{Number of samples with non-missing phenotypes used in analysis}
 #'   \item{covariates_used}{Logical indicating whether covariates were included}
-#' 
+#'
 #' @examples
 #' \dontrun{
 #' # Basic usage with covariates
@@ -33,51 +32,51 @@
 #' filename_bed <- system.file("extdata", "data.bed", package = "StratGWAS")
 #' filename <- gsub(".bed", "", filename_bed)
 #' outfile <- tempfile("gwas")
-#' 
+#'
 #' strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
 #' gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
 #' trans <- transform(strata, gencov)
 #' results <- linear(trans, filename, outfile, nr_blocks = 1000, cov = cov)
-#' 
+#'
 #' # Examine results
 #' head(results$results)                    # Top associations
 #' results$n_samples                        # Sample size
-#' 
+#'
 #' # Without covariates
 #' results_nocov <- linear(trans, filename, outfile, nr_blocks = 1000)
-#' 
+#'
 #' # View top hits
 #' top_hits <- results$results[order(results$results$Pvalue), ]
 #' head(top_hits, 20)
 #' }
-#' 
+#'
 #' @export
 linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
-  
+
   # Extract transformed phenotype
   trans_pheno <- trans$transformed_pheno
-  
+
   # Read genotype IDs
   fam_ids <- as.character(read.table(paste0(filename, ".fam"))[, 2])
-  
+
   # Match transformed phenotype to genotype file order
   pheno_matched <- rep(NA_real_, length(fam_ids))
   names(pheno_matched) <- fam_ids
   pheno_matched[match(trans_pheno[, 2], fam_ids)] <- trans_pheno[, 3]
-  
+
   # Handle covariates if provided
   if (!is.null(cov)) {
     # Match covariates to genotype file order
     cov_ids <- as.character(cov[, 2])
     cov_data <- as.matrix(cov[, -(1:2), drop = FALSE])
-    
+
     cov_matched <- matrix(NA_real_, length(fam_ids), ncol(cov_data))
     colnames(cov_matched) <- colnames(cov_data)
-    
+
     for (k in 1:ncol(cov_data)) {
       cov_matched[, k] <- cov_data[match(fam_ids, cov_ids), k]
     }
-    
+
     # Impute missing covariate values with their means
     for (k in 1:ncol(cov_matched)) {
       missing_idx <- is.na(cov_matched[, k])
@@ -88,10 +87,10 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
                     sum(missing_idx), colnames(cov_matched)[k], mean_val))
       }
     }
-    
+
     # Regress out covariates from phenotype (only for non-missing phenotypes)
     non_missing <- !is.na(pheno_matched)
-    
+
     if (sum(non_missing) > ncol(cov_matched)) {
       fit <- lm(pheno_matched[non_missing] ~ cov_matched[non_missing, , drop = FALSE])
       pheno_matched[non_missing] <- residuals(fit)
@@ -109,11 +108,6 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
     pheno_matched[non_missing] <- scale(pheno_matched[non_missing])
   }
   
-  # Write phenotype file for GWAS
-  pheno_out <- cbind(fam_ids, fam_ids, pheno_matched)
-  write.table(pheno_out, paste0(outfile, ".transformed_pheno"),
-              quote = FALSE, row.names = FALSE, col.names = FALSE)
-  
   # Perform linear regression GWAS
   linear_pheno <- matrix(pheno_matched, ncol = 1)
   rownames(linear_pheno) <- fam_ids
@@ -129,7 +123,6 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
   
   return(list(
     results = results,
-    phenotype_file = paste0(outfile, ".transformed_pheno"),
     n_samples = sum(non_missing),
     covariates_used = !is.null(cov)
   ))
