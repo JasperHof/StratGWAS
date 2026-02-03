@@ -1,126 +1,167 @@
 #' LD score regression
 #'
-#' Compute genetic covariance of subgroups using LD score regression
+#' Compute genetic covariance of subgroups using SumHer
 #'
 #' @useDynLib StratGWAS, .registration = TRUE
 #' @importFrom Rcpp sourceCpp
 #' 
-#' @param strata An object returned from stratify()
-#' @param gencov Genetic covariance matrix
-#' @param outfile Name of output file for phenotype
+#' @param strata Object returned from stratify()
+#' @param gencov Genetic covariance matrix returned by compute_gencov()
 #' @return Returns covariance matrix of the strata
 #' @export
-transform <- function(strata, gencov, outfile) {
+transform <- function(strata, gencov) {
   
   # <performs some checks here> #
 
-  # Read in data as multivariate phenotype
-  K <- strata$K
-  ids <- strata$y[, 1]
+  # Get ids
+  ids <- strata$y[, 2]
+  control_ids <- strata$y[which(strata$y[, 3] == 0), 2]
+
+  # Genetic covariance
+  gencov <- gencov$gencov
+
+  # Extract strata and compute eigendecomposition
+  names <- c()
+  for(k in 1:length(strata$strat_details)) names <- c(names, paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K))
+
+  idx <- which(colnames(gencov) %in% names)
+  gencov_use <- gencov[idx, idx]
+  multi_use <- strata$multi[, colnames(strata$multi) %in% names]
+
+  # Update observed scale heritabilities of categorical groups
+  for(k in 1:length(strata$strat_details)){
+    if(strata$strat_details[[k]]$type == "categorical"){
+      vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
+
+      h2_obs <- diag(gencov_use[vars, vars])
+      prevs <- colMeans(multi_use[, vars], na.rm = T)
+
+      # compute relative to prevalence 1 / K (used for cont. variables)
+      fac <- (1/strata$K * (1 - 1/strata$K)) / (prevs * (1 - prevs))
+      h2_adj <- h2_obs * fac
+
+      # update genetic covariance
+      for(i in 1:length(vars)){
+        gencov_use[vars[i], ] <- gencov_use[vars[i], ] * sqrt(fac[i])
+        gencov_use[, vars[i]] <- gencov_use[, vars[i]] * sqrt(fac[i])
+      }
+    } 
+  } 
 
   # Compute eigenvector transformation
-  trans <- eigen(gencov[1:K, 1:K])$vectors[, 1]
-
-  # Compute medians for smoothing stratification variables
-  group_table <- table(strata$info$groups)
-  cum <- cumsum(group_table)
-
-  # Compute medians for scaled stratification variable
-  strat_scale <- as.numeric(scale(strata$info[, 3]))
-  medians_obs <- unlist(lapply(1:K, function(x) mean(strat_scale[which(strata$info$groups == x)], na.rm = TRUE)))
+  trans <- eigen(gencov_use)$vectors[, 1]
+  names(trans) <- names
 
   # Initialize transformed phenotype with controls
-  trans_pheno <- cbind(ids, ids, 0)
-  control_ids <- strata$y[strata$y[, 3] == 0, 1]
+  trans_pheno <- data.frame(FID = ids, IID = ids, Pheno = 0)
 
-  if(strata$sparse){
-    # For sparse case: use transformation weights on residualized case phenotypes
-    for (k in 1:K) {
-      group_ids <- strata$info[strata$info$groups == k, 1]
-      trans_pheno[ids %in% group_ids, 3] <- trans[k]
-    }
+  # Compute transformed phenotype separately for continuous and categorical
+  for(k in 1:length(strata$strat_details)){
 
-  } else {
-    # Smooth through values
-    fit <- smooth.spline(medians_obs, as.numeric(trans), spar = 0.2)
-    trans_pred <- predict(fit, strat_scale)$y
+    # Get weights for this stratification variable
+    weights <- trans[names(trans) %in% paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)]
 
-    # Make the transformed phenotype (27-01-26)
-    names(trans_pred) <- strata$info[, 1]
-
-    if(strata$cov_used){
-      for (k in 1:K) {
-        # Scale phenotype to 0 / 1, then multiply with weight
-        stratum <- strata[[k]]
-        stratum[, 3] <- stratum[, 3] - mean(stratum[stratum[, 1] %in% control_ids, 3], na.rm = T)
-        stratum[, 3] <- stratum[, 3] / mean(stratum[!stratum[, 1] %in% control_ids, 3], na.rm = T)
-
-        weights <- trans_pred[match(stratum[, 1], names(trans_pred))]
-        weights[is.na(weights)] <- mean(weights, na.rm = T)
-
-        trans_pheno[match(stratum[, 1], trans_pheno[, 1]), 3] <- stratum[, 3] * weights
-      }
-      trans_pheno[trans_pheno[, 1] %in% control_ids, 3] <- trans_pheno[trans_pheno[, 1] %in% control_ids, 3] / K
+    if(strata$strat_details[[k]]$type == "continuous"){
       
+      # Compute medians for scaled stratification variable
+      strat_scale <- as.numeric(scale(strata$strat_details[[k]]$data[, 3]))
+      medians_obs <- unlist(lapply(1:strata$strat_details[[k]]$K, function(x) mean(strat_scale[which(strata$strat_details[[k]]$data$groups == x)], na.rm = TRUE)))
+
+      # Smooth through values
+      fit <- smooth.spline(medians_obs, as.numeric(weights), spar = 0.2)
+      trans_pred <- predict(fit, strat_scale)$y
+
+      # Create a variable to add to transformation variable
+      trans_add <- rep(NA, nrow(trans_pheno))
+      trans_add[ids %in% control_ids] <- 0
+      trans_add[match(strata$strat_details[[k]]$data[, 2], ids)] <- trans_pred
+      trans_add[is.na(trans_add)] <- mean(trans_pred, na.rm = T) # individuals with missing value for the stratificatin variable
+
     } else {
-      idx <- match(names(trans_pred), trans_pheno[, 1])
-      valid <- !is.na(idx)
-      trans_pheno[idx[valid], 3] <- trans_pred[valid]
+
+      # Create subset of multi matrix for this variable
+      multi_use_sub <- multi_use[, colnames(multi_use) %in% paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K), drop = FALSE]
+      miss <- which(rowSums(is.na(multi_use_sub)) == ncol(multi_use_sub))
+
+      multi_use_sub[is.na(multi_use_sub)] <- 0
+      trans_add <- multi_use_sub %*% weights
+      
+      # Impute missing phenotypes by mean
+      if(length(miss) > 0){
+        trans_add[miss] <- mean(trans_add[rowSums(multi_use_sub == 0) != ncol(multi_use_sub)])
+      }
+    }
+
+    trans_pheno[, 3] <- trans_pheno[, 3] + trans_add
+
+  }
+
+  # Compute the inflation factors - need a2, gencor, and h2_Z
+  h2_y <- gencov[1, 1]
+
+  inflation_results <- data.frame(
+    variable = character(),
+    a2 = numeric(),
+    rg = numeric(),
+    h2_Z = numeric(),
+    expected_inflation = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  for(k in 1:length(strata$strat_details)){
+    if(strata$strat_details[[k]]$type == "continuous"){
+
+      var_name <- paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index)
+
+      idx <- which(colnames(gencov) == var_name)
+      h2_Z <- gencov[idx, idx]
+
+      if(h2_y * h2_Z < 0){
+        message(paste0("Can not compute expected inflation criterion of ", var_name,
+        " due to negative h2 estimate of binary trait or stratification variable"))
+      }
+
+      # Prepare variables
+      Z <- strata$strat_details[[k]]$original[, 3]
+      Z[is.na(Z)] <- mean(Z, na.rm = TRUE)
+      
+      y <- strata$y[, 3]
+      y[is.na(y)] <- mean(y, na.rm = TRUE)
+
+      # Scale variables
+      Z <- as.numeric(scale(Z))
+      y <- as.numeric(scale(y))
+      Y_trans <- as.numeric(scale(trans_pheno[, 3]))
+
+      # Fit regression to compute a2
+      fit <- lm(Y_trans ~ y + Z - 1)
+      coefs <- fit$coefficients
+      a2 <- coefs["Z"]
+
+      # Compute inflation criterion using genetic correlation
+      rg <- gencov[1, idx] / sqrt(h2_y * h2_Z)
+      exp_inflation <- a2^2 * (1 - rg^2) * h2_Z
+
+      message(sprintf("Expected inflation criterion of %s is %.4f",
+                      var_name, exp_inflation))
+
+      inflation_results <- rbind(
+        inflation_results,
+        data.frame(
+          variable = var_name,
+          a2 = a2,
+          rg = rg,
+          h2_Z = h2_Z,
+          expected_inflation = exp_inflation,
+          stringsAsFactors = FALSE
+        )
+      )
     }
   }
 
-  # Add back cases with missing stratification variable
-  if (length(strata$strat_miss) > 0) {
-    # Compute mean phenotype value among cases (y == 1)
-    case_ids <- strata$y[strata$y[, 3] == 1, 1]
-    case_indices <- trans_pheno[, 1] %in% case_ids
-    mean_case_pheno <- mean(as.numeric(trans_pheno[case_indices, 3]), na.rm = TRUE)
-
-    trans_pheno_add <- cbind(strata$strat_miss, strata$strat_miss, mean_case_pheno)
-    trans_pheno <- rbind(trans_pheno, trans_pheno_add)
-
-    # Sort back to original order
-    trans_pheno <- trans_pheno[match(strata$ids, trans_pheno[, 1]), ]
-  }
-
-  # Write to phenotype
-  colnames(trans_pheno) = c("FID", "IID", "Pheno")
-  write.table(trans_pheno, paste0(outfile, ".pheno"), quote = F, row = F)
-
-  # Compute the inflation factor - need a2, gencor, and h2_Z
-  h2_y <- gencov[K + 1, K + 1]
-  h2_Z <- gencov[K + 2, K + 2]
-
-  if(h2_y * h2_Z < 0){
-    message(paste0("Can not compute expected inflation criterion due to negative h2 estimate of binary trait or stratification variable"))
-  } else {
-    # Prepare variables
-    Z <- strata$Z[, 3]
-    Z[is.na(Z)] <- mean(Z, na.rm = TRUE)
-    
-    y <- strata$y[, 3]
-    y[is.na(y)] <- mean(y, na.rm = TRUE)
-    
-    # Scale variables
-    Z <- as.numeric(scale(Z))
-    y <- as.numeric(scale(y))
-    Y_trans <- as.numeric(scale(trans_pheno[, 3]))
-    
-    # Fit regression to compute a2
-    fit <- lm(Y_trans ~ y + Z - 1)
-    coefs <- fit$coefficients
-    a2 <- coefs["Z"]
-    
-    # Compute inflation criterion using genetic correlation
-    rg <- gencov[K + 1, K + 2] / sqrt(h2_y * h2_Z)
-    exp_inflation <- a2^2 * (1 - rg^2) * h2_Z
-    
-    message(sprintf("Expected inflation criterion is %.4f", exp_inflation))
-
-    if (exp_inflation > 0.01) {
-      warning("Inflation criterion is greater than 0.01.")
-    }
-  }
-
-  invisible(trans_pheno)
+  return(list(
+    transformed_pheno = trans_pheno,
+    weights = trans,
+    inflation_criteria = inflation_results
+  ))
 }

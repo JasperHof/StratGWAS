@@ -12,3 +12,6 @@ Imports:
     Rcpp,
     RcppParallel
 SystemRequirements: GNU make, C++11
+Depends: 
+    R (>= 3.5)
+LazyData: true

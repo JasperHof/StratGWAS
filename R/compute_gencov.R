@@ -8,56 +8,55 @@
 #' @param nr_blocks Block size for reading in genotype data (default: 1000)
 #' @param outfile Name of output file (should match previous step)
 #' @param SumHer Indicates whether an implementation of SumHer will be used (default: SumHer = T) or LDSC (SumHer = F)
-#' @param ss_list Optional: list of length K+2, containing input summary statistics specific to strata, binary trait, and stratification variable
+#' @param ss_list Optional: list of length K_tot, containing input summary statistics
 #' @param lds Optional: data frame containing LD scores
 #' @return Returns covariance matrix of the strata
 #' @export
-compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer = T, ss_list = NULL, lds = NULL) {
+compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
+                           SumHer = TRUE, ss_list = NULL, lds = NULL) {
 
   # Check input data
-  compute_gencov_checks(strata, filename, nr_blocks = 1000, outfile, SumHer = T, ss_list = NULL, lds = NULL)
+  # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, ss_list, lds)
 
-  # Read in data as multivariate phenotype
-  K <- strata$K
-  K_tot <- K + 2
-
-  ids <- as.character(read.table(paste0(filename, ".fam"))[, 2])
-  multi <- matrix(0, length(ids), strata$K)
-
-  # Match phenotype data for each stratum
-  for(k in 1:K) {
-    multi[, k] <- strata[[paste0("group", k)]][match(ids,strata[[paste0("group", k)]][, 1]), 3]
+  # Get the multi phenotype matrix from strata
+  multi_pheno <- strata$multi
+  
+  # Extract IDs from first two columns
+  ids <- as.character(multi_pheno[, 2])
+  
+  # Get phenotype matrix (excluding first two ID columns)
+  multi <- multi_pheno[, -(1:2), drop = FALSE]
+  multi <- apply(multi, 2, as.numeric)
+  K_tot <- ncol(multi)
+  
+  # Read genotype IDs
+  fam_ids <- as.character(read.table(paste0(filename, ".fam"))[, 2])
+  
+  # Match multi to genotype file order
+  multi_matched <- matrix(NA_real_, length(fam_ids), K_tot)
+  rownames(multi_matched) <- fam_ids
+  colnames(multi_matched) <- colnames(multi)
+  
+  for(k in 1:K_tot) {
+    multi_matched[, k] <- multi[match(fam_ids, ids), k]
   }
 
   # Scale phenotypes while preserving missing values
-  for (k in 1:K) {
-    non_missing <- !is.na(multi[, k])
+  for (k in 1:K_tot) {
+    non_missing <- !is.na(multi_matched[, k])
     if (sum(non_missing) > 1) {
-      multi[non_missing, k] <- scale(as.numeric(multi[non_missing, k]))
+      multi_matched[non_missing, k] <- scale(as.numeric(multi_matched[non_missing, k]))
     }
   }
 
-  rownames(multi) <- ids
-
-  # Add binary trait and stratification variable
-  y_vals <- as.numeric(strata$y[match(ids, strata$y[, 1]), 3])
-  Z_vals <- as.numeric(strata$Z[match(ids, strata$Z[, 1]), 3])
-  
-  # Scale values
-  if (sum(!is.na(y_vals)) > 1) y_vals <- as.numeric(scale(y_vals))
-  if (sum(!is.na(Z_vals)) > 1) Z_vals <- as.numeric(scale(Z_vals))
-
-  # Create new phenotype file
-  multi <- cbind(multi, y_vals, Z_vals)
-  multi_pheno <- cbind(ids, ids, multi)
-
   # Write phenotype file
-  write.table(multi_pheno, paste0(outfile, ".strata"), 
+  multi_pheno_out <- cbind(fam_ids, fam_ids, multi_matched)
+  write.table(multi_pheno_out, paste0(outfile, ".strata"),
               quote = FALSE, row.names = FALSE, col.names = FALSE)
 
-  # Perform a linear regression on K+2-dimensional phenotype: (i) K subtypes; (ii) disease; (iii) stratification variable
+  # Perform linear regression on all phenotypes
   if (is.null(ss_list)) {
-    linear_gwas(filename, multi, nr_blocks, outfile)
+    linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
 
     # Read in linear regression results
     ss_list <- vector("list", K_tot)
@@ -68,11 +67,11 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
 
   # Compute LD scores if not provided
   if (is.null(lds)) {
-    if (length(ids) > 1000) {
+    if (length(fam_ids) > 1000) {
       set.seed(123)  # For reproducibility
-      geno_set <- sort(sample(seq_len(length(ids)), size = 1000))
+      geno_set <- sort(sample(seq_len(length(fam_ids)), size = 1000))
     } else {
-      geno_set <- seq_len(length(ids))
+      geno_set <- seq_len(length(fam_ids))
     }
 
     lds <- computeLDscoresFromBED(filename, geno_set)
@@ -83,6 +82,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
   # Initialize results matrices
   hers <- rep(NA, K_tot)
   gencov <- matrix(NA, nrow = K_tot, ncol = K_tot)
+  rownames(gencov) <- colnames(gencov) <- colnames(multi)
   ldscores <- lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
 
   if(SumHer == F){ 
@@ -108,14 +108,14 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
           gencov[i, j] <- sum$h2_snp
           hers[i] <- sum$h2_snp
 
-          cat(sprintf("SNP heritability of trait %d: %.4f (SE = %.4f)\n", 
-                      i, sum$h2_snp, sum$se_h2))
+          cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", 
+                      colnames(multi)[i], sum$h2_snp, sum$se_h2))
         } else {
           sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores)
           gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
 
-          cat(sprintf("Genetic covariance between trait %d and %d: %.4f (SE = %.4f)\n", 
-                      i, j, sum_cov$h2_AB, sum_cov$se_h2_AB))
+          cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
+                      colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, sum_cov$se_h2_AB))
         }
       }
     }
@@ -123,12 +123,15 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
 
   cat("\n")
 
-  # Compute genetic covariance matrix
+  # Compute genetic correlation matrix
   gencor <- gencov
+  rownames(gencor) <- colnames(gencor) <- colnames(multi)
+  
   for (k in 1:K_tot) {
     if (is.na(hers[k]) || hers[k] <= 0) {
       if (!is.na(hers[k]) && hers[k] < 0) {
-        cat(sprintf("SNP heritability of trait %d is negative, so will not compute genetic correlation\n", k))
+        cat(sprintf("SNP heritability of %s is negative, so will not compute genetic correlation\n", 
+                    colnames(multi)[k]))
       }
       gencor[k, ] <- NA
       gencor[, k] <- NA
@@ -138,13 +141,22 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile, SumHer =
     }
   }
 
-  # Write output files
-  write.table(hers, paste0(outfile, ".hers"),
-              quote = FALSE, row.names = FALSE, col.names = FALSE)
+  # Write output files with row/column names
+  write.table(cbind(rownames = colnames(multi), hers), paste0(outfile, ".hers"),
+              quote = FALSE, row.names = FALSE, col.names = TRUE)
   write.table(gencov, paste0(outfile, ".gencov"),
-              quote = FALSE, row.names = FALSE, col.names = FALSE)
+              quote = FALSE, row.names = TRUE, col.names = TRUE)
   write.table(gencor, paste0(outfile, ".gencor"),
-              quote = FALSE, row.names = FALSE, col.names = FALSE)
+              quote = FALSE, row.names = TRUE, col.names = TRUE)
 
-  return(gencov)
+  # Return results with metadata
+  result <- list(
+    gencov = gencov,
+    gencor = gencor,
+    hers = hers,
+    var_names = colnames(multi),
+    strat_details = strata$strat_details
+  )
+  
+  return(result)
 }

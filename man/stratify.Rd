@@ -2,20 +2,22 @@
 % Please edit documentation in R/stratify.R
 \name{stratify}
 \alias{stratify}
-\title{Stratify cases based on multiple auxiliary variabales}
+\title{Stratify cases based on input variables}
 \usage{
-stratify(pheno, strat, K = 5, cov = NULL)
+stratify(pheno, strat_cont = NULL, strat_cat = NULL, K = 5)
 }
 \arguments{
-\item{phenofile}{Binary input phenotype in PLINK format}
+\item{pheno}{Binary input phenotype in PLINK format}
 
-\item{stratfile}{Stratification variable in PLINK format}
+\item{strat_cont}{Continuous stratification variables in PLINK format}
 
-\item{filename}{Prefix of input .bed file}
+\item{strat_cat}{Binary/categorical stratification variables in PLINK format}
+
+\item{K}{Number of groups for continuous variables (default 5)}
 }
 \value{
 Returns list containing subgroup phenotypes
 }
 \description{
-Compute case subgroups by stratification based on input variable
+Compute case subgroups by stratification based on multiple input variables
 }

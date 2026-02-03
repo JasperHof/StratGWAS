@@ -9,7 +9,7 @@ compute_gencov(
   filename,
   nr_blocks = 1000,
   outfile,
-  SumHer = T,
+  SumHer = TRUE,
   ss_list = NULL,
   lds = NULL
 )
@@ -25,7 +25,7 @@ compute_gencov(
 
 \item{SumHer}{Indicates whether an implementation of SumHer will be used (default: SumHer = T) or LDSC (SumHer = F)}
 
-\item{ss_list}{Optional: list of length K+2, containing input summary statistics specific to strata, binary trait, and stratification variable}
+\item{ss_list}{Optional: list of length K_tot, containing input summary statistics}
 
 \item{lds}{Optional: data frame containing LD scores}
 }

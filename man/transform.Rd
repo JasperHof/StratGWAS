@@ -4,18 +4,16 @@
 \alias{transform}
 \title{LD score regression}
 \usage{
-transform(strata, gencov, outfile)
+transform(strata, gencov)
 }
 \arguments{
-\item{strata}{An object returned from stratify()}
+\item{strata}{Object returned from stratify()}
 
-\item{gencov}{Genetic covariance matrix}
-
-\item{outfile}{Name of output file for phenotype}
+\item{gencov}{Genetic covariance matrix returned by compute_gencov()}
 }
 \value{
 Returns covariance matrix of the strata
 }
 \description{
-Compute genetic covariance of subgroups using LD score regression
+Compute genetic covariance of subgroups using SumHer
 }
