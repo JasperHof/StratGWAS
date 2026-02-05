@@ -48,7 +48,7 @@
 #' }
 #' 
 #' @export
-transform <- function(strata, gencov, outfile) {
+transform <- function(strata, gencov, outfile, spar = 0.2) {
   
   # <performs some checks here> #
 
@@ -111,7 +111,7 @@ transform <- function(strata, gencov, outfile) {
       medians_obs <- unlist(lapply(1:strata$strat_details[[k]]$K, function(x) mean(strat_scale[which(strata$strat_details[[k]]$data$groups == x)], na.rm = TRUE)))
 
       # Smooth through values
-      fit <- smooth.spline(medians_obs, as.numeric(weights), spar = 0.2)
+      fit <- smooth.spline(medians_obs, as.numeric(weights), spar = spar)
       trans_pred <- predict(fit, strat_scale)$y
 
       # Create a variable to add to transformation variable
