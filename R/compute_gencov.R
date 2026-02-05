@@ -15,6 +15,8 @@
 #' @param lds Optional: data frame containing LD scores. The first column should contain
 #'   SNP IDs, while the second column contains LD scores. If NULL, LD scores will be 
 #'   computed from genotype data (using a random subset of 1000 individuals if N > 1000).
+#' @param ss_computed Indicates whether the subgroup-specific summary statistics have
+#'   already been computed before
 #'
 #' @return Returns a list containing:
 #'   \item{gencov}{Genetic covariance matrix between strata}
@@ -48,7 +50,7 @@
 #' 
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
-                           SumHer = TRUE, lds = NULL) {
+                           SumHer = TRUE, lds = NULL, ss_computed = FALSE) {
 
   # Check input data
   # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, lds)
@@ -90,8 +92,10 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
               quote = FALSE, row.names = FALSE, col.names = FALSE)
 
   # Perform linear regression on all phenotypes
-  linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
-  cat("\n")
+  if (!ss_computed) {
+    linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
+    cat("\n")
+  }
 
   # Read in linear regression results
   ss_list <- vector("list", K_tot)
