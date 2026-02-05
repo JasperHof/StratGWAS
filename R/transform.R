@@ -9,6 +9,7 @@
 #' 
 #' @param strata Object returned from \code{\link{stratify}}
 #' @param gencov Genetic covariance object returned by \code{\link{compute_gencov}}
+#' @param outfile Name/path prefix for output files
 #'   
 #' @return Returns a list containing:
 #'   \item{transformed_pheno}{Data frame with FID, IID, and transformed phenotype values}
@@ -47,7 +48,7 @@
 #' }
 #' 
 #' @export
-transform <- function(strata, gencov) {
+transform <- function(strata, gencov, outfile) {
   
   # <performs some checks here> #
 
