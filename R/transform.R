@@ -48,7 +48,7 @@
 #' }
 #' 
 #' @export
-transform <- function(strata, gencov, outfile, spar = 0.2) {
+transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   
   # <performs some checks here> #
 
