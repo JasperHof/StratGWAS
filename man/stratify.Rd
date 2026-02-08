@@ -104,6 +104,7 @@ trans <- transform(strata, gencov)
 
 # Run GWAS
 results <- linear(trans, filename, outfile, nr_blocks = 1000)
+head(results$results)
 }
 
 }

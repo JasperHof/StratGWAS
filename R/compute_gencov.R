@@ -50,7 +50,8 @@
 #' 
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
-                           SumHer = TRUE, lds = NULL, ss_list = NULL) {
+                           SumHer = TRUE, lds = NULL, ss_list = NULL,
+                           alpha = -0.25) {
 
   # Check input data
   # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, lds)
@@ -143,14 +144,14 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     for (i in 1:K_tot) {
       for (j in i:K_tot) {
         if (i == j) {
-          sum <- sumher(ss_list[[i]], ldscores)
+          sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
           gencov[i, j] <- sum$h2_snp
           hers[i] <- sum$h2_snp
 
           cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", 
                       colnames(multi)[i], sum$h2_snp, sum$se_h2))
         } else {
-          sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores)
+          sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
           gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
 
           cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 

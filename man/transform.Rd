@@ -4,12 +4,14 @@
 \alias{transform}
 \title{Transform phenotype based on genetic covariance}
 \usage{
-transform(strata, gencov)
+transform(strata, gencov, outfile, spar = 0.8, smooth = TRUE)
 }
 \arguments{
 \item{strata}{Object returned from \code{\link{stratify}}}
 
 \item{gencov}{Genetic covariance object returned by \code{\link{compute_gencov}}}
+
+\item{outfile}{Name/path prefix for output files}
 }
 \value{
 Returns a list containing:

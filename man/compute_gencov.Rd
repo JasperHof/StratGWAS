@@ -10,7 +10,8 @@ compute_gencov(
   nr_blocks = 1000,
   outfile,
   SumHer = TRUE,
-  lds = NULL
+  lds = NULL,
+  ss_list = NULL
 )
 }
 \arguments{
@@ -28,6 +29,9 @@ or LDSC (FALSE)}
 \item{lds}{Optional: data frame containing LD scores. The first column should contain
 SNP IDs, while the second column contains LD scores. If NULL, LD scores will be
 computed from genotype data (using a random subset of 1000 individuals if N > 1000).}
+
+\item{ss_list}{Optional: list of previously computed summary statistics for strata
+in strata$multi}
 }
 \value{
 Returns a list containing:

@@ -25,7 +25,6 @@ before GWAS analysis.}
 Returns a list containing:
 \item{results}{Data frame with GWAS results (predictor, effect size,
 standard error, p-value, etc.)}
-\item{phenotype_file}{Path to the transformed phenotype file}
 \item{n_samples}{Number of samples with non-missing phenotypes used in analysis}
 \item{covariates_used}{Logical indicating whether covariates were included}
 }

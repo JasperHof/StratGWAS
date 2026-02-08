@@ -73,7 +73,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
 
       h2_obs <- diag(gencov_use[vars, vars])
-      
+
       # Ensure we have a numeric matrix
       multi_subset <- as.matrix(multi_use[, vars, drop = FALSE])
       multi_subset <- apply(multi_subset, 2, as.numeric)
@@ -104,7 +104,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
     # Get weights for this stratification variable
     weights <- trans[names(trans) %in% paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)]
 
-    if(strata$strat_details[[k]]$type == "continuous"){
+    if(strata$strat_details[[k]]$type == "continuous" && smooth){
       
       # Compute medians for scaled stratification variable
       strat_scale <- as.numeric(scale(strata$strat_details[[k]]$data[, 3]))
