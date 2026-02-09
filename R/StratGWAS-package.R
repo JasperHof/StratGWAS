@@ -77,7 +77,7 @@
 #' print(gencov$hers)                  # SNP heritabilities
 #' 
 #' # Step 3: Transform phenotype based on genetic covariance structure
-#' trans <- transform(strata, gencov)
+#' trans <- transform(strata, gencov, outfile)
 #' 
 #' # Examine transformation results
 #' head(trans$transformed_pheno)       # Transformed phenotype values

@@ -41,7 +41,7 @@ Additional requirements:
 
 ---
 
-## 🚀 Workflow Overview
+## Workflow Overview
 
 StratGWAS consists of four main steps:
 
@@ -49,7 +49,7 @@ StratGWAS consists of four main steps:
    Divide cases into subgroups based on stratification variables.
 
 2. **Genetic Covariance Estimation** (`compute_gencov`)
-   Estimate genetic covariances between strata using SumHer or LDSC.
+   Estimate genetic covariances between strata using SumHer.
 
 3. **Phenotype Transformation** (`transform`)
    Create a transformed phenotype based on the covariance structure.
@@ -83,7 +83,7 @@ strata <- stratify(pheno, strat_cont = strat_cont, strat_cat = strat_cat, K = 5)
 gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
 
 # Step 3: Transform phenotype
-trans <- transform(strata, gencov)
+trans <- transform(strata, gencov, outfile)
 
 # Step 4: Run GWAS
 results <- linear(trans, filename, outfile, nr_blocks = 1000, cov = cov)
