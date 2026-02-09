@@ -1,14 +1,12 @@
 # StratGWAS
 
-**Stratified Genome-Wide Association Studies in R**
-
-StratGWAS is an R package for performing stratified genome-wide association studies (GWAS) by leveraging genetic heterogeneity within cases. Instead of treating all cases as homogeneous, StratGWAS stratifies cases using continuous and/or categorical variables (e.g. age at diagnosis, comorbodities), estimates genetic covariance between strata, and constructs a transformed phenotype that maximizes power to detect genetic associations.
+StratGWAS is an R package for modelling disease heterogeneity of binary traits in genome-wide association studies (GWAS). StratGWAS can leverage secondary phenotypes (e.g. age at diagnosis, comorbodities) as continuous and/or categorical variables to stratify cases, estimate genetic covariance between strata, and construct a transformed phenotype that maximizes power to detect genetic associations.
 
 ---
 
 ## Installation
 
-You can install the development version from GitHub:
+StratGWAS can be installed from GitHub:
 
 ```r
 # install.packages("devtools")
