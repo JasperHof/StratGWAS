@@ -11,7 +11,8 @@ compute_gencov(
   outfile,
   SumHer = TRUE,
   lds = NULL,
-  ss_list = NULL
+  ss_list = NULL,
+  alpha = -0.25
 )
 }
 \arguments{

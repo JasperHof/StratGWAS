@@ -10,7 +10,8 @@ RoxygenNote: 7.3.3
 LinkingTo: Rcpp, RcppEigen, RcppParallel
 Imports: 
     Rcpp,
-    RcppParallel
+    RcppParallel,
+    Matrix
 SystemRequirements: GNU make, C++11
 Depends: 
     R (>= 3.5)

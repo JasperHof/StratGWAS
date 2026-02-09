@@ -23,7 +23,7 @@ library(StratGWAS)
 
 ## Input Data Format
 
-All phenotype, covariate, and stratification files must follow **PLINK-style format**:
+All phenotype, covariate, and stratification variables must follow **PLINK-style format**:
 
 | Column | Description                                       |
 | ------ | ------------------------------------------------- |

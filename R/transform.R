@@ -91,6 +91,11 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
     } 
   } 
 
+  # Smooth matrix if needed
+  if(min(eigen(gencov_use)$values) <= 0) {
+    gencov_use <- as.matrix(Matrix::nearPD(gencov_use, corr = FALSE)$mat)
+  }
+
   # Compute eigenvector transformation
   trans <- eigen(gencov_use)$vectors[, 1]
   names(trans) <- names
