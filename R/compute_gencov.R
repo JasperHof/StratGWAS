@@ -17,6 +17,8 @@
 #'   computed from genotype data (using a random subset of 1000 individuals if N > 1000).
 #' @param ss_list Optional: list of previously computed summary statistics for strata 
 #'   in strata$multi
+#' @param alpha Selection parameter for dependency MAF on SNP heritability (default: -0.25)
+#' @param B Number of jackknife blocks for standard error of genetic covariance (default 100)
 #'
 #' @return Returns a list containing:
 #'   \item{gencov}{Genetic covariance matrix between strata}
@@ -148,7 +150,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
       for (j in i:K_tot) {
         if (i == j) {
           sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
-          jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha)
+          jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
 
           # store jackknife estimates
           for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack$ests[b]
@@ -160,7 +162,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
                       colnames(multi)[i], sum$h2_snp, jack$se))
         } else {
           sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
-          jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
+          jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
 
           # store jackknife estimates
           for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]

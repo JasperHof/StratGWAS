@@ -6,7 +6,7 @@
 #' @param tol Convergence tolerance (default 1e-6)
 #' @param max_iter Maximum iterations (default 100)
 #' @param alpha Selection parameter for MAF
-#' @param B Number of jackknife blocks
+#' @param B Number of jackknife blocks (default 100)
 #' @return List with heritability estimates and likelihood
 #' @export
 sumher_jack <- function(ss, ldscores, 
@@ -16,7 +16,7 @@ sumher_jack <- function(ss, ldscores,
                         alpha = -0.25,
                         B = 100) {
 
-  make_blocks <- function(M, B = 100) {
+  make_blocks <- function(M, B) {
     split(seq_len(M), cut(seq_len(M), B, labels = FALSE))
   }
 
@@ -59,7 +59,7 @@ sumher_jack <- function(ss, ldscores,
 #' @param tol Convergence tolerance (default 1e-6)
 #' @param max_iter Maximum iterations (default 100)
 #' @param alpha Selection parameter for MAF
-#' @param B Number of jackknife blocks
+#' @param B Number of jackknife blocks (default 100)
 #' @return List with heritability estimates and likelihood
 #' @export
 sumher_cov_jack <- function(ss1, ss2, ldscores,
@@ -69,7 +69,7 @@ sumher_cov_jack <- function(ss1, ss2, ldscores,
                         alpha = -0.25,
                         B = 100) {
 
-  make_blocks <- function(M, B = 100) {
+  make_blocks <- function(M, B) {
     split(seq_len(M), cut(seq_len(M), B, labels = FALSE))
   }
 
