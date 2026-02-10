@@ -8,11 +8,11 @@
 #' @param weights Optional weights (default: 1/ldscores)
 #' @return List with heritability estimates and likelihood
 #' @export
-sumher <- function(ss, ldscores, 
-                    fit_intercept = TRUE,
-                    tol = 1e-6,
-                    max_iter = 100,
-                    alpha = -0.25) {
+sumher <- function(ss, ldscores,
+                   fit_intercept = TRUE,
+                   tol = 1e-6,
+                   max_iter = 100,
+                   alpha = -0.25) {
 
   M <- length(ldscores)
   N <- ss$N
@@ -196,12 +196,12 @@ sumher <- function(ss, ldscores,
 #' @return List with genetic correlation and covariance estimates
 #' @export
 sumher_cov <- function(ss1, ss2, ldscores,
-                        h2_1 = NULL, h2_2 = NULL,
-                        sample_overlap = 0,
-                        fit_intercept = TRUE,
-                        tol = 1e-6,
-                        max_iter = 100,
-                        alpha = -0.25) {
+                       h2_1 = NULL, h2_2 = NULL,
+                       sample_overlap = 0,
+                       fit_intercept = TRUE,
+                       tol = 1e-6,
+                       max_iter = 100,
+                       alpha = -0.25) {
   
   # Input validation
   if (nrow(ss1) != nrow(ss2) || nrow(ss1) != length(ldscores)) {

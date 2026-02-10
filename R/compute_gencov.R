@@ -51,7 +51,7 @@
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
                            SumHer = TRUE, lds = NULL, ss_list = NULL,
-                           alpha = -0.25) {
+                           alpha = -0.25, B = 100) {
 
   # Check input data
   # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, lds)
@@ -141,21 +141,34 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     }
   } else { 
     # Use SumHer implementation for genetic correlations (default)
+    jack_ests <- vector("list", B)
+    for (b in 1:B) jack_ests[[b]] = matrix(NA, K_tot, K_tot)
+
     for (i in 1:K_tot) {
       for (j in i:K_tot) {
         if (i == j) {
           sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
+          jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha)
+
+          # store jackknife estimates
+          for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack$ests[b]
+
           gencov[i, j] <- sum$h2_snp
           hers[i] <- sum$h2_snp
 
           cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", 
-                      colnames(multi)[i], sum$h2_snp, sum$se_h2))
+                      colnames(multi)[i], sum$h2_snp, jack$se))
         } else {
           sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
+          jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
+
+          # store jackknife estimates
+          for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
+
           gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
 
           cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
-                      colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, sum_cov$se_h2_AB))
+                      colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
         }
       }
     }
@@ -193,6 +206,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   result <- list(
     gencov = gencov,
     gencor = gencor,
+    jack_ests = jack_ests,
     hers = hers,
     var_names = colnames(multi),
     strat_details = strata$strat_details

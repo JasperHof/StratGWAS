@@ -57,14 +57,14 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   control_ids <- strata$y[which(strata$y[, 3] == 0), 2]
 
   # Genetic covariance
-  gencov <- gencov$gencov
+  gencov_all <- gencov$gencov
 
   # Extract strata and compute eigendecomposition
   names <- c()
   for(k in 1:length(strata$strat_details)) names <- c(names, paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K))
 
-  idx <- which(colnames(gencov) %in% names)
-  gencov_use <- gencov[idx, idx]
+  idx <- which(colnames(gencov_all) %in% names)
+  gencov_use <- gencov_all[idx, idx]
   multi_use <- strata$multi[, colnames(strata$multi) %in% names]
 
   # Update observed scale heritabilities of categorical groups
@@ -98,7 +98,29 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
   # Compute eigenvector transformation
   trans <- eigen(gencov_use)$vectors[, 1]
+  trans <- trans / sqrt(sum(trans^2))  # normalize
+  if (mean(trans) < 0) trans <- -trans
   names(trans) <- names
+
+  # Get standard errors of weights
+  B <- length(gencov$jack_ests)
+  idx <- which(colnames(gencov_all) %in% names)
+  trans_B <- matrix(NA, nrow = B, ncol = length(trans))
+
+  for (b in 1:B) {
+    trans_b <- eigen(gencov$jack_ests[[b]][idx, idx])$vectors[, 1]
+
+    # normalize and check sign
+    trans_b <- trans_b / sqrt(sum(trans_b^2))
+    if (mean(trans_b) < 0) trans_b <- -trans_b
+
+    trans_B[b, ] <- trans_b
+  }
+
+  trans_bar <- colMeans(trans_B)
+  trans_var <- rep(0, length(trans)); names(trans_var) <- names(trans)
+  for(k in 1:length(trans)) trans_var[k] <- (B - 1) / B * sum((trans_B[, k] - trans_bar[k])^2)
+  trans_se <- sqrt(trans_var)
 
   # Initialize transformed phenotype with controls
   trans_pheno <- data.frame(FID = ids, IID = ids, Pheno = 0)
@@ -152,7 +174,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
               quote = FALSE, row.names = FALSE, col.names = FALSE)
 
   # Compute the inflation factors - need a2, gencor, and h2_Z
-  h2_y <- gencov[1, 1]
+  h2_y <- gencov_all[1, 1]
 
   inflation_results <- data.frame(
     variable = character(),
@@ -168,8 +190,8 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
       var_name <- paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index)
 
-      idx <- which(colnames(gencov) == var_name)
-      h2_Z <- gencov[idx, idx]
+      idx <- which(colnames(gencov_all) == var_name)
+      h2_Z <- gencov_all[idx, idx]
 
       if(h2_y * h2_Z < 0){
         message(paste0("Can not compute expected inflation criterion of ", var_name,
@@ -194,7 +216,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       a2 <- coefs["Z"]
 
       # Compute inflation criterion using genetic correlation
-      rg <- gencov[1, idx] / sqrt(h2_y * h2_Z)
+      rg <- gencov_all[1, idx] / sqrt(h2_y * h2_Z)
       exp_inflation <- a2^2 * (1 - rg^2) * h2_Z
 
       message(sprintf("Expected inflation criterion of %s is %.4f",
@@ -219,6 +241,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   return(list(
     transformed_pheno = trans_pheno,
     weights = trans,
+    weights_se = trans_se,
     inflation_criteria = inflation_results
   ))
 }
