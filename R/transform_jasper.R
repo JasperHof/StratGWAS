@@ -48,7 +48,7 @@
 #' }
 #' 
 #' @export
-transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
+transform_jasper <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   
   # <performs some checks here> #
 
@@ -60,7 +60,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   gencov <- gencov$gencov
 
   # Extract strata and compute eigendecomposition
-  names <- c()
+  names <- c("pheno")
   for(k in 1:length(strata$strat_details)) names <- c(names, paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K))
 
   idx <- which(colnames(gencov) %in% names)
@@ -91,17 +91,20 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
     } 
   } 
 
-  # Smooth matrix if needed? Turn off for now
+  # Smooth matrix if needed
   #if(min(eigen(gencov_use)$values) <= 0) {
   #  gencov_use <- as.matrix(Matrix::nearPD(gencov_use, corr = FALSE)$mat)
   #}
 
   # Compute eigenvector transformation
   trans <- eigen(gencov_use)$vectors[, 1]
-  names(trans) <- names
+  names(trans) <- c(names)
 
-  # Initialize transformed phenotype with controls
+  # Initialize transformed phenotype
   trans_pheno <- data.frame(FID = ids, IID = ids, Pheno = 0)
+
+  # Assign first weight to cases
+  trans_pheno[which(strata$y[, 3] == 1), 3] <- trans["pheno"]
 
   # Compute transformed phenotype separately for continuous and categorical
   for(k in 1:length(strata$strat_details)){

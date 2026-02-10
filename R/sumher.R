@@ -151,9 +151,9 @@ sumher <- function(ss, ldscores,
   W <- 1 / D_inv
   W_sqrt <- sqrt(W)
   X <- matrix(0, nrow = M, ncol = n_params)
-  X[, 1] <- W_sqrt * M * N_scaled * q * ldscores
+  X[, 1] <- W_sqrt * N * q * ldscores
   if (fit_intercept) {
-    X[, 2] <- W_sqrt * N_scaled
+    X[, 2] <- W_sqrt * N
   }
   
   vcov <- tryCatch({
