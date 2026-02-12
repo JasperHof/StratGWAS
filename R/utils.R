@@ -238,6 +238,37 @@ weights_univariate <- function(strata, gencov, trans, gencov_all, names) {
   trans_B <- matrix(NA, nrow = B, ncol = length(trans))
   colnames(trans_B) <- names
 
+  # update h2 estimates for all categorical groups
+  for (b in 1:B){
+    for (k in 1:length(strata$strat_details)) {
+      if (strata$strat_details[[k]]$type == "categorical") {
+        vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
+
+        colnames(gencov$jack_ests[[b]]) <- rownames(gencov$jack_ests[[b]]) <- rownames(gencov_all)
+        gencov_use <- gencov$jack_ests[[b]][idx, idx]
+        h2_obs <- diag(gencov_use[vars, vars])
+
+        # Ensure we have a numeric matrix
+        multi_subset <- as.matrix(strata$multi[, vars, drop = FALSE])
+        multi_subset <- apply(multi_subset, 2, as.numeric)
+        prevs <- colMeans(multi_subset, na.rm = TRUE)
+
+        # compute h2 relative to prevalence of strata for continuous variables
+        fac <- (cont_prev * (1 - cont_prev)) / (prevs * (1 - prevs))
+        h2_adj <- h2_obs * fac
+
+        # update genetic covariance
+        for(i in 1:length(vars)){
+          gencov_use[vars[i], ] <- gencov_use[vars[i], ] * sqrt(fac[i])
+          gencov_use[, vars[i]] <- gencov_use[, vars[i]] * sqrt(fac[i])
+        }
+
+        # return values
+        gencov$jack_ests[[b]][idx, idx] <- gencov_use
+      }
+    }
+  }
+
   # get jack-knife SE estimates - for each variable separately
   for (b in 1:B) {
     for (k in 1:length(strata$strat_details)) {
