@@ -56,6 +56,10 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   ids <- strata$y[, 2]
   control_ids <- strata$y[which(strata$y[, 3] == 0), 2]
 
+  # Information about prevalence
+  total_prev <- mean(strata$y[, 3], na.rm = T)
+  cont_prev <- (total_prev / strata$K) / (1 - total_prev + total_prev / strata$K)
+
   # Genetic covariance
   gencov_all <- gencov$gencov
 
@@ -75,12 +79,12 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       h2_obs <- diag(gencov_use[vars, vars])
 
       # Ensure we have a numeric matrix
-      multi_subset <- as.matrix(multi_use[, vars, drop = FALSE])
+      multi_subset <- as.matrix(strata$multi[, vars, drop = FALSE])
       multi_subset <- apply(multi_subset, 2, as.numeric)
       prevs <- colMeans(multi_subset, na.rm = TRUE)
 
-      # compute relative to prevalence 1 / K (used for cont. variables)
-      fac <- (1/strata$K * (1 - 1/strata$K)) / (prevs * (1 - prevs))
+      # compute h2 relative to prevalence of strata for continuous variables
+      fac <- (cont_prev * (1 - cont_prev)) / (prevs * (1 - prevs))
       h2_adj <- h2_obs * fac
 
       # update genetic covariance
@@ -102,25 +106,8 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   if (mean(trans) < 0) trans <- -trans
   names(trans) <- names
 
-  # Get standard errors of weights
-  B <- length(gencov$jack_ests)
-  idx <- which(colnames(gencov_all) %in% names)
-  trans_B <- matrix(NA, nrow = B, ncol = length(trans))
-
-  for (b in 1:B) {
-    trans_b <- eigen(gencov$jack_ests[[b]][idx, idx])$vectors[, 1]
-
-    # normalize and check sign
-    trans_b <- trans_b / sqrt(sum(trans_b^2))
-    if (mean(trans_b) < 0) trans_b <- -trans_b
-
-    trans_B[b, ] <- trans_b
-  }
-
-  trans_bar <- colMeans(trans_B)
-  trans_var <- rep(0, length(trans)); names(trans_var) <- names(trans)
-  for(k in 1:length(trans)) trans_var[k] <- (B - 1) / B * sum((trans_B[, k] - trans_bar[k])^2)
-  trans_se <- sqrt(trans_var)
+  # get jack-knife SE estimates of weights
+  weights_se <- weights_se_jack(strata, gencov, trans, gencov_all, names)
 
   # Initialize transformed phenotype with controls
   trans_pheno <- data.frame(FID = ids, IID = ids, Pheno = 0)
@@ -241,7 +228,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   return(list(
     transformed_pheno = trans_pheno,
     weights = trans,
-    weights_se = trans_se,
+    weights_se = weights_se,
     inflation_criteria = inflation_results
   ))
 }

@@ -176,6 +176,10 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     }
   }
 
+  for (b in 1:B){
+    rownames(jack_ests[[b]]) <- colnames(jack_ests[[b]]) <- colnames(multi)
+  }
+
   cat("\n")
 
   # Compute genetic correlation matrix

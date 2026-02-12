@@ -26,7 +26,7 @@ sumher_cov_jack(
 
 \item{alpha}{Selection parameter for MAF}
 
-\item{B}{Number of jackknife blocks}
+\item{B}{Number of jackknife blocks (default 100)}
 
 \item{ss}{Summary statistics data.frame with columns: SNP, N, Chisq}
 }

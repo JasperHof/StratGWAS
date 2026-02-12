@@ -34,6 +34,10 @@ computed from genotype data (using a random subset of 1000 individuals if N > 10
 
 \item{ss_list}{Optional: list of previously computed summary statistics for strata
 in strata$multi}
+
+\item{alpha}{Selection parameter for dependency MAF on SNP heritability (default: -0.25)}
+
+\item{B}{Number of jackknife blocks for standard error of genetic covariance (default 100)}
 }
 \value{
 Returns a list containing:
