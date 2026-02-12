@@ -165,14 +165,6 @@ check_stratify_inputs <- function(pheno, strat_cont, strat_cat, K) {
 
 #' Compute jack-knife estimates of standard error for weights
 #'
-#' Validates all input parameters for the stratify function
-#'
-#' @param pheno Binary input phenotype in PLINK format
-#' @param strat_cont Continuous stratification variables in PLINK format
-#' @param strat_cat Categorical stratification variables in PLINK format
-#' @param K Number of groups for continuous variables
-#' @param cov Covariates in PLINK format
-#' @return NULL if all checks pass, stops with error message otherwise
 #' @keywords internal
 weights_se_jack <- function(strata, gencov, trans, gencov_all, names) {
 
@@ -189,6 +181,7 @@ weights_se_jack <- function(strata, gencov, trans, gencov_all, names) {
       if (strata$strat_details[[k]]$type == "categorical") {
         vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
 
+        colnames(gencov$jack_ests[[b]]) <- rownames(gencov$jack_ests[[b]]) <- rownames(gencov_all)
         gencov_use <- gencov$jack_ests[[b]][idx, idx]
         h2_obs <- diag(gencov_use[vars, vars])
 
@@ -230,4 +223,43 @@ weights_se_jack <- function(strata, gencov, trans, gencov_all, names) {
   trans_se <- sqrt(trans_var)
 
   return(trans_se)
+} 
+
+#' Compute estimates of weights specific to stratification variables
+#'
+#' @keywords internal
+weights_univariate <- function(strata, gencov, trans, gencov_all, names) {
+
+  # Define variables - note that h2 scaling is already done in weights_se_jack
+  total_prev <- mean(strata$y[, 3], na.rm = T)
+  cont_prev <- (total_prev / strata$K) / (1 - total_prev + total_prev / strata$K)
+  B <- length(gencov$jack_ests)
+  idx <- which(colnames(gencov_all) %in% names)
+  trans_B <- matrix(NA, nrow = B, ncol = length(trans))
+  colnames(trans_B) <- names
+
+  # get jack-knife SE estimates - for each variable separately
+  for (b in 1:B) {
+    for (k in 1:length(strata$strat_details)) {
+
+      vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
+      trans_b <- eigen(gencov$jack_ests[[b]][vars, vars])$vectors[, 1]
+
+      # normalize and check sign
+      trans_b <- trans_b / sqrt(sum(trans_b^2))
+      if (mean(trans_b) < 0) trans_b <- -trans_b
+
+      trans_B[b, vars] <- trans_b
+    }
+  }
+
+  trans_bar <- colMeans(trans_B)
+  trans_var <- rep(0, length(trans)); names(trans_var) <- names(trans)
+  for(k in 1:length(trans)) trans_var[k] <- (B - 1) / B * sum((trans_B[, k] - trans_bar[k])^2)
+  trans_se <- sqrt(trans_var)
+
+  return(list(
+    weights_uni = trans_bar,
+    weights_uni_se = trans_se
+  ))
 } 

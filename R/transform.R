@@ -109,6 +109,9 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   # get jack-knife SE estimates of weights
   weights_se <- weights_se_jack(strata, gencov, trans, gencov_all, names)
 
+  # get univariate weights + SE estimates
+  weights_uni <- weights_univariate(strata, gencov, trans, gencov_all, names)
+
   # Initialize transformed phenotype with controls
   trans_pheno <- data.frame(FID = ids, IID = ids, Pheno = 0)
 
@@ -229,6 +232,8 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
     transformed_pheno = trans_pheno,
     weights = trans,
     weights_se = weights_se,
+    weights_uni = weights_uni$weights_uni,
+    weights_uni_se = weights_uni$weights_uni_se,
     inflation_criteria = inflation_results
   ))
 }

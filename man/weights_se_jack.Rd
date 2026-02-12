@@ -6,21 +6,7 @@
 \usage{
 weights_se_jack(strata, gencov, trans, gencov_all, names)
 }
-\arguments{
-\item{pheno}{Binary input phenotype in PLINK format}
-
-\item{strat_cont}{Continuous stratification variables in PLINK format}
-
-\item{strat_cat}{Categorical stratification variables in PLINK format}
-
-\item{K}{Number of groups for continuous variables}
-
-\item{cov}{Covariates in PLINK format}
-}
-\value{
-NULL if all checks pass, stops with error message otherwise
-}
 \description{
-Validates all input parameters for the stratify function
+Compute jack-knife estimates of standard error for weights
 }
 \keyword{internal}
