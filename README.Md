@@ -19,6 +19,8 @@ Then load the package:
 library(StratGWAS)
 ```
 
+Please note that StratGWAS requires Rtools to install, so this should be downloaded prior to installing StratGWAS.
+
 ---
 
 ## Input Data Format
