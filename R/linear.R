@@ -67,18 +67,17 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
   valid <- !is.na(matched_idx)
   pheno_matched[matched_idx[valid]] <- trans_pheno[valid, 3]
 
-  # Handle covariates if provided
+  # Regress out covariates if provided
   if (!is.null(cov)) {
     # Match covariates to genotype file order
     cov_ids <- as.character(cov[, 2])
-    cov_data <- as.matrix(cov[, -(1:2), drop = FALSE])
+    cov_data <- as.matrix(cov[, -(1:2), drop = FALSE])  # ensure matrix, not data.frame
 
-    cov_matched <- matrix(NA_real_, length(fam_ids), ncol(cov_data))
-    colnames(cov_matched) <- colnames(cov_data)
+    match_idx <- match(fam_ids, cov_ids)  # for each fam_id, find its row in cov
 
-    for (k in 1:ncol(cov_data)) {
-      cov_matched[, k] <- cov_data[match(fam_ids, cov_ids), k]
-    }
+    cov_matched <- cov_data[match_idx, , drop = FALSE]   # reorder in one step
+    cov_matched <- apply(cov_matched, 2, as.numeric)
+    rownames(cov_matched) <- fam_ids
 
     # Impute missing covariate values with their means
     for (k in 1:ncol(cov_matched)) {
