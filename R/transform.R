@@ -50,8 +50,6 @@
 #' @export
 transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   
-  # <performs some checks here> #
-
   # Get ids
   ids <- strata$y[, 2]
   control_ids <- strata$y[which(strata$y[, 3] == 0), 2]
@@ -107,6 +105,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   names(trans) <- names
 
   # get jack-knife SE estimates of weights
+  weights_all <- NULL
   weights_se <- weights_se_jack(strata, gencov, trans, gencov_all, names)
 
   # get univariate weights + SE estimates
@@ -120,6 +119,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
     # Get weights for this stratification variable
     weights <- trans[names(trans) %in% paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)]
+    weights_all <- c(weights_all, weights)
 
     if(strata$strat_details[[k]]$type == "continuous" && smooth){
       
@@ -157,11 +157,17 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
   }
 
-  # Write trans_pheno to output file
+  # Write trans_pheno and weights to output file
+  weights_df <- data.frame("weights" = weights_all, "weights_SE" = weights_se, "weights_uni" = weights_uni$weights_uni, "weights_uni_SE" = weights_uni$weights_uni_se)
+
   message(paste0("Writing transformed phenotype to ",
                  paste0(outfile, ".transformed")))
   write.table(trans_pheno, paste0(outfile, ".transformed"),
               quote = FALSE, row.names = FALSE, col.names = FALSE)
+  message(paste0("Writing StratGWAS weights to ",
+                 paste0(outfile, ".weights")))
+  write.table(weights_df, paste0(outfile, ".weights"),
+              quote = FALSE, row.names = TRUE, col.names = TRUE)
 
   # Compute the inflation factors - need a2, gencor, and h2_Z
   h2_y <- gencov_all[1, 1]

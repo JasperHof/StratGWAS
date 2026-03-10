@@ -1,7 +1,7 @@
 #' Estimate genetic covariance of strata
 #'
 #' Compute genetic covariances and correlations between case strata using 
-#' SumHer or LDSC. This is the second step in the StratGWAS workflow.
+#' SumHer. This is the second step in the StratGWAS workflow.
 #' 
 #' @useDynLib StratGWAS, .registration = TRUE
 #' @importFrom Rcpp sourceCpp
@@ -10,8 +10,6 @@
 #' @param filename Prefix of genotype .bed file (without the .bed extension)
 #' @param nr_blocks Block size for reading in genotype data (default: 1000)
 #' @param outfile Name/path prefix for output files
-#' @param SumHer Logical indicating whether to use SumHer implementation (default: TRUE) 
-#'   or LDSC (FALSE)
 #' @param lds Optional: data frame containing LD scores. The first column should contain
 #'   SNP IDs, while the second column contains LD scores. If NULL, LD scores will be 
 #'   computed from genotype data (using a random subset of 1000 individuals if N > 1000).
@@ -44,16 +42,13 @@
 #' print(gencov$gencor)  # Genetic correlation matrix
 #' print(gencov$hers)    # SNP heritabilities
 #' 
-#' # Use LDSC instead of SumHer
-#' gencov_ldsc <- compute_gencov(strata, filename, nr_blocks = 1000, 
-#'                               outfile, SumHer = FALSE)
 #' 
 #' }
 #' 
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
-                           SumHer = TRUE, lds = NULL, ss_list = NULL,
-                           alpha = -0.25, B = 100) {
+                           lds = NULL, ss_list = NULL,
+                           alpha = -0.25, B = 50) {
 
   # Check input data
   # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, lds)
@@ -123,55 +118,42 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   
   # Initialize results matrices
   hers <- rep(NA, K_tot)
+  hers_se <- rep(NA, K_tot)
+
   gencov <- matrix(NA, nrow = K_tot, ncol = K_tot)
   rownames(gencov) <- colnames(gencov) <- colnames(multi)
   ldscores <- lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
 
-  if(SumHer == F){ 
-    # Use LDSC implementation for genetic correlations
-    for (i in 1:K_tot) {
-      for (j in i:K_tot) {
-        if (i == j) {
-          ldsc <- ldsc_cor(ss_list[[i]], ss_list[[j]], ldscores)
-          gencov[i, j] <- ldsc$cov_g
-          hers[i] <- ldsc$h2_1
-        } else {
-          ldsc <- ldsc_cor(ss_list[[i]], ss_list[[j]], ldscores)
-          gencov[i, j] <- gencov[j, i] <- ldsc$cov_g
-        }
-      }
-    }
-  } else { 
-    # Use SumHer implementation for genetic correlations (default)
-    jack_ests <- vector("list", B)
-    for (b in 1:B) jack_ests[[b]] = matrix(NA, K_tot, K_tot)
+  # Use SumHer implementation for genetic correlations
+  jack_ests <- vector("list", B)
+  for (b in 1:B) jack_ests[[b]] = matrix(NA, K_tot, K_tot)
 
-    for (i in 1:K_tot) {
-      for (j in i:K_tot) {
-        if (i == j) {
-          sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
-          jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
+  for (i in 1:K_tot) {
+    for (j in i:K_tot) {
+      if (i == j) {
+        sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
+        jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
 
-          # store jackknife estimates
-          for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack$ests[b]
+        # store jackknife estimates
+        for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack$ests[b]
 
-          gencov[i, j] <- sum$h2_snp
-          hers[i] <- sum$h2_snp
+        gencov[i, j] <- sum$h2_snp
+        hers[i] <- sum$h2_snp
+        hers_se[i] <- jack$se
 
-          cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", 
-                      colnames(multi)[i], sum$h2_snp, jack$se))
-        } else {
-          sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
-          jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
+        cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", 
+                    colnames(multi)[i], sum$h2_snp, jack$se))
+      } else {
+        sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
+        jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
 
-          # store jackknife estimates
-          for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
+        # store jackknife estimates
+        for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
 
-          gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
+        gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
 
-          cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
-                      colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
-        }
+        cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
+                    colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
       }
     }
   }
@@ -200,9 +182,19 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     }
   }
 
+  # Compute liability scale heritabilities + SE
+  prevs <- colMeans(multi_matched > 0, na.rm = T)
+  t <- qnorm(1 - prevs)
+  z <- dnorm(t)
+
+  hers_liab <- hers * (prevs * (1 - prevs)) / z^2
+  hers_liab_se <- hers_se * (prevs * (1 - prevs)) / z^2
+  hers_all <- data.frame("h2_obs" = hers, "h2_obs_SE" = hers_se, "h2_liab" = hers_liab, "h2_liab_SE" = hers_liab_se)
+  hers_all[rownames(hers_all) %in% paste0("continuous_", 1:100), c("h2_liab", "h2_liab_SE")] <- NA
+
   # Write output files with row/column names
-  write.table(cbind(rownames = colnames(multi), hers), paste0(outfile, ".hers"),
-              quote = FALSE, row.names = FALSE, col.names = TRUE)
+  write.table(hers_all, paste0(outfile, ".hers"),
+              quote = FALSE, row.names = TRUE, col.names = TRUE)
   write.table(gencov, paste0(outfile, ".gencov"),
               quote = FALSE, row.names = TRUE, col.names = TRUE)
   write.table(gencor, paste0(outfile, ".gencor"),

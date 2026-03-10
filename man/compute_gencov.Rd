@@ -9,11 +9,10 @@ compute_gencov(
   filename,
   nr_blocks = 1000,
   outfile,
-  SumHer = TRUE,
   lds = NULL,
   ss_list = NULL,
   alpha = -0.25,
-  B = 100
+  B = 50
 )
 }
 \arguments{
@@ -24,9 +23,6 @@ compute_gencov(
 \item{nr_blocks}{Block size for reading in genotype data (default: 1000)}
 
 \item{outfile}{Name/path prefix for output files}
-
-\item{SumHer}{Logical indicating whether to use SumHer implementation (default: TRUE)
-or LDSC (FALSE)}
 
 \item{lds}{Optional: data frame containing LD scores. The first column should contain
 SNP IDs, while the second column contains LD scores. If NULL, LD scores will be
@@ -49,7 +45,7 @@ Returns a list containing:
 }
 \description{
 Compute genetic covariances and correlations between case strata using
-SumHer or LDSC. This is the second step in the StratGWAS workflow.
+SumHer. This is the second step in the StratGWAS workflow.
 }
 \examples{
 \dontrun{
@@ -68,9 +64,6 @@ print(gencov$gencov)  # Genetic covariance matrix
 print(gencov$gencor)  # Genetic correlation matrix
 print(gencov$hers)    # SNP heritabilities
 
-# Use LDSC instead of SumHer
-gencov_ldsc <- compute_gencov(strata, filename, nr_blocks = 1000, 
-                              outfile, SumHer = FALSE)
 
 }
 

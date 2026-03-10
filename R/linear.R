@@ -62,7 +62,10 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
   # Match transformed phenotype to genotype file order
   pheno_matched <- rep(NA_real_, length(fam_ids))
   names(pheno_matched) <- fam_ids
-  pheno_matched[match(trans_pheno[, 2], fam_ids)] <- trans_pheno[, 3]
+
+  matched_idx <- match(trans_pheno[, 2], fam_ids)
+  valid <- !is.na(matched_idx)
+  pheno_matched[matched_idx[valid]] <- trans_pheno[valid, 3]
 
   # Handle covariates if provided
   if (!is.null(cov)) {

@@ -21,17 +21,17 @@ sumher <- function(ss, ldscores,
   chisq_obs <- ss$Chisq
   MAF <- ss$MAF
   q <- (MAF * (1 - MAF))^(1 + alpha)
-  q <- q / sum(q) 
+  q <- q / sum(q)
 
   n_params <- 1 + fit_intercept
   theta <- rep(0, n_params)
-  
+
   # Initial weights: D_inv = ldscores (approximately sum of r²)
   D_inv_0 <- pmax(ldscores, 1)  # Keep this fixed for likelihood comparison
-  
+
   # Current weights (will be updated)
   D_inv <- D_inv_0
-  
+
   # Starting expectations
   mu <- rep(1, M)
 
@@ -43,7 +43,7 @@ sumher <- function(ss, ldscores,
     loglik <- -d/2 * (log(2 * pi * lambda / d) + 1)
     return(loglik)
   }
-  
+
   # Compute expectations from parameters
   compute_expectations <- function(theta, N_scaled, ldscores, q, M, fit_intercept) {
     mu <- rep(1, length(ldscores)) + theta[1] * N * q * ldscores
@@ -65,24 +65,24 @@ sumher <- function(ss, ldscores,
   
   while (iter < max_iter && !converged) {
     iter <- iter + 1
-    
+
     # Build design matrix weighted by CURRENT iteration weights
     W <- 1 / D_inv  # Current weights
     W_sqrt <- sqrt(W)
-    
+
     X <- matrix(0, nrow = M, ncol = n_params)
     X[, 1] <- W_sqrt * N * q * ldscores
     if (fit_intercept) {
       X[, 2] <- W_sqrt * N
     }
-    
+
     # Weighted response: sqrt(W) * (S - 1)
     y <- W_sqrt * (chisq_obs - 1)
-    
+
     # Weighted least squares: solve X'X theta = X'y
     XtX <- crossprod(X)
     Xty <- crossprod(X, y)
-    
+
     # Check for singularity before solving
     is_singular <- FALSE
 
