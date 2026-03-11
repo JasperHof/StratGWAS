@@ -96,10 +96,6 @@ print(trans$inflation_criteria)     # Expected inflation for continuous variable
 # Step 4: Run GWAS on transformed phenotype with covariates
 results <- linear(trans, filename, outfile, nr_blocks = 1000, cov = cov)
 
-# Examine GWAS results
-head(results$results)               # Top SNP associations
-results$n_samples                   # Sample size used
-
 # ============================================================================
 # EXAMPLE 2: Categorical stratification (e.g., disease subtypes)
 # ============================================================================
@@ -116,7 +112,7 @@ strata_cat$strat_details[[1]]$K
 # Continue with genetic covariance estimation
 gencov_cat <- compute_gencov(strata_cat, filename, nr_blocks = 1000, outfile)
 trans_cat <- transform(strata_cat, gencov_cat)
-results_cat <- linear(trans_cat, filename, outfile, nr_blocks = 1000, cov = cov)
+linear(trans_cat, filename, outfile, nr_blocks = 1000, cov = cov)
 
 # ============================================================================
 # EXAMPLE 3: Multiple stratification variables
@@ -136,7 +132,7 @@ ncol(strata_multi$multi) - 3        # Total number of strata + variables
 # Complete workflow
 gencov_multi <- compute_gencov(strata_multi, filename, nr_blocks = 1000, outfile)
 trans_multi <- transform(strata_multi, gencov_multi)
-results_multi <- linear(trans_multi, filename, outfile, nr_blocks = 1000, cov = cov)
+linear(trans_multi, filename, outfile, nr_blocks = 1000, cov = cov)
 
 # ============================================================================
 # EXAMPLE 4: Adjust number of strata for continuous variables
@@ -146,22 +142,13 @@ results_multi <- linear(trans_multi, filename, outfile, nr_blocks = 1000, cov = 
 strata_10 <- stratify(pheno, strat_cont = strat_cont, K = 10)
 gencov_10 <- compute_gencov(strata_10, filename, nr_blocks = 1000, outfile)
 trans_10 <- transform(strata_10, gencov_10)
-results_10 <- linear(trans_10, filename, outfile, nr_blocks = 1000, cov = cov)
+linear(trans_10, filename, outfile, nr_blocks = 1000, cov = cov)
 
 # ============================================================================
 # EXAMPLE 5: GWAS without covariates
 # ============================================================================
 
-results_nocov <- linear(trans, filename, outfile, nr_blocks = 1000)
-
-# ============================================================================
-# EXAMPLE 6: Using LDSC instead of SumHer
-# ============================================================================
-
-gencov_ldsc <- compute_gencov(strata, filename, nr_blocks = 1000,
-                              outfile, SumHer = FALSE)
-trans_ldsc <- transform(strata, gencov_ldsc)
-results_ldsc <- linear(trans_ldsc, filename, outfile, nr_blocks = 1000, cov = cov)
+linear(trans, filename, outfile, nr_blocks = 1000)
 
 # ============================================================================
 # OUTPUT FILES
@@ -177,9 +164,12 @@ results_ldsc <- linear(trans_ldsc, filename, outfile, nr_blocks = 1000, cov = co
 #   <outfile>.gencov      - Genetic covariance matrix
 #   <outfile>.gencor      - Genetic correlation matrix
 #
+# From transform():
+#   <outfile>.weights       - StratGWAS weights
+#   <outfile>.transformed   - Transformed phenotype
+#
 # From linear():
-#   <outfile>.transformed_pheno - Transformed phenotype file
-#   <outfile>.pheno1            - Final GWAS results
+#   <outfile>.trans.pheno1  - Final GWAS results
 }
 
 }

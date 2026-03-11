@@ -18,7 +18,7 @@
 #'     continuous variables, including a2 (regression coefficient), genetic correlation 
 #'     with binary phenotype, heritability of stratification variable, and expected 
 #'     inflation factor}
-#' 
+#'
 #' @examples
 #' \dontrun{
 #' # Basic usage
@@ -27,19 +27,19 @@
 #' filename_bed <- system.file("extdata", "data.bed", package = "StratGWAS")
 #' filename <- gsub(".bed", "", filename_bed)
 #' outfile <- tempfile("transform")
-#' 
+#'
 #' strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
 #' gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
 #' trans <- transform(strata, gencov)
-#' 
+#'
 #' # Examine transformation results
 #' head(trans$transformed_pheno)      # Transformed phenotype values
 #' print(trans$weights)               # Weights for each stratum
 #' print(trans$inflation_criteria)    # Expected inflation (continuous vars only)
-#' 
+#'
 #' # Check distribution of transformed phenotype
 #' hist(trans$transformed_pheno[, 3], main = "Transformed Phenotype Distribution")
-#' 
+#'
 #' # With categorical variables
 #' data(strat_cat)
 #' strata_cat <- stratify(pheno, strat_cat = strat_cat)

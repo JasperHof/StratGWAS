@@ -6,7 +6,7 @@
 #'
 #' @useDynLib StratGWAS, .registration = TRUE
 #' @importFrom Rcpp sourceCpp
-#' 
+#'
 #' @param trans Object returned from \code{\link{transform}}, containing the
 #'   transformed phenotype and associated weights
 #' @param filename Prefix of genotype .bed file (without the .bed extension)
@@ -17,11 +17,7 @@
 #'   column means. Covariates will be regressed out of the transformed phenotype
 #'   before GWAS analysis.
 #'
-#' @return Returns a list containing:
-#'   \item{results}{Data frame with GWAS results (predictor, effect size,
-#'     standard error, p-value, etc.)}
-#'   \item{n_samples}{Number of samples with non-missing phenotypes used in analysis}
-#'   \item{covariates_used}{Logical indicating whether covariates were included}
+#' @return GWAS results are written to <outfile>.trans.pheno1
 #'
 #' @examples
 #' \dontrun{
@@ -36,17 +32,12 @@
 #' strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
 #' gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
 #' trans <- transform(strata, gencov)
-#' results <- linear(trans, filename, outfile, nr_blocks = 1000, cov = cov)
+#' linear(trans, filename, outfile, nr_blocks = 1000, cov = cov)
 #'
-#' # Examine results
-#' head(results$results)                    # Top associations
-#' results$n_samples                        # Sample size
-#'
-#' # Without covariates
-#' results_nocov <- linear(trans, filename, outfile, nr_blocks = 1000)
+#' gwas_results <- read.table(paste0(outfile,".trans.pheno1"))
 #'
 #' # View top hits
-#' top_hits <- results$results[order(results$results$Pvalue), ]
+#' top_hits <- gwas_results$gwas_results[order(gwas_results$gwas_results$Pvalue), ]
 #' head(top_hits, 20)
 #' }
 #'
@@ -118,14 +109,6 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
   linear_gwas_parallel(filename, linear_pheno,
                        nr_blocks, outfile_trans)
   
-  # Read results
-  results <- read.table(paste0(outfile_trans, ".pheno1"), header = TRUE)
-  
+  cat("\n")
   cat(sprintf("GWAS completed. Results written to %s.pheno1\n\n", outfile_trans))
-  
-  return(list(
-    results = results,
-    n_samples = sum(non_missing),
-    covariates_used = !is.null(cov)
-  ))
 }
