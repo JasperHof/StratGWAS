@@ -64,6 +64,8 @@ struct PhenotypeWorker : public Worker {
         
         for (std::size_t p = begin; p < end; ++p) {
             
+            std::ostringstream local_buf; // CHANGE 1
+
             // Phenotype vector + mask
             VectorXd y(n_inds);
             VectorXd y_mask(n_inds);
@@ -155,7 +157,8 @@ struct PhenotypeWorker : public Worker {
 
                 int idx = block_start + s;
 
-                buffers[p]
+                // buffers[p]
+                local_buf // *** CHANGE 
                     << chr[idx] << '\t'
                     << snp[idx] << '\t'
                     << pos[idx] << '\t'
@@ -169,6 +172,7 @@ struct PhenotypeWorker : public Worker {
                     << maf[s] << '\t'
                     << miss[s] << '\n';
             }
+            buffers[p] << local_buf.str(); // *** CHANGE
         }
     }
 };
@@ -247,7 +251,9 @@ Rcpp::NumericMatrix linear_gwas_parallel(const std::string& filename, const SEXP
 
     for(int b = 0; b < nr_blocks; ++b){
 
-        Rcout << "Performing linear regression for block " << b + 1 << "/" << nr_blocks << "\n";
+        if (b % 10 == 0)
+            Rcout << "Performing linear regression for block " << b + 1 << "/" << nr_blocks << "\n";
+        // Rcout << "Performing linear regression for block " << b + 1 << "/" << nr_blocks << "\n";
 
         int block_start = b * block_size;
         int block_end = std::min(n_snps - 1, (b + 1) * block_size - 1);
@@ -288,8 +294,6 @@ Rcpp::NumericMatrix linear_gwas_parallel(const std::string& filename, const SEXP
         out_files[i].flush(); // added
         out_files[i].close();
     }
-
-
 
     return NumericMatrix(0, 0);
 }

@@ -3,6 +3,7 @@
 export(compute_gencov)
 export(linear)
 export(stratify)
+export(stratify_jasper)
 export(sumher)
 export(sumher_cov)
 export(sumher_cov_jack)

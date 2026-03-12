@@ -92,10 +92,11 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   # Perform linear regression on all phenotypes
   if (is.null(ss_list)) {
     linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
-    
+
     # Read in linear regression results
     ss_list <- vector("list", K_tot)
     for (k in 1:K_tot) {
+      cat(sprintf("Reading summary statistics of stratum %d \n", k))
       ss_list[[k]] <- read.table(paste0(outfile, ".pheno", k), header = TRUE)
     }
   }
@@ -116,7 +117,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
                 quote = FALSE, row.names = FALSE, col.names = TRUE)
   }
   cat("\n")
-  
+
   # Initialize results matrices
   hers <- rep(NA, K_tot)
   hers_se <- rep(NA, K_tot)
