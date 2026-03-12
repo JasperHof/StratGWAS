@@ -285,8 +285,11 @@ Rcpp::NumericMatrix linear_gwas_parallel(const std::string& filename, const SEXP
 
     // Close files
     for(int i = 0; i < n_pheno; ++i) {
+        out_files[i].flush(); // added
         out_files[i].close();
     }
+
+
 
     return NumericMatrix(0, 0);
 }
