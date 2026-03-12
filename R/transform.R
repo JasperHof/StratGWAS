@@ -73,7 +73,6 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   for(k in 1:length(strata$strat_details)){
     if(strata$strat_details[[k]]$type == "categorical"){
       vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
-
       h2_obs <- diag(gencov_use[vars, vars])
 
       # Ensure we have a numeric matrix
@@ -88,7 +87,8 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       scale_from <- (prevs * (1 - prevs)) / z_from^2
       scale_to <- (cont_prev * (1 - cont_prev)) / z_to^2
 
-      fac <- scale_from / scale_to
+      fac <- scale_from
+      #fac <- scale_from / scale_to
       ###
 
       # compute h2 relative to prevalence of strata for continuous variables
@@ -99,6 +99,25 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       for(i in 1:length(vars)){
         gencov_use[vars[i], ] <- gencov_use[vars[i], ] * sqrt(fac[i])
         gencov_use[, vars[i]] <- gencov_use[, vars[i]] * sqrt(fac[i])
+      }
+    } else {
+      vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
+      h2_obs <- diag(gencov_use[vars, vars])
+
+      # Ensure we have a numeric matrix
+      multi_subset <- as.matrix(strata$multi[, vars, drop = FALSE])
+      multi_subset <- apply(multi_subset, 2, as.numeric)
+      prevs <- colMeans(multi_subset, na.rm = TRUE)
+
+      # Scale heritability estimates
+      z_from <- dnorm(qnorm(1 - prevs))
+      scale <- (prevs * (1 - prevs)) / z_from^2
+      h2_adj <- h2_obs * scale
+
+      # update genetic covariance
+      for(i in 1:length(vars)){
+        gencov_use[vars[i], ] <- gencov_use[vars[i], ] * sqrt(scale[i])
+        gencov_use[, vars[i]] <- gencov_use[, vars[i]] * sqrt(scale[i])
       }
     } 
   } 
