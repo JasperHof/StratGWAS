@@ -63,7 +63,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
   # Extract strata and compute eigendecomposition
   names <- c()
-  for(k in 1:length(strata$strat_details)) names <- c(names, paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K))
+  for(k in 1:length(strata$strat_details)) names <- c(names, paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index,"_", 1:strata$strat_details[[k]]$K))
 
   idx <- which(colnames(gencov_all) %in% names)
   gencov_use <- gencov_all[idx, idx]
@@ -81,7 +81,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       multi_subset <- apply(multi_subset, 2, as.numeric)
       prevs <- colMeans(multi_subset, na.rm = TRUE)
 
-      ### different scaling strategy that is more correct?
+      ### scale heritability estimates
       z_from <- dnorm(qnorm(1 - prevs))
       z_to <- dnorm(qnorm(1 - cont_prev))
 

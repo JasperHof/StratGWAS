@@ -190,8 +190,17 @@ weights_se_jack <- function(strata, gencov, trans, gencov_all, names) {
         multi_subset <- apply(multi_subset, 2, as.numeric)
         prevs <- colMeans(multi_subset, na.rm = TRUE)
 
+        ### scale heritability estimates
+        z_from <- dnorm(qnorm(1 - prevs))
+        z_to <- dnorm(qnorm(1 - cont_prev))
+
+        scale_from <- (prevs * (1 - prevs)) / z_from^2
+        scale_to <- (cont_prev * (1 - cont_prev)) / z_to^2
+
+        fac <- scale_from / scale_to
+
         # compute h2 relative to prevalence of strata for continuous variables
-        fac <- (cont_prev * (1 - cont_prev)) / (prevs * (1 - prevs))
+        #fac <- (cont_prev * (1 - cont_prev)) / (prevs * (1 - prevs))
         h2_adj <- h2_obs * fac
 
         # update genetic covariance
@@ -252,9 +261,18 @@ weights_univariate <- function(strata, gencov, trans, gencov_all, names) {
         multi_subset <- as.matrix(strata$multi[, vars, drop = FALSE])
         multi_subset <- apply(multi_subset, 2, as.numeric)
         prevs <- colMeans(multi_subset, na.rm = TRUE)
+  
+        ### scale heritability estimates
+        z_from <- dnorm(qnorm(1 - prevs))
+        z_to <- dnorm(qnorm(1 - cont_prev))
+
+        scale_from <- (prevs * (1 - prevs)) / z_from^2
+        scale_to <- (cont_prev * (1 - cont_prev)) / z_to^2
+
+        fac <- scale_from / scale_to
 
         # compute h2 relative to prevalence of strata for continuous variables
-        fac <- (cont_prev * (1 - cont_prev)) / (prevs * (1 - prevs))
+        #fac <- (cont_prev * (1 - cont_prev)) / (prevs * (1 - prevs))
         h2_adj <- h2_obs * fac
 
         # update genetic covariance
