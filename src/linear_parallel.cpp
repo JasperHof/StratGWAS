@@ -64,7 +64,7 @@ struct PhenotypeWorker : public Worker {
         
         for (std::size_t p = begin; p < end; ++p) {
             
-            std::ostringstream local_buf; // CHANGE 1
+            // std::ostringstream local_buf; // CHANGE 1
 
             // Phenotype vector + mask
             VectorXd y(n_inds);
@@ -153,12 +153,14 @@ struct PhenotypeWorker : public Worker {
 
                 double se = std::sqrt((rss / (n_used - 2)) / XtX);
                 double chisq = (beta / se) * (beta / se);
-                double pval = R::pchisq(chisq, 1, false, false);
+                // double pval = R::pchisq(chisq, 1, false, false);
+                double pval = std::erfc(std::sqrt(chisq / 2.0));
 
                 int idx = block_start + s;
 
                 // buffers[p]
-                local_buf // *** CHANGE 
+                //local_buf // *** CHANGE 
+                buffers[p]
                     << chr[idx] << '\t'
                     << snp[idx] << '\t'
                     << pos[idx] << '\t'
@@ -172,7 +174,7 @@ struct PhenotypeWorker : public Worker {
                     << maf[s] << '\t'
                     << miss[s] << '\n';
             }
-            buffers[p] << local_buf.str(); // *** CHANGE
+            // buffers[p] << local_buf.str(); // *** CHANGE
         }
     }
 };

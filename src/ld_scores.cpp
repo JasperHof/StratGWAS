@@ -100,14 +100,14 @@ DataFrame computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set
 
   NumericVector ldscore(n_snp, 0.0);
   int start_snp = 0;
-  static int last_printed = -1000; // Track last printed value
+  static int last_printed = -10000; // Track last printed value
 
   // Strategy: read in blocks at a time to reduce memory. First find the maximum index distance that covers 1Mb? 
   while(start_snp < n_snp) {
 
-    if (start_snp / 1000 > last_printed / 1000) {
-      Rcout << "Reading SNP " << (start_snp / 1000) * 1000 << " / " << n_snp << "\n";
-      last_printed = (start_snp / 1000) * 1000;
+    if (start_snp / 10000 > last_printed / 10000) {
+      Rcout << "Reading SNP " << (start_snp / 10000) * 10000 << " / " << n_snp << "\n";
+      last_printed = (start_snp / 10000) * 10000;
     }
 
     // Rcout << "Reading SNP " << start_snp << "/" << n_snp << "\n";

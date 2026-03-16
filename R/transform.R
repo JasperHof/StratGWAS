@@ -244,7 +244,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       rg <- gencov_all[1, idx] / sqrt(h2_y * h2_Z)
       exp_inflation <- a2^2 * (1 - rg^2) * h2_Z
 
-      message(sprintf("Expected inflation criterion of %s is %.4f",
+      message(sprintf("Inflation criterion of %s is %.4f",
                       var_name, exp_inflation))
 
       inflation_results <- rbind(
