@@ -16,6 +16,7 @@
 #' @param ss_list Optional: list of previously computed summary statistics for strata 
 #'   in strata$multi
 #' @param alpha Selection parameter for dependency MAF on SNP heritability (default: -0.25)
+#' @param jack Logical specifying whether jack-knife estimates are used to compute h2 standard errors (default: FALSE)
 #' @param B Number of jackknife blocks for standard error of genetic covariance (default 100)
 #'
 #' @return Returns a list containing:
@@ -48,30 +49,30 @@
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
                            lds = NULL, ss_list = NULL,
-                           alpha = -0.25, B = 50, threads = 4) {
+                           alpha = -0.25, jack = FALSE, B = 50) {
 
   # Check input data
   # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, lds)
 
   # Get the multi phenotype matrix from strata
   multi_pheno <- strata$multi
-  
+
   # Extract IDs from first two columns
   ids <- as.character(multi_pheno[, 2])
-  
+
   # Get phenotype matrix (excluding first two ID columns)
   multi <- multi_pheno[, -(1:2), drop = FALSE]
   multi <- apply(multi, 2, as.numeric)
   K_tot <- ncol(multi)
-  
+
   # Read genotype IDs
   fam_ids <- as.character(read.table(paste0(filename, ".fam"))[, 2])
-  
+
   # Match multi to genotype file order
   multi_matched <- matrix(NA_real_, length(fam_ids), K_tot)
   rownames(multi_matched) <- fam_ids
   colnames(multi_matched) <- colnames(multi)
-  
+
   for(k in 1:K_tot) {
     multi_matched[, k] <- multi[match(fam_ids, ids), k]
   }
@@ -94,7 +95,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     cat("\n")
     linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
     cat("\n")
-    
+
     # Read in linear regression results
     ss_list <- vector("list", K_tot)
     for (k in 1:K_tot) {
@@ -132,100 +133,52 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   jack_ests <- vector("list", B)
   for (b in 1:B) jack_ests[[b]] = matrix(NA, K_tot, K_tot)
 
-  #for (i in 1:K_tot) {
-  #  for (j in i:K_tot) {
-  #    if (i == j) {
-  #      sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
-  #      jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
-  #
-  #      # store jackknife estimates
-  #      for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack$ests[b]
-  #
-  #      gencov[i, j] <- sum$h2_snp
-  #      hers[i] <- sum$h2_snp
-  #      hers_se[i] <- jack$se
-  #
-  #      cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n",
-  #                  colnames(multi)[i], sum$h2_snp, jack$se))
-  #    } else {
-  #      sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
-  #      jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
-  #
-  #      # store jackknife estimates
-  #      for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
-  #
-  #      gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
-  #
-  #      cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
-  #                  colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
-  #    }
-  #  }
-  #}
+  for (i in 1:K_tot) {
+    for (j in i:K_tot) {
+      if (i == j) {
+        sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
 
-  # free up memory thats not being used
-  gc()
+        if (jack == TRUE) {
+          jack_sum <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
+          for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_sum$ests[b]
+    
+          gencov[i, j] <- sum$h2_snp
+          hers[i] <- sum$h2_snp
+          hers_se[i] <- jack_sum$se
+    
+          cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n",
+                      colnames(multi)[i], sum$h2_snp, jack_sum$se))
+        } else {
+          gencov[i, j] <- sum$h2_snp
+          hers[i] <- sum$h2_snp
+          hers_se[i] <- sum$se_h2
+    
+          cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n",
+                      colnames(multi)[i], sum$h2_snp, sum$se_h2))
+        }
+      } else {
+        sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
 
-  ### use parallel to obtain jackknife estimates
-  pairs <- list()
-  for (i in 1:K_tot)
-    for (j in i:K_tot)
-      pairs[[length(pairs) + 1]] <- c(i, j)
-
-  cl <- parallel::makeCluster(max(1, threads))
-  on.exit(parallel::stopCluster(cl), add = TRUE)  # clean up even on error
-
-  parallel::clusterExport(cl,
-    varlist = c("ss_list", "ldscores", "alpha", "B",
-                "sumher", "sumher_jack", "sumher_cov", "sumher_cov_jack"),
-    envir = environment())
-
-  # compute results
-  results <- parallel::parLapply(cl, pairs, function(pair) {
-    i <- pair[1]; j <- pair[2]
-    if (i == j) {
-      sum  <- sumher(ss_list[[i]], ldscores, alpha = alpha)
-      jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
-      list(type = "diag", i = i, sum = sum, jack = jack)
-    } else {
-      sum_cov  <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
-      jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
-      list(type = "offdiag", i = i, j = j, sum_cov = sum_cov, jack_cov = jack_cov)
-    }
-  })
-
-  #results <- parallel::mclapply(pairs, function(pair) {
-  #  i <- pair[1]; j <- pair[2]
-  #  if (i == j) {
-  #    sum  <- sumher(ss_list[[i]], ldscores, alpha = alpha)
-  #    jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
-  #    list(type = "diag", i = i, sum = sum, jack = jack)
-  #  } else {
-  #   sum_cov  <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
-  #    jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
-  #    list(type = "offdiag", i = i, j = j, sum_cov = sum_cov, jack_cov = jack_cov)
-  #  }
-  #}, mc.cores = max(1, threads))   #}, mc.cores = max(1, parallel::detectCores() - 1))
-
-  for (res in results) {
-    i <- res$i; j <- res$j
-    if (res$type == "diag") {
-      sum <- res$sum; jack <- res$jack
-      for (b in 1:B) jack_ests[[b]][i, i] <- jack$ests[b]
-      gencov[i, i] <- sum$h2_snp
-      hers[i] <- sum$h2_snp
-      hers_se[i] <- jack$se
-      cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", colnames(multi)[i], sum$h2_snp, jack$se))
-    } else {
-      sum_cov <- res$sum_cov; jack_cov <- res$jack_cov
-      for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
-      gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
-      cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
+        if (jack == TRUE) {
+          jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
+          for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
+    
+          gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
+          cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
+                    colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
+        } else {
+          gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
+          cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
+                    colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, sum_cov$se_h2_AB))
+        }
+      }
     }
   }
-  ### end parallel
 
-  for (b in 1:B){
-    rownames(jack_ests[[b]]) <- colnames(jack_ests[[b]]) <- colnames(multi)
+  if (jack == TRUE) {
+    for (b in 1:B){
+      rownames(jack_ests[[b]]) <- colnames(jack_ests[[b]]) <- colnames(multi)
+    }
   }
 
   cat("\n")
@@ -271,10 +224,11 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     gencov = gencov,
     gencor = gencor,
     jack_ests = jack_ests,
+    jack = jack,
     hers = hers,
     var_names = colnames(multi),
     strat_details = strata$strat_details
   )
-  
+
   return(result)
 }

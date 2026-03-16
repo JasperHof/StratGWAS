@@ -12,8 +12,8 @@ compute_gencov(
   lds = NULL,
   ss_list = NULL,
   alpha = -0.25,
-  B = 50,
-  threads = 4
+  jack = FALSE,
+  B = 50
 )
 }
 \arguments{
@@ -33,6 +33,8 @@ computed from genotype data (using a random subset of 1000 individuals if N > 10
 in strata$multi}
 
 \item{alpha}{Selection parameter for dependency MAF on SNP heritability (default: -0.25)}
+
+\item{jack}{Logical specifying whether jack-knife estimates are used to compute h2 standard errors (default: FALSE)}
 
 \item{B}{Number of jackknife blocks for standard error of genetic covariance (default 100)}
 }

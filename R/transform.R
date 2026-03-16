@@ -54,6 +54,12 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   ids <- strata$y[, 2]
   control_ids <- strata$y[which(strata$y[, 3] == 0), 2]
 
+  # Check smoothing parameter
+  if (strata$K < 4) {
+    message("Need K > 3 to enable smoothing - will continue without smoothing.")
+    smooth <- FALSE
+  }
+
   # Information about prevalence
   total_prev <- mean(strata$y[, 3], na.rm = T)
   cont_prev <- (total_prev / strata$K) / (1 - total_prev + total_prev / strata$K)
@@ -101,7 +107,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
         gencov_use[, vars[i]] <- gencov_use[, vars[i]] * sqrt(fac[i])
       }
     } else {
-      vars <- paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)
+      vars <- paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index,"_", 1:strata$strat_details[[k]]$K)
       h2_obs <- diag(gencov_use[vars, vars])
 
       # Ensure we have a numeric matrix
@@ -135,10 +141,14 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
   # get jack-knife SE estimates of weights
   weights_all <- NULL
-  weights_se <- weights_se_jack(strata, gencov, trans, gencov_all, names)
 
-  # get univariate weights + SE estimates
-  weights_uni <- weights_univariate(strata, gencov, trans, gencov_all, names)
+  if (gencov$jack) {
+    weights_se <- weights_se_jack(strata, gencov, trans, gencov_all, names)
+    weights_uni <- weights_univariate(strata, gencov, trans, gencov_all, names)
+  } else {
+    weights_se <- NULL
+    weights_uni <- NULL
+  }
 
   # Initialize transformed phenotype with controls
   trans_pheno <- data.frame(FID = ids, IID = ids, Pheno = 0)
@@ -187,7 +197,11 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   }
 
   # Write trans_pheno and weights to output file
-  weights_df <- data.frame("weights" = weights_all, "weights_SE" = weights_se, "weights_uni" = weights_uni$weights_uni, "weights_uni_SE" = weights_uni$weights_uni_se)
+  if (gencov$jack == TRUE) {
+    weights_df <- data.frame("weights" = weights_all, "weights_SE" = weights_se, "weights_uni" = weights_uni$weights_uni, "weights_uni_SE" = weights_uni$weights_uni_se)
+  } else {
+    weights_df <- data.frame("weights" = weights_all)
+  }
 
   message(paste0("Writing transformed phenotype to ",
                  paste0(outfile, ".transformed")))
