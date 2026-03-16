@@ -48,7 +48,7 @@
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
                            lds = NULL, ss_list = NULL,
-                           alpha = -0.25, B = 50) {
+                           alpha = -0.25, B = 50, threads = 4) {
 
   # Check input data
   # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, lds)
@@ -182,7 +182,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
       jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
       list(type = "offdiag", i = i, j = j, sum_cov = sum_cov, jack_cov = jack_cov)
     }
-  }, mc.cores = max(1, parallel::detectCores() - 1))
+  }, mc.cores = max(1, threads))   #}, mc.cores = max(1, parallel::detectCores() - 1))
 
   for (res in results) {
     i <- res$i; j <- res$j
