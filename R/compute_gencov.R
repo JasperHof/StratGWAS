@@ -162,6 +162,9 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   #  }
   #}
 
+  # free up memory thats not being used
+  gc()
+
   ### use parallel to obtain jackknife estimates
   pairs <- list()
   for (i in 1:K_tot)
