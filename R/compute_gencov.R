@@ -145,7 +145,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   #      hers[i] <- sum$h2_snp
   #      hers_se[i] <- jack$se
   #
-  #      cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", 
+  #      cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n",
   #                  colnames(multi)[i], sum$h2_snp, jack$se))
   #    } else {
   #      sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
@@ -171,7 +171,16 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     for (j in i:K_tot)
       pairs[[length(pairs) + 1]] <- c(i, j)
 
-  results <- parallel::mclapply(pairs, function(pair) {
+  cl <- parallel::makeCluster(max(1, threads))
+  on.exit(parallel::stopCluster(cl), add = TRUE)  # clean up even on error
+
+  parallel::clusterExport(cl,
+    varlist = c("ss_list", "ldscores", "alpha", "B",
+                "sumher", "sumher_jack", "sumher_cov", "sumher_cov_jack"),
+    envir = environment())
+
+  # compute results
+  results <- parallel::parLapply(cl, pairs, function(pair) {
     i <- pair[1]; j <- pair[2]
     if (i == j) {
       sum  <- sumher(ss_list[[i]], ldscores, alpha = alpha)
@@ -182,7 +191,20 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
       jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
       list(type = "offdiag", i = i, j = j, sum_cov = sum_cov, jack_cov = jack_cov)
     }
-  }, mc.cores = max(1, threads))   #}, mc.cores = max(1, parallel::detectCores() - 1))
+  })
+
+  #results <- parallel::mclapply(pairs, function(pair) {
+  #  i <- pair[1]; j <- pair[2]
+  #  if (i == j) {
+  #    sum  <- sumher(ss_list[[i]], ldscores, alpha = alpha)
+  #    jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
+  #    list(type = "diag", i = i, sum = sum, jack = jack)
+  #  } else {
+  #   sum_cov  <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
+  #    jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
+  #    list(type = "offdiag", i = i, j = j, sum_cov = sum_cov, jack_cov = jack_cov)
+  #  }
+  #}, mc.cores = max(1, threads))   #}, mc.cores = max(1, parallel::detectCores() - 1))
 
   for (res in results) {
     i <- res$i; j <- res$j

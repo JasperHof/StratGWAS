@@ -12,7 +12,8 @@ compute_gencov(
   lds = NULL,
   ss_list = NULL,
   alpha = -0.25,
-  B = 50
+  B = 50,
+  threads = 4
 )
 }
 \arguments{
