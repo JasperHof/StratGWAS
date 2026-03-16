@@ -11,7 +11,8 @@ LinkingTo: Rcpp, RcppEigen, RcppParallel
 Imports: 
     Rcpp,
     RcppParallel,
-    Matrix
+    Matrix,
+    parallel
 SystemRequirements: GNU make, C++11
 Depends: 
     R (>= 3.5)

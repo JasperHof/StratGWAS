@@ -132,35 +132,72 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   jack_ests <- vector("list", B)
   for (b in 1:B) jack_ests[[b]] = matrix(NA, K_tot, K_tot)
 
-  for (i in 1:K_tot) {
-    for (j in i:K_tot) {
-      if (i == j) {
-        sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
-        jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
+  #for (i in 1:K_tot) {
+  #  for (j in i:K_tot) {
+  #    if (i == j) {
+  #      sum <- sumher(ss_list[[i]], ldscores, alpha = alpha)
+  #      jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
+  #
+  #      # store jackknife estimates
+  #      for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack$ests[b]
+  #
+  #      gencov[i, j] <- sum$h2_snp
+  #      hers[i] <- sum$h2_snp
+  #      hers_se[i] <- jack$se
+  #
+  #      cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", 
+  #                  colnames(multi)[i], sum$h2_snp, jack$se))
+  #    } else {
+  #      sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
+  #      jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
+  #
+  #      # store jackknife estimates
+  #      for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
+  #
+  #      gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
+  #
+  #      cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
+  #                  colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
+  #    }
+  #  }
+  #}
 
-        # store jackknife estimates
-        for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack$ests[b]
+  ### use parallel to obtain jackknife estimates
+  pairs <- list()
+  for (i in 1:K_tot)
+    for (j in i:K_tot)
+      pairs[[length(pairs) + 1]] <- c(i, j)
 
-        gencov[i, j] <- sum$h2_snp
-        hers[i] <- sum$h2_snp
-        hers_se[i] <- jack$se
+  results <- parallel::mclapply(pairs, function(pair) {
+    i <- pair[1]; j <- pair[2]
+    if (i == j) {
+      sum  <- sumher(ss_list[[i]], ldscores, alpha = alpha)
+      jack <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
+      list(type = "diag", i = i, sum = sum, jack = jack)
+    } else {
+      sum_cov  <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
+      jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
+      list(type = "offdiag", i = i, j = j, sum_cov = sum_cov, jack_cov = jack_cov)
+    }
+  }, mc.cores = max(1, parallel::detectCores() - 1))
 
-        cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", 
-                    colnames(multi)[i], sum$h2_snp, jack$se))
-      } else {
-        sum_cov <- sumher_cov(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha)
-        jack_cov <- sumher_cov_jack(ss_list[[i]], ss_list[[j]], ldscores, alpha = alpha, B = B)
-
-        # store jackknife estimates
-        for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
-
-        gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
-
-        cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
-                    colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
-      }
+  for (res in results) {
+    i <- res$i; j <- res$j
+    if (res$type == "diag") {
+      sum <- res$sum; jack <- res$jack
+      for (b in 1:B) jack_ests[[b]][i, i] <- jack$ests[b]
+      gencov[i, i] <- sum$h2_snp
+      hers[i] <- sum$h2_snp
+      hers_se[i] <- jack$se
+      cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n", colnames(multi)[i], sum$h2_snp, jack$se))
+    } else {
+      sum_cov <- res$sum_cov; jack_cov <- res$jack_cov
+      for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
+      gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
+      cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
     }
   }
+  ### end parallel
 
   for (b in 1:B){
     rownames(jack_ests[[b]]) <- colnames(jack_ests[[b]]) <- colnames(multi)
