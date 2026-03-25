@@ -17,7 +17,7 @@
 #'   column means. Covariates will be regressed out of the transformed phenotype
 #'   before GWAS analysis.
 #'
-#' @return GWAS results are written to <outfile>.trans.pheno1
+#' @return GWAS results are written to <outfile>.assoc
 #'
 #' @examples
 #' \dontrun{
@@ -34,7 +34,7 @@
 #' trans <- transform(strata, gencov)
 #' linear(trans, filename, outfile, nr_blocks = 1000, cov = cov)
 #'
-#' gwas_results <- read.table(paste0(outfile,".trans.pheno1"))
+#' gwas_results <- read.table(paste0(outfile,".assoc"))
 #'
 #' # View top hits
 #' top_hits <- gwas_results$gwas_results[order(gwas_results$gwas_results$Pvalue), ]
@@ -106,9 +106,13 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
   rownames(linear_pheno) <- fam_ids
   outfile_trans <- paste0(outfile, ".trans")
   cat("Running linear regression GWAS on transformed phenotype...\n")
-  linear_gwas_parallel(filename, linear_pheno,
-                       nr_blocks, outfile_trans)
-  
+  #linear_gwas_parallel(filename, linear_pheno,
+  #                     nr_blocks, outfile_trans)
+  outfile_trans <- paste0(outfile, ".assoc")
+  linear_gwas(filename, linear_pheno,
+              nr_blocks, outfile_trans)
+
+
   cat("\n")
-  cat(sprintf("GWAS completed. Results written to %s.pheno1\n\n", outfile_trans))
+  cat(sprintf("GWAS completed. Results written to %s.assoc\n\n", outfile_trans))
 }

@@ -160,7 +160,7 @@
 #' #   <outfile>.transformed   - Transformed phenotype
 #' #
 #' # From linear():
-#' #   <outfile>.trans.pheno1  - Final GWAS results
+#' #   <outfile>.assoc  - Final GWAS results
 #' }
 #'
 #' @author Jasper Hof \email{jasper.hof@qgg.au.dk}

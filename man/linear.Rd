@@ -22,7 +22,7 @@ column means. Covariates will be regressed out of the transformed phenotype
 before GWAS analysis.}
 }
 \value{
-GWAS results are written to \if{html}{\out{<outfile>}}.trans.pheno1
+GWAS results are written to \if{html}{\out{<outfile>}}.assoc
 }
 \description{
 Perform genome-wide association analysis using the transformed phenotype.
@@ -44,7 +44,7 @@ gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
 trans <- transform(strata, gencov)
 linear(trans, filename, outfile, nr_blocks = 1000, cov = cov)
 
-gwas_results <- read.table(paste0(outfile,".trans.pheno1"))
+gwas_results <- read.table(paste0(outfile,".assoc"))
 
 # View top hits
 top_hits <- gwas_results$gwas_results[order(gwas_results$gwas_results$Pvalue), ]

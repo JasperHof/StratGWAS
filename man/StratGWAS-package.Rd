@@ -169,7 +169,7 @@ linear(trans, filename, outfile, nr_blocks = 1000)
 #   <outfile>.transformed   - Transformed phenotype
 #
 # From linear():
-#   <outfile>.trans.pheno1  - Final GWAS results
+#   <outfile>.assoc  - Final GWAS results
 }
 
 }
