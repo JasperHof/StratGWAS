@@ -61,7 +61,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   }
 
   # Information about prevalence
-  total_prev <- mean(strata$y[, 3], na.rm = T)
+  total_prev <- mean(as.numeric(strata$y[, 3]), na.rm = T)
   cont_prev <- (total_prev / strata$K) / (1 - total_prev + total_prev / strata$K)
 
   # Genetic covariance
@@ -137,7 +137,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   trans <- eigen(gencov_use)$vectors[, 1]
   trans <- trans / sqrt(sum(trans^2))  # normalize
   if (mean(trans) < 0) trans <- -trans
-  names(trans) <- names
+  names(trans) <- names 
 
   # get jack-knife SE estimates of weights
   weights_all <- NULL
@@ -241,7 +241,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       Z <- strata$strat_details[[k]]$original[, 3]
       Z[is.na(Z)] <- mean(Z, na.rm = TRUE)
       
-      y <- strata$y[, 3]
+      y <- as.numeric(strata$y[, 3])
       y[is.na(y)] <- mean(y, na.rm = TRUE)
 
       # Scale variables
