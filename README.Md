@@ -112,7 +112,7 @@ The workflow produces several files using the provided output prefix:
 
 ### From `linear()`
 
-* `<outfile>.trans.pheno1` – Final GWAS results
+* `<outfile>.assoc` – Final GWAS results
 
 ---
 

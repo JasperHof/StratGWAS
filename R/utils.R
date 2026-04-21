@@ -169,7 +169,7 @@ check_stratify_inputs <- function(pheno, strat_cont, strat_cat, K) {
 weights_se_jack <- function(strata, gencov, trans, gencov_all, names) {
 
   # Define variables
-  total_prev <- mean(strata$y[, 3], na.rm = T)
+  total_prev <- mean(as.numeric(strata$y[, 3]), na.rm = TRUE)
   cont_prev <- (total_prev / strata$K) / (1 - total_prev + total_prev / strata$K)
   B <- length(gencov$jack_ests)
   idx <- which(colnames(gencov_all) %in% names)
@@ -197,7 +197,8 @@ weights_se_jack <- function(strata, gencov, trans, gencov_all, names) {
         scale_from <- (prevs * (1 - prevs)) / z_from^2
         scale_to <- (cont_prev * (1 - cont_prev)) / z_to^2
 
-        fac <- scale_from / scale_to
+        #fac <- scale_from / scale_to
+        fac <- scale_from
 
         # compute h2 relative to prevalence of strata for continuous variables
         #fac <- (cont_prev * (1 - cont_prev)) / (prevs * (1 - prevs))
@@ -240,7 +241,7 @@ weights_se_jack <- function(strata, gencov, trans, gencov_all, names) {
 weights_univariate <- function(strata, gencov, trans, gencov_all, names) {
 
   # Define variables - note that h2 scaling is already done in weights_se_jack
-  total_prev <- mean(strata$y[, 3], na.rm = T)
+  total_prev <- mean(as.numeric(strata$y[, 3]), na.rm = TRUE)
   cont_prev <- (total_prev / strata$K) / (1 - total_prev + total_prev / strata$K)
   B <- length(gencov$jack_ests)
   idx <- which(colnames(gencov_all) %in% names)
@@ -269,7 +270,8 @@ weights_univariate <- function(strata, gencov, trans, gencov_all, names) {
         scale_from <- (prevs * (1 - prevs)) / z_from^2
         scale_to <- (cont_prev * (1 - cont_prev)) / z_to^2
 
-        fac <- scale_from / scale_to
+        #fac <- scale_from / scale_to
+        fac <- scale_from
 
         # compute h2 relative to prevalence of strata for continuous variables
         #fac <- (cont_prev * (1 - cont_prev)) / (prevs * (1 - prevs))

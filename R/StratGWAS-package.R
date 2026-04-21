@@ -1,11 +1,12 @@
-#' StratGWAS: Stratified Genome-Wide Association Studies
+#' StratGWAS
 #'
 #' @description
-#' StratGWAS performs stratified genome-wide association studies (GWAS) by
-#' leveraging genetic heterogeneity within cases. The package stratifies cases
+#' StratGWAS performs genome-wide association studies (GWAS) by
+#' stratifying cases based on input variables, and assiging extra weight to
+#' those conferring greater genetic risk. The package can stratify cases
 #' based on continuous and/or categorical variables (e.g., age at diagnosis,
-#' disease subtype), estimates genetic covariances between strata, and creates
-#' a transformed phenotype that maximizes power to detect genetic associations.
+#' disease subtype), and computes a transformed phenotype that maximizes
+#' power to detect genetic associations.
 #'
 #' @details
 #' The StratGWAS workflow consists of four main steps:
@@ -14,9 +15,9 @@
 #' Divide cases into subgroups based on stratification variables
 #'
 #' \strong{2. Genetic Covariance Estimation} (\code{\link{compute_gencov}}):
-#' Estimate genetic covariances between strata using SumHer or LDSC
+#' Estimate genetic covariances between strata using approach similar to SumHer
 #'
-#' \strong{3. Phenotype Transformation} (\code{\link{transform}}):
+#' \strong{3. Compute Transformed Phenotype} (\code{\link{transform}}):
 #' Create a transformed phenotype based on the genetic covariance structure
 #'
 #' \strong{4. GWAS Analysis} (\code{\link{linear}}):
@@ -26,7 +27,7 @@
 #' \describe{
 #'   \item{\code{\link{stratify}}}{Create case strata from continuous/categorical variables}
 #'   \item{\code{\link{compute_gencov}}}{Estimate genetic covariance matrix between strata}
-#'   \item{\code{\link{transform}}}{Generate transformed phenotype for GWAS}
+#'   \item{\code{\link{transform}}}{Generate transformed phenotype}
 #'   \item{\code{\link{linear}}}{Run linear regression GWAS on transformed phenotype}
 #' }
 #'
@@ -114,39 +115,39 @@
 #'                          strat_cont = strat_cont,   # e.g., age at diagnosis
 #'                          strat_cat = strat_cat,     # e.g., disease subtype
 #'                          K = 5)
-#' 
+#'
 #' # Check stratification structure
 #' strata_multi$n_cont                 # Number of continuous variables
 #' strata_multi$n_bin                  # Number of categorical variables
 #' ncol(strata_multi$multi) - 3        # Total number of strata + variables
-#' 
+#'
 #' # Complete workflow
 #' gencov_multi <- compute_gencov(strata_multi, filename, nr_blocks = 1000, outfile)
 #' trans_multi <- transform(strata_multi, gencov_multi)
 #' linear(trans_multi, filename, outfile, nr_blocks = 1000, cov = cov)
-#' 
+#'
 #' # ============================================================================
 #' # EXAMPLE 4: Adjust number of strata for continuous variables
 #' # ============================================================================
-#' 
+#'
 #' # Use 10 quantile groups instead of 5
 #' strata_10 <- stratify(pheno, strat_cont = strat_cont, K = 10)
 #' gencov_10 <- compute_gencov(strata_10, filename, nr_blocks = 1000, outfile)
 #' trans_10 <- transform(strata_10, gencov_10)
 #' linear(trans_10, filename, outfile, nr_blocks = 1000, cov = cov)
-#' 
+#'
 #' # ============================================================================
 #' # EXAMPLE 5: GWAS without covariates
 #' # ============================================================================
-#' 
+#'
 #' linear(trans, filename, outfile, nr_blocks = 1000)
 #' 
 #' # ============================================================================
 #' # OUTPUT FILES
 #' # ============================================================================
-#' 
+#'
 #' # The workflow generates several output files with the specified prefix:
-#' # 
+#' #
 #' # From compute_gencov():
 #' #   <outfile>.strata      - Multi-phenotype file for all strata
 #' #   <outfile>.pheno1-K    - GWAS results for each stratum
