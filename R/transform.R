@@ -125,8 +125,8 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
         gencov_use[vars[i], ] <- gencov_use[vars[i], ] * sqrt(scale[i])
         gencov_use[, vars[i]] <- gencov_use[, vars[i]] * sqrt(scale[i])
       }
-    } 
-  } 
+    }
+  }
 
   # Smooth matrix if needed? Turn off for now
   #if(min(eigen(gencov_use)$values) <= 0) {
@@ -137,7 +137,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   trans <- eigen(gencov_use)$vectors[, 1]
   trans <- trans / sqrt(sum(trans^2))  # normalize
   if (mean(trans) < 0) trans <- -trans
-  names(trans) <- names 
+  names(trans) <- names
 
   # get jack-knife SE estimates of weights
   weights_all <- NULL
