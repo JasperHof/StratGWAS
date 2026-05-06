@@ -272,7 +272,7 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
 #' @return Integer vector of group assignments (1 to K)
 assign_to_quantiles <- function(x, K = 5) {
   set.seed(123)  # For reproducibility
-  
+
   # -- Add jitter to x --
   x_jit <- x + rnorm(length(x), mean = 0, sd = 1e-6)
 
@@ -288,7 +288,11 @@ assign_to_quantiles <- function(x, K = 5) {
   #                                             sd = 1e-6)
   
   # Assign to quantile groups
-  breaks <- seq(0, 1, length.out = K + 1)
+  #breaks <- seq(0, 1, length.out = K + 1)
+
+  breaks <- quantile(percentiles, probs = seq(0, 1, length.out = K + 1))
+  breaks[1] <- breaks[1] - 1e-9   # ensure minimum value is included
+
   groups <- cut(percentiles,
                 breaks = breaks,
                 labels = 1:K,
