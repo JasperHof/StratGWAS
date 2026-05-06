@@ -107,12 +107,12 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
   # Convert to data.frame
   pheno <- as.data.frame(pheno)
 
-  if(!is.null(strat_cont)){
+  if (!is.null(strat_cont)) {
     strat_cont <- as.data.frame(strat_cont)
     strat_cont <- strat_cont[match(ids, strat_cont[, 2]), ]
     strat_cont[, 1] <- strat_cont[, 2] <- ids
   }
-  if(!is.null(strat_cat)){
+  if (!is.null(strat_cat)) {
     strat_cat <- as.data.frame(strat_cat)
     strat_cat <- strat_cat[match(ids, strat_cat[, 2]), ]
     strat_cat[, 1] <- strat_cat[, 2] <- ids
@@ -120,37 +120,37 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
 
   # Identify cases
   cases <- pheno[which(pheno[, 3] == 1), 2]
-  
+
   # Initialize for tracking all strata
   all_strat_info <- list()
   strata <- list()
   K_total <- 0
   all_cases_nostrat <- c()
-  
+
   # Process continuous stratification variables
   if(!is.null(strat_cont)) {
     n_cont <- ncol(strat_cont) - 2
-    
+
     for(i in 1:n_cont) {
       # Extract column
       strat_col <- strat_cont[, 2 + i]
-      
+
       # Identify cases with missing stratification
       cases_nostrat <- strat_cont[which(strat_cont[, 2] %in% cases & is.na(strat_col)), 2, drop = TRUE]
       all_cases_nostrat <- c(all_cases_nostrat, cases_nostrat)
-      
+
       # Extract stratification variable for cases only
       strat_cases <- strat_cont[which(pheno[, 3] == 1 & !(pheno[, 2] %in% cases_nostrat)), c(1, 2, 2 + i)]
       colnames(strat_cases) <- c("FID", "IID", "strat_val")
       strat_cases_vals <- strat_cases[, 3]
-      
+
       # Define groups
       K_use <- K
       K_total <- K_total + K_use
       result <- assign_to_quantiles(strat_cases_vals, K)
       strat_cases$groups <- result$groups
       strat_cases$order <- result$order
-      
+
       # Store stratification info
       all_strat_info[[length(all_strat_info) + 1]] <- list(
         data = strat_cases,
@@ -271,21 +271,25 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
 #' @param K Number of quantile groups
 #' @return Integer vector of group assignments (1 to K)
 assign_to_quantiles <- function(x, K = 5) {
+  set.seed(123)  # For reproducibility
+  
+  # -- Add jitter to x --
+  x_jit <- x + rnorm(length(x), mean = 0, sd = 1e-6)
+
   # Calculate ranks (handles ties by averaging)
-  ranks <- rank(x, ties.method = "average")
+  ranks <- rank(x_jit, ties.method = "average")
   
   # Convert to percentiles (this becomes the "order" variable)
   percentiles <- ranks / length(ranks)
   
   # Add minimal jitter to break remaining ties for group assignment
-  set.seed(123)  # For reproducibility
-  percentiles_jittered <- percentiles + rnorm(length(percentiles),
-                                               mean = 0,
-                                               sd = 1e-6)
+  #percentiles_jittered <- percentiles + rnorm(length(percentiles),
+  #                                             mean = 0,
+  #                                             sd = 1e-6)
   
   # Assign to quantile groups
   breaks <- seq(0, 1, length.out = K + 1)
-  groups <- cut(percentiles_jittered,
+  groups <- cut(percentiles,
                 breaks = breaks,
                 labels = 1:K,
                 include.lowest = TRUE)

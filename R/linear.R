@@ -114,5 +114,5 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
 
 
   cat("\n")
-  cat(sprintf("GWAS completed. Results written to %s.assoc\n\n", outfile_trans))
+  cat(sprintf("GWAS completed. Results written to %s\n\n", outfile_trans))
 }
