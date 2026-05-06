@@ -4,13 +4,14 @@
 \name{StratGWAS-package}
 \alias{StratGWAS}
 \alias{StratGWAS-package}
-\title{StratGWAS: Stratified Genome-Wide Association Studies}
+\title{StratGWAS}
 \description{
-StratGWAS performs stratified genome-wide association studies (GWAS) by
-leveraging genetic heterogeneity within cases. The package stratifies cases
+StratGWAS performs genome-wide association studies (GWAS) by
+stratifying cases based on input variables, and assiging extra weight to
+those conferring greater genetic risk. The package can stratify cases
 based on continuous and/or categorical variables (e.g., age at diagnosis,
-disease subtype), estimates genetic covariances between strata, and creates
-a transformed phenotype that maximizes power to detect genetic associations.
+disease subtype), and computes a transformed phenotype that maximizes
+power to detect genetic associations.
 }
 \details{
 The StratGWAS workflow consists of four main steps:
@@ -19,9 +20,9 @@ The StratGWAS workflow consists of four main steps:
 Divide cases into subgroups based on stratification variables
 
 \strong{2. Genetic Covariance Estimation} (\code{\link{compute_gencov}}):
-Estimate genetic covariances between strata using SumHer or LDSC
+Estimate genetic covariances between strata using approach similar to SumHer
 
-\strong{3. Phenotype Transformation} (\code{\link{transform}}):
+\strong{3. Compute Transformed Phenotype} (\code{\link{transform}}):
 Create a transformed phenotype based on the genetic covariance structure
 
 \strong{4. GWAS Analysis} (\code{\link{linear}}):
@@ -32,7 +33,7 @@ Perform genome-wide association analysis on the transformed phenotype
 \describe{
 \item{\code{\link{stratify}}}{Create case strata from continuous/categorical variables}
 \item{\code{\link{compute_gencov}}}{Estimate genetic covariance matrix between strata}
-\item{\code{\link{transform}}}{Generate transformed phenotype for GWAS}
+\item{\code{\link{transform}}}{Generate transformed phenotype}
 \item{\code{\link{linear}}}{Run linear regression GWAS on transformed phenotype}
 }
 }
@@ -155,7 +156,7 @@ linear(trans, filename, outfile, nr_blocks = 1000)
 # ============================================================================
 
 # The workflow generates several output files with the specified prefix:
-# 
+#
 # From compute_gencov():
 #   <outfile>.strata      - Multi-phenotype file for all strata
 #   <outfile>.pheno1-K    - GWAS results for each stratum
