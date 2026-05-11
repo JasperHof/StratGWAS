@@ -126,6 +126,7 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
   strata <- list()
   K_total <- 0
   all_cases_nostrat <- c()
+  var_info <- NULL
 
   # Process continuous stratification variables
   if(!is.null(strat_cont)) {
@@ -150,6 +151,9 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
       result <- assign_to_quantiles(strat_cases_vals, K)
       strat_cases$groups <- result$groups
       strat_cases$order <- result$order
+
+      # Store information
+      var_info <- rbind(var_info, c(colnames(strat_cont)[i+2], "continuous", K))
 
       # Store stratification info
       all_strat_info[[length(all_strat_info) + 1]] <- list(
@@ -185,14 +189,17 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
       # Get unique categories
       categories <- sort(unique(strat_cases_vals[!is.na(strat_cases_vals)]))
       C <- length(categories)
-      
+
       message(sprintf("Categorical variable %d: %d categories detected", i, C))
-      
+
       # Assign groups based on categories
       K_total <- K_total + C
       strat_cases$groups <- match(strat_cases_vals, categories)
       strat_cases$order <- NA
-      
+
+      # Store information
+      var_info <- rbind(var_info, c(colnames(strat_cat)[i + 2], "categorical", C))
+
       # Store stratification info
       all_strat_info[[length(all_strat_info) + 1]] <- list(
         data = strat_cases,
@@ -261,7 +268,7 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
   strata[["strat_details"]] <- all_strat_info  # Detailed info about each variable
   strata[["n_cont"]] <- if(!is.null(strat_cont)) ncol(strat_cont) - 2 else 0
   strata[["n_bin"]] <- if(!is.null(strat_cat)) ncol(strat_cat) - 2 else 0
-  
+  strata[["var_info"]] <- var_info
   return(strata)
 }
 

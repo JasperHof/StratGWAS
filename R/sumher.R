@@ -205,7 +205,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
   
   # Input validation
   if (nrow(ss1) != nrow(ss2) || nrow(ss1) != length(ldscores)) {
-    stop("Summary statistics and LD scores must match in length")
+    stop("Summary statistics and LD scores do not match in length. This error is likely due to small subgroup sample size or low MAF variants.")
   }
   
   M <- length(ldscores)

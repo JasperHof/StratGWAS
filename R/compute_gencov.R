@@ -48,6 +48,7 @@
 #' 
 #' @export
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
+                           cov = NULL,
                            lds = NULL, ss_list = NULL,
                            alpha = -0.25, jack = FALSE, B = 50) {
 
@@ -82,6 +83,49 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     non_missing <- !is.na(multi_matched[, k])
     if (sum(non_missing) > 1) {
       multi_matched[non_missing, k] <- scale(as.numeric(multi_matched[non_missing, k]))
+    }
+  }
+
+  # Regress out covariates if provided
+  if (!is.null(cov)) {
+    
+    # Match covariates to genotype file order
+    cov_ids <- as.character(cov[, 2])
+    cov_data <- as.matrix(cov[, -(1:2), drop = FALSE])  # ensure matrix, not data.frame
+
+    match_idx <- match(fam_ids, cov_ids)  # for each fam_id, find its row in cov
+
+    cov_matched <- cov_data[match_idx, , drop = FALSE]   # reorder in one step
+    cov_matched <- apply(cov_matched, 2, as.numeric)
+    rownames(cov_matched) <- fam_ids
+
+    # Impute missing covariate values with their means
+    for (k in 1:ncol(cov_matched)) {
+      missing_idx <- is.na(cov_matched[, k])
+      if (any(missing_idx)) {
+        mean_val <- mean(cov_matched[, k], na.rm = TRUE)
+        cov_matched[missing_idx, k] <- mean_val
+        cat(sprintf("Imputed %d missing values for covariate %s with mean (%.4f)\n", 
+                    sum(missing_idx), colnames(cov_matched)[k], mean_val))
+      }
+    }
+
+    # Regress out covariates from phenotype (only for non-missing phenotypes)
+    for (m in 1:ncol(multi_matched)) {
+      pheno_matched <- multi_matched[, m]
+      non_missing <- !is.na(pheno_matched)
+
+      if (sum(non_missing) > ncol(cov_matched)) {
+        fit <- lm(pheno_matched[non_missing] ~ cov_matched[non_missing, , drop = FALSE])
+        pheno_matched[non_missing] <- residuals(fit)
+        pheno_matched <- as.numeric(scale(pheno_matched))
+
+        multi_matched[, m] <- pheno_matched
+        cat(sprintf("Regressed out %d covariate(s) from %s\n", 
+                    ncol(cov_matched), colnames(multi_matched)[m]))
+      } else {
+        warning("Not enough observations to regress out covariates")
+      }
     }
   }
 

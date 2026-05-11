@@ -9,6 +9,7 @@ compute_gencov(
   filename,
   nr_blocks = 1000,
   outfile,
+  cov = NULL,
   lds = NULL,
   ss_list = NULL,
   alpha = -0.25,
