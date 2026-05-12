@@ -220,7 +220,7 @@ sumher_cov <- function(ss1, ss2, ldscores,
   N_scaled_2 <- ss2$N / N_mean_2
   
   # Product of Z-statistics (signed test statistics)
-  Z_product <- (ss1$Beta / ss1$SE) * (ss2$Beta / ss2$SE)
+  Z_product <- (ss1$BETA / ss1$SE) * (ss2$BETA / ss2$SE)
   
   # Cross-product sample size (geometric mean)
   N_cross <- sqrt(ss1$N) * sqrt(ss2$N)

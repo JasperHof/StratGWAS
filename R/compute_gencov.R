@@ -168,6 +168,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   # Initialize results matrices
   hers <- rep(NA, K_tot)
   hers_se <- rep(NA, K_tot)
+  co_hers <- NULL
 
   gencov <- matrix(NA, nrow = K_tot, ncol = K_tot)
   rownames(gencov) <- colnames(gencov) <- colnames(multi)
@@ -186,17 +187,25 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
           jack_sum <- sumher_jack(ss_list[[i]], ldscores, alpha = alpha, B = B)
           for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_sum$ests[b]
     
+          # Store hers
           gencov[i, j] <- sum$h2_snp
           hers[i] <- sum$h2_snp
           hers_se[i] <- jack_sum$se
     
+          # Store co-hers
+          co_hers <- rbind(co_hers, c(colnames(multi)[i], colnames(multi)[j], sum$h2_snp, jack_sum$se))
+
           cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n",
                       colnames(multi)[i], sum$h2_snp, jack_sum$se))
         } else {
+          # Store hers
           gencov[i, j] <- sum$h2_snp
           hers[i] <- sum$h2_snp
           hers_se[i] <- sum$se_h2
     
+          # Store co-hers
+          co_hers <- rbind(co_hers, c(colnames(multi)[i], colnames(multi)[j], sum$h2_snp, sum$se_h2))
+
           cat(sprintf("SNP heritability of %s: %.4f (SE = %.4f)\n",
                       colnames(multi)[i], sum$h2_snp, sum$se_h2))
         }
@@ -208,10 +217,18 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
           for (b in 1:B) jack_ests[[b]][i, j] <- jack_ests[[b]][j, i] <- jack_cov$ests[b]
     
           gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
+
+          # Store co-hers
+          co_hers <- rbind(co_hers, c(colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
+
           cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
                     colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, jack_cov$se))
         } else {
           gencov[i, j] <- gencov[j, i] <- sum_cov$h2_AB
+
+          # Store co-hers
+          co_hers <- rbind(co_hers, c(colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, sum_cov$se_h2_AB))
+
           cat(sprintf("Genetic covariance between %s and %s: %.4f (SE = %.4f)\n", 
                     colnames(multi)[i], colnames(multi)[j], sum_cov$h2_AB, sum_cov$se_h2_AB))
         }
@@ -255,7 +272,13 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   hers_all <- data.frame("h2_obs" = hers, "h2_obs_SE" = hers_se, "h2_liab" = hers_liab, "h2_liab_SE" = hers_liab_se)
   hers_all[rownames(hers_all) %in% paste0("continuous_", 1:100), c("h2_liab", "h2_liab_SE")] <- NA
 
+  # Adjust cohers dataframe
+  co_hers <- as.data.frame(co_hers)
+  colnames(co_hers) = c("Trait1", "Trait2", "Coheritability", "SE")
+
   # Write output files with row/column names
+  write.table(co_hers, paste0(outfile, ".cohers"),
+              quote = FALSE, row.names = FALSE, col.names = TRUE)
   write.table(hers_all, paste0(outfile, ".hers"),
               quote = FALSE, row.names = TRUE, col.names = TRUE)
   write.table(gencov, paste0(outfile, ".gencov"),
