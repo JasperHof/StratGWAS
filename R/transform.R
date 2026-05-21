@@ -141,6 +141,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
   # get jack-knife SE estimates of weights
   weights_all <- NULL
+  weights_means <- NULL
 
   if (gencov$jack) {
     weights_se <- weights_se_jack(strata, gencov, trans, gencov_all, names)
@@ -160,11 +161,15 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
     weights <- trans[names(trans) %in% paste0(strata$strat_details[[k]]$type,"_",strata$strat_details[[k]]$var_index,"_",1:strata$strat_details[[k]]$K)]
     weights_all <- c(weights_all, weights)
 
-    if(strata$strat_details[[k]]$type == "continuous" && smooth){
+    if (strata$strat_details[[k]]$type == "continuous" && smooth) {
       
-      # Compute medians for scaled stratification variable
+      # Compute medians for (non-)scaled stratification variable
       strat_scale <- as.numeric(scale(strata$strat_details[[k]]$data[, 3]))
+      strat_noscale <- as.numeric(strata$strat_details[[k]]$data[, 3])
+      
       medians_obs <- unlist(lapply(1:strata$strat_details[[k]]$K, function(x) mean(strat_scale[which(strata$strat_details[[k]]$data$groups == x)], na.rm = TRUE)))
+      medians_obs_noscale <- unlist(lapply(1:strata$strat_details[[k]]$K, function(x) mean(strat_noscale[which(strata$strat_details[[k]]$data$groups == x)], na.rm = TRUE)))
+      weights_means <- c(weights_means, medians_obs_noscale)
 
       # Smooth through values
       fit <- smooth.spline(medians_obs, as.numeric(weights), spar = spar)
@@ -183,11 +188,14 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       multi_use_sub <- apply(multi_use_sub, 2, as.numeric)
       miss <- which(rowSums(is.na(multi_use_sub)) == ncol(multi_use_sub))
 
+      # NA values for non-continuous stratification variables
+      weights_means <- c(weights_means, rep(NA, ncol(multi_use_sub)))
+
       multi_use_sub[is.na(multi_use_sub)] <- 0
       trans_add <- multi_use_sub %*% weights
       
       # Impute missing phenotypes by mean
-      if(length(miss) > 0){
+      if (length(miss) > 0) {
         trans_add[miss] <- mean(trans_add[rowSums(multi_use_sub == 0) != ncol(multi_use_sub)])
       }
     }
@@ -198,10 +206,12 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
   # Write trans_pheno and weights to output file
   if (gencov$jack == TRUE) {
-    weights_df <- data.frame("weights" = weights_all, "weights_SE" = weights_se, "weights_uni" = weights_uni$weights_uni, "weights_uni_SE" = weights_uni$weights_uni_se)
+    weights_df <- data.frame("weights" = weights_all, "weights_SE" = weights_se, 
+                             "weights_uni" = weights_uni$weights_uni, "weights_uni_SE" = weights_uni$weights_uni_se)
   } else {
     weights_df <- data.frame("weights" = weights_all)
   }
+  weights_df$cont_means <- weights_means
 
   message(paste0("Writing transformed phenotype to ",
                  paste0(outfile, ".transformed")))
