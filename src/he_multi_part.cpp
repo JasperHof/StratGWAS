@@ -208,7 +208,7 @@ Rcpp::NumericMatrix he_multi_part(const std::string& filename, const SEXP pheno_
                 double yyt = Y.col(i).dot(Y.col(j));
 
                 // Set up system: [tr(K^2)  tr(K)] [h2]   = [y'Ky]
-                //                [tr(K)    N   ] [e2]     [y'y ]
+                //                [tr(K)    N   ]  [e2]     [y'y ]
                 Eigen::Matrix2d A;
                 A << tr_KK, tr_K,
                      tr_K,  n_inds;

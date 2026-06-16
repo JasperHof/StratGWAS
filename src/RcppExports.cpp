@@ -11,6 +11,42 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
+// compute_gene_burden
+void compute_gene_burden(const std::string& bed_prefix, const std::string& gene_file, const std::string& out_file, int write_buffer_genes);
+RcppExport SEXP _StratGWAS_compute_gene_burden(SEXP bed_prefixSEXP, SEXP gene_fileSEXP, SEXP out_fileSEXP, SEXP write_buffer_genesSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type bed_prefix(bed_prefixSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type gene_file(gene_fileSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type out_file(out_fileSEXP);
+    Rcpp::traits::input_parameter< int >::type write_buffer_genes(write_buffer_genesSEXP);
+    compute_gene_burden(bed_prefix, gene_file, out_file, write_buffer_genes);
+    return R_NilValue;
+END_RCPP
+}
+// vb_elastic_net_prs
+Rcpp::List vb_elastic_net_prs(const std::string& filename, const SEXP pheno_mat, const Rcpp::NumericVector& maf_all, const Rcpp::IntegerVector& chr_all, double h2, double alpha_param, double p_en, double F_en, int chunk_size, double tol, int max_scans, bool loco, int loco_chr);
+RcppExport SEXP _StratGWAS_vb_elastic_net_prs(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP maf_allSEXP, SEXP chr_allSEXP, SEXP h2SEXP, SEXP alpha_paramSEXP, SEXP p_enSEXP, SEXP F_enSEXP, SEXP chunk_sizeSEXP, SEXP tolSEXP, SEXP max_scansSEXP, SEXP locoSEXP, SEXP loco_chrSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::NumericVector& >::type maf_all(maf_allSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::IntegerVector& >::type chr_all(chr_allSEXP);
+    Rcpp::traits::input_parameter< double >::type h2(h2SEXP);
+    Rcpp::traits::input_parameter< double >::type alpha_param(alpha_paramSEXP);
+    Rcpp::traits::input_parameter< double >::type p_en(p_enSEXP);
+    Rcpp::traits::input_parameter< double >::type F_en(F_enSEXP);
+    Rcpp::traits::input_parameter< int >::type chunk_size(chunk_sizeSEXP);
+    Rcpp::traits::input_parameter< double >::type tol(tolSEXP);
+    Rcpp::traits::input_parameter< int >::type max_scans(max_scansSEXP);
+    Rcpp::traits::input_parameter< bool >::type loco(locoSEXP);
+    Rcpp::traits::input_parameter< int >::type loco_chr(loco_chrSEXP);
+    rcpp_result_gen = Rcpp::wrap(vb_elastic_net_prs(filename, pheno_mat, maf_all, chr_all, h2, alpha_param, p_en, F_en, chunk_size, tol, max_scans, loco, loco_chr));
+    return rcpp_result_gen;
+END_RCPP
+}
 // read_bim_file
 List read_bim_file(const std::string& filename);
 RcppExport SEXP _StratGWAS_read_bim_file(SEXP filenameSEXP) {
@@ -127,8 +163,24 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// compute_prs
+Rcpp::DataFrame compute_prs(const std::string& filename, const Rcpp::CharacterVector& snp_input, const Rcpp::NumericVector& beta_input, int block_size);
+RcppExport SEXP _StratGWAS_compute_prs(SEXP filenameSEXP, SEXP snp_inputSEXP, SEXP beta_inputSEXP, SEXP block_sizeSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::CharacterVector& >::type snp_input(snp_inputSEXP);
+    Rcpp::traits::input_parameter< const Rcpp::NumericVector& >::type beta_input(beta_inputSEXP);
+    Rcpp::traits::input_parameter< int >::type block_size(block_sizeSEXP);
+    rcpp_result_gen = Rcpp::wrap(compute_prs(filename, snp_input, beta_input, block_size));
+    return rcpp_result_gen;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_StratGWAS_compute_gene_burden", (DL_FUNC) &_StratGWAS_compute_gene_burden, 4},
+    {"_StratGWAS_vb_elastic_net_prs", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs, 13},
     {"_StratGWAS_read_bim_file", (DL_FUNC) &_StratGWAS_read_bim_file, 1},
     {"_StratGWAS_read_fam_file", (DL_FUNC) &_StratGWAS_read_fam_file, 1},
     {"_StratGWAS_he", (DL_FUNC) &_StratGWAS_he, 2},
@@ -138,6 +190,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},
     {"_StratGWAS_linear_gwas_parallel", (DL_FUNC) &_StratGWAS_linear_gwas_parallel, 4},
     {"_StratGWAS_readBedBlock", (DL_FUNC) &_StratGWAS_readBedBlock, 7},
+    {"_StratGWAS_compute_prs", (DL_FUNC) &_StratGWAS_compute_prs, 4},
     {NULL, NULL, 0}
 };
 
