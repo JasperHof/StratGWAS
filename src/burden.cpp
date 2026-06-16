@@ -110,17 +110,9 @@ struct BimIndex {
     }
 };
 
-//
-// Computes per-gene allele-count burden scores using direct index lookup:
-// for each gene, binary-search the (sorted) .bim positions to find the
-// contiguous block of SNP indices falling inside the gene's coordinates,
-// then read only that block from the .bed file and sum allele counts
-// across individuals. Genes with zero overlapping SNPs are written as a
-// row of zeros (not skipped), so the output always has one row per gene.
-//
-// Output: tab-separated text file, one row per gene (GENE name first
-// column), one column per individual (IID), written incrementally so the
-// full n_genes x n_inds matrix is never held in memory at once.
+// Computes per-gene allele-count burden scores using direct index lookup.
+// Output is a tab-separated text file with one row per gene and one
+// column per individual, written incrementally to avoid high memory use.
 // [[Rcpp::export]]
 void compute_gene_burden(
     const std::string& bed_prefix,
@@ -150,13 +142,9 @@ void compute_gene_burden(
     Rcout << "Genes: " << n_genes << "\n";
     if (n_genes == 0) Rcpp::stop("No genes read from gene position file");
 
-    // ── Open output, write header ────────────────────────────────────────
+    // ── Open output (no header row — pure numeric matrix) ──────────────────
     std::ofstream out(out_file);
     if (!out.is_open()) Rcpp::stop("Could not open output file for writing: " + out_file);
-
-    out << "GENE";
-    for (int i = 0; i < n_inds; ++i) out << "\t" << std::string(geno_iid[i]);
-    out << "\n";
 
     // ── Buffer for batching disk writes (avoids one fstream flush per gene) ─
     std::vector<std::string> write_buffer;
@@ -172,8 +160,10 @@ void compute_gene_burden(
         // report once at the end rather than erroring out mid-run
         if (gene.chr < 0) {
             std::ostringstream row;
-            row << gene.name;
-            for (int i = 0; i < n_inds; ++i) row << "\t0";
+            for (int i = 0; i < n_inds; ++i) {
+                if (i > 0) row << "\t";
+                row << "0";
+            }
             write_buffer.push_back(row.str());
             n_zero_snp_genes++;
             continue;
@@ -207,10 +197,12 @@ void compute_gene_burden(
             n_zero_snp_genes++;
         }
 
-        // ── Build this gene's output row ─────────────────────────────────
+        // ── Build this gene's output row (numeric values only) ────────────
         std::ostringstream row;
-        row << gene.name;
-        for (int i = 0; i < n_inds; ++i) row << "\t" << burden_vec(i);
+        for (int i = 0; i < n_inds; ++i) {
+            if (i > 0) row << "\t";
+            row << burden_vec(i);
+        }
         write_buffer.push_back(row.str());
 
         // ── Flush buffer periodically ────────────────────────────────────
