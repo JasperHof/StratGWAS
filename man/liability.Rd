@@ -7,5 +7,5 @@
 liability(pheno, filename, strat_cont = NULL, strat_cat = NULL, env = T)
 }
 \description{
-!!! Note that this is a developer's function
+!!! Note that this function is in development
 }

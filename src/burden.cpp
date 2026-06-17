@@ -111,8 +111,11 @@ struct BimIndex {
 };
 
 // Computes per-gene allele-count burden scores using direct index lookup.
-// Output is a tab-separated text file with one row per gene and one
-// column per individual, written incrementally to avoid high memory use.
+// Genes with zero overlapping SNPs are skipped entirely (no row written),
+// so the output file only contains rows for genes with at least one SNP.
+// A companion file (<out_file>.kept_genes) lists the names of genes that
+// were written, in row order, so downstream code can map rows back to
+// gene identities.
 // [[Rcpp::export]]
 void compute_gene_burden(
     const std::string& bed_prefix,
@@ -146,25 +149,27 @@ void compute_gene_burden(
     std::ofstream out(out_file);
     if (!out.is_open()) Rcpp::stop("Could not open output file for writing: " + out_file);
 
-    // ── Buffer for batching disk writes (avoids one fstream flush per gene) ─
+    // ── Companion file recording which genes were actually kept, in order ──
+    std::string kept_genes_file = out_file + ".kept_genes";
+    std::ofstream kept_out(kept_genes_file);
+    if (!kept_out.is_open()) Rcpp::stop("Could not open kept-genes file for writing: " + kept_genes_file);
+
+    // ── Buffers for batching disk writes ────────────────────────────────────
     std::vector<std::string> write_buffer;
     write_buffer.reserve(write_buffer_genes);
+    std::vector<std::string> kept_buffer;
+    kept_buffer.reserve(write_buffer_genes);
 
     int n_zero_snp_genes = 0;
+    int n_written_genes  = 0;
 
     for (int gi = 0; gi < n_genes; ++gi) {
 
         const GeneRegion& gene = genes[gi];
 
-        // Skip genes with unrecognized (non-numeric) chromosome codes —
-        // report once at the end rather than erroring out mid-run
+        // Genes with unrecognized (non-numeric) chromosome codes are treated
+        // the same as zero-overlap genes: skipped, not written.
         if (gene.chr < 0) {
-            std::ostringstream row;
-            for (int i = 0; i < n_inds; ++i) {
-                if (i > 0) row << "\t";
-                row << "0";
-            }
-            write_buffer.push_back(row.str());
             n_zero_snp_genes++;
             continue;
         }
@@ -174,27 +179,26 @@ void compute_gene_burden(
         int end_idx   = range.second;     // half-open: [start_idx, end_idx)
         int n_snps_gene = end_idx - start_idx;
 
+        if (n_snps_gene == 0) {
+            n_zero_snp_genes++;
+            continue;   // skip entirely — no row written for this gene
+        }
+
+        // Direct read of just this gene's SNP block
+        IntegerMatrix geno_block = readBedBlock(
+            bed_prefix + ".bed", n_inds, n_snps,
+            0, n_inds - 1,
+            start_idx, end_idx - 1   // inclusive end index for readBedBlock
+        );
+
         VectorXd burden_vec = VectorXd::Zero(n_inds);
-
-        if (n_snps_gene > 0) {
-            // Direct read of just this gene's SNP block — no scanning of
-            // unrelated chunks, no full-genome pass per gene.
-            IntegerMatrix geno_block = readBedBlock(
-                bed_prefix + ".bed", n_inds, n_snps,
-                0, n_inds - 1,
-                start_idx, end_idx - 1   // inclusive end index for readBedBlock
-            );
-
-            for (int s = 0; s < n_snps_gene; ++s) {
-                for (int i = 0; i < n_inds; ++i) {
-                    int allele_count = geno_block(i, s);
-                    if (allele_count != -1) {     // skip missing, no imputation
-                        burden_vec(i) += allele_count;
-                    }
+        for (int s = 0; s < n_snps_gene; ++s) {
+            for (int i = 0; i < n_inds; ++i) {
+                int allele_count = geno_block(i, s);
+                if (allele_count != -1) {     // skip missing, no imputation
+                    burden_vec(i) += allele_count;
                 }
             }
-        } else {
-            n_zero_snp_genes++;
         }
 
         // ── Build this gene's output row (numeric values only) ────────────
@@ -204,11 +208,15 @@ void compute_gene_burden(
             row << burden_vec(i);
         }
         write_buffer.push_back(row.str());
+        kept_buffer.push_back(gene.name);
+        n_written_genes++;
 
-        // ── Flush buffer periodically ────────────────────────────────────
+        // ── Flush buffers periodically ────────────────────────────────────
         if ((int)write_buffer.size() >= write_buffer_genes) {
             for (const auto& r : write_buffer) out << r << "\n";
             write_buffer.clear();
+            for (const auto& g : kept_buffer) kept_out << g << "\n";
+            kept_buffer.clear();
         }
 
         if ((gi + 1) % 1000 == 0 || gi + 1 == n_genes) {
@@ -219,9 +227,14 @@ void compute_gene_burden(
     // Flush any remaining buffered rows
     for (const auto& r : write_buffer) out << r << "\n";
     write_buffer.clear();
+    for (const auto& g : kept_buffer) kept_out << g << "\n";
+    kept_buffer.clear();
 
     out.close();
+    kept_out.close();
 
-    Rcout << "Done. " << n_zero_snp_genes << " genes had zero overlapping SNPs.\n";
+    Rcout << "Done. " << n_written_genes << " genes written, "
+          << n_zero_snp_genes << " genes skipped (zero overlapping SNPs).\n";
     Rcout << "Output written to " << out_file << "\n";
+    Rcout << "Kept gene names written to " << kept_genes_file << "\n";
 }
