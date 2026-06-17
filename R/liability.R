@@ -9,18 +9,22 @@ liability <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, env 
   multi <- pheno
   colnames(multi) <- c("FID", "IID", "Pheno")
 
-  for (j in 3:ncol(strat_cont)){
-    cont_mean <- mean(strat_cont[match(pheno[,2], strat_cont[, 2]), j], na.rm = T)
+  if (!is.null(strat_cont)) {
+    for (j in 3:ncol(strat_cont)){
+      cont_mean <- mean(strat_cont[match(pheno[,2], strat_cont[, 2]), j], na.rm = T)
 
-    multi <- cbind(multi, strat_cont[match(pheno[,2], strat_cont[, 2]), j], 
-            (strat_cont[match(pheno[,2], strat_cont[, 2]), j] - cont_mean)^2)
+      multi <- cbind(multi, strat_cont[match(pheno[,2], strat_cont[, 2]), j], 
+              (strat_cont[match(pheno[,2], strat_cont[, 2]), j] - cont_mean)^2)
 
-    colnames(multi)[(ncol(multi) - 1):ncol(multi)] <- paste0("cont_", j-2, "_", 1:2)
+      colnames(multi)[(ncol(multi) - 1):ncol(multi)] <- paste0("cont_", j-2, "_", 1:2)
+    }
   }
-
-  for (j in 3:ncol(strat_cat)){
-    multi <- cbind(multi, strat_cat[match(pheno[,2], strat_cont[, 2]), j])
-    colnames(multi)[ncol(multi)] <- paste0("cat_", j-2)
+  
+  if (!is.null(strat_cat)) {
+    for (j in 3:ncol(strat_cat)){
+      multi <- cbind(multi, strat_cat[match(pheno[,2], strat_cont[, 2]), j])
+      colnames(multi)[ncol(multi)] <- paste0("cat_", j-2)
+    }
   }
 
   # Impute means and normalize
