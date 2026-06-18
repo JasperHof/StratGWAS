@@ -49,10 +49,16 @@ liability <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, env 
     gencov_adj[-1, i] <- gencov_adj[-1, i] * sqrt(abs(gencov_adj[i, 1] / gencov_adj[i, i]))
   }
 
+  # Adjust to positive definite matrix
+  gencov_adj <- as.matrix(nearPD(gencov_adj)$mat)
+
   # Get total and environmental correlations
   if (env == T) {
     total_cor <- cor(multi_he, use = 'complete.obs')
     env_cor <- total_cor - gencov
+
+    # Adjust to positive definite matrix
+    env_cor <- as.matrix(nearPD(env_cor)$mat)
 
     # Do a double eigendecomposition
     Wmat = eigen(env_cor)                                                  # decompose E = U diag(Le) UT
@@ -70,12 +76,12 @@ liability <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, env 
     weights <- U1[1, ]
   } else {
     Wmat <- eigen(gencov_adj)
-    weights <- Wmat$vectors[,1]
+    weights <- Wmat$vectors[, 1]
   }
   
 
   # Compute new phenotype
-  trans <- cbind(multi[, c(1,2)], as.matrix(multi[, -c(1,2)]) %*% weights)
+  trans <- cbind(multi[, c(1, 2)], as.matrix(multi[, -c(1, 2)]) %*% weights)
 
   return(trans)
 }
