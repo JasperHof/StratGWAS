@@ -50,7 +50,7 @@ liability <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, env 
   }
 
   # Adjust to positive definite matrix
-  gencov_adj <- as.matrix(nearPD(gencov_adj)$mat)
+  gencov_adj <- as.matrix(Matrix::nearPD(gencov_adj)$mat)
 
   # Get total and environmental correlations
   if (env == T) {
@@ -58,7 +58,7 @@ liability <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, env 
     env_cor <- total_cor - gencov
 
     # Adjust to positive definite matrix
-    env_cor <- as.matrix(nearPD(env_cor)$mat)
+    env_cor <- as.matrix(Matrix::nearPD(env_cor)$mat)
 
     # Do a double eigendecomposition
     Wmat = eigen(env_cor)                                                  # decompose E = U diag(Le) UT
