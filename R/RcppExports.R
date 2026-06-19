@@ -5,6 +5,10 @@ compute_gene_burden <- function(bed_prefix, gene_file, out_file, write_buffer_ge
     invisible(.Call(`_StratGWAS_compute_gene_burden`, bed_prefix, gene_file, out_file, write_buffer_genes))
 }
 
+compute_burden_windows <- function(bed_prefix, out_file, kb_size = -1, n_snps_per_window = -1L, target_mac_per_ind = -1, write_buffer_size = 500L, chunk_size = 5000L) {
+    invisible(.Call(`_StratGWAS_compute_burden_windows`, bed_prefix, out_file, kb_size, n_snps_per_window, target_mac_per_ind, write_buffer_size, chunk_size))
+}
+
 vb_elastic_net_prs <- function(filename, pheno_mat, maf_all, chr_all, h2, alpha_param, p_en, F_en, chunk_size, tol, max_scans, loco, loco_chr) {
     .Call(`_StratGWAS_vb_elastic_net_prs`, filename, pheno_mat, maf_all, chr_all, h2, alpha_param, p_en, F_en, chunk_size, tol, max_scans, loco, loco_chr)
 }

@@ -24,6 +24,22 @@ BEGIN_RCPP
     return R_NilValue;
 END_RCPP
 }
+// compute_burden_windows
+void compute_burden_windows(const std::string& bed_prefix, const std::string& out_file, double kb_size, int n_snps_per_window, double target_mac_per_ind, int write_buffer_size, int chunk_size);
+RcppExport SEXP _StratGWAS_compute_burden_windows(SEXP bed_prefixSEXP, SEXP out_fileSEXP, SEXP kb_sizeSEXP, SEXP n_snps_per_windowSEXP, SEXP target_mac_per_indSEXP, SEXP write_buffer_sizeSEXP, SEXP chunk_sizeSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type bed_prefix(bed_prefixSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type out_file(out_fileSEXP);
+    Rcpp::traits::input_parameter< double >::type kb_size(kb_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type n_snps_per_window(n_snps_per_windowSEXP);
+    Rcpp::traits::input_parameter< double >::type target_mac_per_ind(target_mac_per_indSEXP);
+    Rcpp::traits::input_parameter< int >::type write_buffer_size(write_buffer_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type chunk_size(chunk_sizeSEXP);
+    compute_burden_windows(bed_prefix, out_file, kb_size, n_snps_per_window, target_mac_per_ind, write_buffer_size, chunk_size);
+    return R_NilValue;
+END_RCPP
+}
 // vb_elastic_net_prs
 Rcpp::List vb_elastic_net_prs(const std::string& filename, const SEXP pheno_mat, const Rcpp::NumericVector& maf_all, const Rcpp::IntegerVector& chr_all, double h2, double alpha_param, double p_en, double F_en, int chunk_size, double tol, int max_scans, bool loco, int loco_chr);
 RcppExport SEXP _StratGWAS_vb_elastic_net_prs(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP maf_allSEXP, SEXP chr_allSEXP, SEXP h2SEXP, SEXP alpha_paramSEXP, SEXP p_enSEXP, SEXP F_enSEXP, SEXP chunk_sizeSEXP, SEXP tolSEXP, SEXP max_scansSEXP, SEXP locoSEXP, SEXP loco_chrSEXP) {
@@ -180,6 +196,7 @@ END_RCPP
 
 static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_compute_gene_burden", (DL_FUNC) &_StratGWAS_compute_gene_burden, 4},
+    {"_StratGWAS_compute_burden_windows", (DL_FUNC) &_StratGWAS_compute_burden_windows, 7},
     {"_StratGWAS_vb_elastic_net_prs", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs, 13},
     {"_StratGWAS_read_bim_file", (DL_FUNC) &_StratGWAS_read_bim_file, 1},
     {"_StratGWAS_read_fam_file", (DL_FUNC) &_StratGWAS_read_fam_file, 1},
