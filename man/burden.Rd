@@ -4,7 +4,15 @@
 \alias{burden}
 \title{Compute burdens}
 \usage{
-burden(bed_prefix, gene_file, out_file = NULL, write_buffer_genes = 500)
+burden(
+  bed_prefix,
+  gene_file = NULL,
+  kb_size = NULL,
+  n_snps_per_window = NULL,
+  target_mac_per_ind = NULL,
+  out_file = NULL,
+  write_buffer_genes = 500
+)
 }
 \description{
 Compute burdens

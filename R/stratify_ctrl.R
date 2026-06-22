@@ -2,100 +2,11 @@
 #'
 #' Compute case subgroups by stratification based on multiple input variables.
 #' This function creates strata of cases based on continuous and/or categorical
-#' variables, which can then be used for genetic covariance estimation and
-#' phenotype transformation in stratified GWAS analysis.
+#' variables, with the option of matching cases to these variables.
 #'
-#' @param pheno Binary input phenotype in PLINK format (data frame or matrix with
-#'   columns: FID, IID, phenotype). Phenotype should be coded as 0 (controls) and
-#'   1 (cases). Missing values coded as NA.
-#' @param strat_cont Optional: continuous stratification variables in PLINK format
-#'   (data frame or matrix with columns: FID, IID, variable1, variable2, ...). 
-#'   Each variable will be divided into K quantile-based groups.
-#' @param strat_cat Optional: binary/categorical stratification variables in PLINK 
-#'   format (data frame or matrix with columns: FID, IID, variable1, variable2, ...).
-#'   Categories are automatically detected from unique values.
-#' @param K Number of quantile groups for continuous variables (default: 5).
-#'   Categorical variables use their natural number of categories.
-#' 
-#' @return Returns a list containing:
-#'   \item{K}{Number of groups used for continuous variables}
-#'   \item{y}{Input phenotype data frame}
-#'   \item{multi}{Multi-phenotype matrix for genetic covariance estimation, with 
-#'     binary indicators for each stratum and continuous variables}
-#'   \item{info}{Combined information about all strata with group assignments}
-#'   \item{ids}{Vector of all individual IDs}
-#'   \item{strat_miss}{Vector of case IDs with missing stratification values}
-#'   \item{strat_details}{Detailed list for each stratification variable containing:
-#'     \itemize{
-#'       \item \code{data}: Stratification data for cases
-#'       \item \code{original}: Original stratification variable data (for continuous)
-#'       \item \code{type}: "continuous" or "categorical"
-#'       \item \code{K}: Number of groups/categories
-#'       \item \code{categories}: Category values (for categorical)
-#'       \item \code{cases_nostrat}: Cases with missing values
-#'       \item \code{var_index}: Variable index
-#'       \item \code{group_start}, \code{group_end}: Global group indices
-#'     }}
-#'   \item{n_cont}{Number of continuous stratification variables}
-#'   \item{n_bin}{Number of categorical stratification variables}
-#' 
-#' @examples
-#' \dontrun{
-#' # Load example data
-#' data(pheno)
-#' data(strat_cont)
-#' data(strat_cat)
-#' 
-#' # Example 1: Stratify by single continuous variable (e.g., age at diagnosis)
-#' strata_cont <- stratify(pheno, strat_cont = strat_cont, K = 5)
-#' 
-#' # View stratification summary
-#' table(strata_cont$info$groups)  # Cases per stratum
-#' length(strata_cont$strat_miss)  # Cases with missing values
-#' 
-#' # Example 2: Stratify by categorical variable (e.g., disease subtype)
-#' strata_cat <- stratify(pheno, strat_cat = strat_cat)
-#' 
-#' # Check detected categories
-#' strata_cat$strat_details[[1]]$categories
-#' strata_cat$strat_details[[1]]$K  # Number of categories
-#' 
-#' # Example 3: Stratify by both continuous and categorical variables
-#' strata_both <- stratify(pheno,
-#'                         strat_cont = strat_cont,
-#'                         strat_cat = strat_cat,
-#'                         K = 5)
-#' 
-#' # Check structure
-#' strata_both$n_cont  # Number of continuous variables
-#' strata_both$n_bin   # Number of categorical variables
-#' 
-#' # View multi-phenotype matrix (first few rows and columns)
-#' head(strata_both$multi[, 1:6])
-#' 
-#' # Example 4: Use different number of quantiles
-#' strata_10 <- stratify(pheno, strat_cont = strat_cont, K = 10)
-#' 
-#' # Example 5: Complete workflow
-#' filename_bed <- system.file("extdata", "data.bed", package = "StratGWAS")
-#' filename <- gsub(".bed", "", filename_bed)
-#' outfile <- tempfile("gwas_output")
-#' 
-#' # Stratify
-#' strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
-#' 
-#' # Compute genetic covariance
-#' gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
-#' 
-#' # Transform phenotype
-#' trans <- transform(strata, gencov)
-#' 
-#' # Run GWAS
-#' linear(trans, filename, outfile, nr_blocks = 1000)
-#' }
-#' 
 #' @export
-stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
+stratify_control <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5,
+                             shared_control = FALSE) {
 
   # Check input data
   check_stratify_inputs(pheno, strat_cont, strat_cat, K)
@@ -127,10 +38,12 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
   K_total <- 0
   all_cases_nostrat <- c()
   var_info <- NULL
+  ctrl_rows_matched <- NULL
 
   # Process continuous stratification variables
-  if(!is.null(strat_cont)) {
+  if (!is.null(strat_cont)) {
     n_cont <- ncol(strat_cont) - 2
+    ctrl_rows_matched <- NULL
 
     for(i in 1:n_cont) {
       # Extract column
@@ -151,6 +64,25 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
       result <- assign_to_quantiles(strat_cases_vals, K)
       strat_cases$groups <- result$groups
       strat_cases$order <- result$order
+      breaks <- result$breaks
+
+      if (shared_control == TRUE) {
+        # Also stratify controls
+        ctrl_rows <- strat_cont[which(pheno[, 3] == 0), c(1, 2, 2 + i)]
+        colnames(ctrl_rows) <- c("FID", "IID", "strat_val")
+        ctrl_rows <- ctrl_rows[!is.na(ctrl_rows$strat_val), ]
+
+        ctrl_groups <- cut(ctrl_rows$strat_val,
+                   breaks         = breaks,
+                   labels         = 1:K,
+                   include.lowest = TRUE)
+        if (any(table(ctrl_groups) < 100)) 
+            stop("Too few controls to match controls on stratification variable.")
+
+        ctrl_rows$groups <- as.integer(ctrl_groups)
+        ctrl_rows$order  <- NA
+        ctrl_rows_matched <- ctrl_rows[!is.na(ctrl_rows$groups), ]
+      }
 
       # Store information
       var_info <- rbind(var_info, c(colnames(strat_cont)[i+2], "continuous", K))
@@ -158,6 +90,7 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
       # Store stratification info
       all_strat_info[[length(all_strat_info) + 1]] <- list(
         data = strat_cases,
+        data_control = ctrl_rows_matched,
         original = strat_cont[, c(1, 2, 2 + i)],
         type = "continuous",
         K = K_use,
@@ -172,8 +105,9 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
   # Process binary/categorical stratification variables
   if(!is.null(strat_cat)) {
     n_bin <- ncol(strat_cat) - 2
-    
-    for(i in 1:n_bin) {
+    ctrl_rows_matched_cat <- NULL
+
+    for (i in 1:n_bin) {
       # Extract column
       strat_col <- strat_cat[, 2 + i]
       
@@ -197,12 +131,28 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
       strat_cases$groups <- match(strat_cases_vals, categories)
       strat_cases$order <- NA
 
+      if (shared_control == TRUE) {
+        # Also stratify controls
+        ctrl_rows_cat <- strat_cat[which(pheno[, 3] == 0), c(1, 2, 2 + i)]
+        colnames(ctrl_rows_cat) <- c("FID", "IID", "strat_val")
+
+        ctrl_rows_cat <- ctrl_rows_cat[!is.na(ctrl_rows_cat$strat_val), ]
+        ctrl_rows_cat$groups <- match(ctrl_rows_cat$strat_val, categories)
+
+        if (any(table(ctrl_rows_cat$groups) < 100)) 
+            stop("Too few controls to match controls on categorical stratification variable.")
+
+        ctrl_rows_cat$order  <- NA
+        ctrl_rows_matched_cat <- ctrl_rows_cat[!is.na(ctrl_rows_cat$groups), ]
+      }
+
       # Store information
       var_info <- rbind(var_info, c(colnames(strat_cat)[i + 2], "categorical", C))
 
       # Store stratification info
       all_strat_info[[length(all_strat_info) + 1]] <- list(
         data = strat_cases,
+        data_control = ctrl_rows_matched_cat,
         type = "categorical",
         K = C,
         categories = categories,
@@ -227,24 +177,43 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
     df$groups <- df$groups + x$group_start - 1
     df
   }))
+
+  if (shared_control) {
+    all_controls_combined <- do.call(rbind, lapply(all_strat_info, function(x) {
+        df <- x$data_control
+        # Adjust group numbers to be global
+        df$groups <- df$groups + x$group_start - 1
+        df
+    }))
+  }
   
   # Create a multivariate dataframe for linear regression + SumHer
   multi <- cbind(ids, ids, pheno[, 3])
   colnames(multi) <- c("FID", "IID", "pheno")
 
-  for(k in 1:length(all_strat_info)){
+  for (k in 1:length(all_strat_info)) {
     var_add  <- NULL
 
-    for(j in all_strat_info[[k]]$group_start:all_strat_info[[k]]$group_end){
-      add <- rep(NA, length(ids))
-      add[which(ids %in% control_ids)] <- 0
-      add[which(ids %in% all_cases_combined[all_cases_combined$groups == j, 2])] <- 1
-      var_add <- cbind(var_add, add)
+    if (shared_control) {
+        for (j in all_strat_info[[k]]$group_start:all_strat_info[[k]]$group_end) {
+            # Find the matched controls
+            add <- rep(NA, length(ids))
+            add[which(ids %in% all_controls_combined[all_controls_combined$groups == j, 2])] <- 0
+            add[which(ids %in% all_cases_combined[all_cases_combined$groups == j, 2])] <- 1
+            var_add <- cbind(var_add, add)
+        }
+    } else {
+        for (j in all_strat_info[[k]]$group_start:all_strat_info[[k]]$group_end) {
+            add <- rep(NA, length(ids))
+            add[which(ids %in% control_ids)] <- 0
+            add[which(ids %in% all_cases_combined[all_cases_combined$groups == j, 2])] <- 1
+            var_add <- cbind(var_add, add)
+        }
     }
 
     colnames(var_add) <- paste0(all_strat_info[[k]]$type, "_", all_strat_info[[k]]$var_index, "_", 1:all_strat_info[[k]]$K)
 
-    # In the case of a continuous variable, add this (INCLUDING ALL CASES!)
+    # In the case of a continuous variable, add this as continuous variable
     if(all_strat_info[[k]]$type == "continuous"){
       add_cont <- rep(NA, length(ids))
       add_cont <- all_strat_info[[k]]$original[match(ids, all_strat_info[[k]]$original[, 2]), 3]
@@ -269,40 +238,6 @@ stratify <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5) {
   strata[["n_cont"]] <- if(!is.null(strat_cont)) ncol(strat_cont) - 2 else 0
   strata[["n_bin"]] <- if(!is.null(strat_cat)) ncol(strat_cat) - 2 else 0
   strata[["var_info"]] <- var_info
+  strata[["shared_control"]] <- shared_control
   return(strata)
-}
-
-#' Assign values to quantile-based groups
-#'
-#' @param x Numeric vector to stratify
-#' @param K Number of quantile groups
-#' @return Integer vector of group assignments (1 to K)
-assign_to_quantiles <- function(x, K = 5) {
-  set.seed(123)  # For reproducibility
-
-  # -- Add jitter to x --
-  x_jit <- x + rnorm(length(x), mean = 0, sd = 1e-6)
-
-  # Compute raw breaks on raw (jittered) values
-  raw_breaks <- quantile(x_jit, probs = seq(0, 1, length.out = K + 1))
-
-  # Calculate ranks (handles ties by averaging)
-  ranks <- rank(x_jit, ties.method = "average")
-
-  # Convert to percentiles (this becomes the "order" variable)
-  percentiles <- ranks / length(ranks)
-
-  breaks <- quantile(percentiles, probs = seq(0, 1, length.out = K + 1))
-  breaks[1] <- breaks[1] - 1e-9   # ensure minimum value is included
-
-  groups <- cut(percentiles,
-                breaks = breaks,
-                labels = 1:K,
-                include.lowest = TRUE)
-  
-  return(list(
-    groups = as.integer(groups),
-    order = percentiles,
-    breaks = raw_breaks
-  ))
 }
