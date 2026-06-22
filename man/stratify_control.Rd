@@ -8,6 +8,7 @@ stratify_control(
   pheno,
   strat_cont = NULL,
   strat_cat = NULL,
+  strat_surv = NULL,
   K = 5,
   shared_control = FALSE
 )

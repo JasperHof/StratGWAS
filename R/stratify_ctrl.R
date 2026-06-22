@@ -5,11 +5,36 @@
 #' variables, with the option of matching cases to these variables.
 #'
 #' @export
-stratify_control <- function(pheno, strat_cont = NULL, strat_cat = NULL, K = 5,
+stratify_control <- function(pheno, strat_cont = NULL, strat_cat = NULL, strat_surv = NULL, K = 5,
                              shared_control = FALSE) {
 
   # Check input data
-  check_stratify_inputs(pheno, strat_cont, strat_cat, K)
+  #check_stratify_inputs(pheno, strat_cont, strat_cat, K)
+
+  # Re-format the survival matrix (FID, IID, Time, Event)
+  if (!is.null(strat_surv)) {
+    # Match
+    if(!is.null(strat_cont)){
+      strat_surv <- strat_surv[match(strat_cont[, 2], strat_surv[, 2]), ]
+    } else {
+      strat_cont <- strat_surv[, c(1, 2)]
+    }
+
+    # Convert
+    event_times <- strat_surv[which(strat_surv[, 4] == 1), 3]
+    event_times_ctrls <- strat_surv[which(strat_surv[, 4] == 0), 3]
+
+    # Sample censoring time from event times, and code NA if already censored
+    controls <- which(strat_surv[, 4] == 0)
+    event_times_ctrls_fake <- sample(event_times, length(controls))
+    event_times_ctrls_fake[which(event_times_ctrls_fake > event_times_ctrls)] <- NA
+
+    add_cont <- rep(NA, nrow(strat_cont))
+    add_cont[which(strat_surv[, 4] == 1)] <- event_times
+    add_cont[which(strat_surv[, 4] == 0)] <- event_times_ctrls_fake
+
+    strat_cont <- cbind(strat_cont, add_cont)
+  }
 
   # Store IDs
   ids <- pheno[, 2]

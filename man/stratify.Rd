@@ -73,9 +73,9 @@ strata_cat$strat_details[[1]]$categories
 strata_cat$strat_details[[1]]$K  # Number of categories
 
 # Example 3: Stratify by both continuous and categorical variables
-strata_both <- stratify(pheno, 
-                        strat_cont = strat_cont, 
-                        strat_cat = strat_cat, 
+strata_both <- stratify(pheno,
+                        strat_cont = strat_cont,
+                        strat_cat = strat_cat,
                         K = 5)
 
 # Check structure
