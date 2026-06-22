@@ -26,7 +26,7 @@ stratify_control <- function(pheno, strat_cont = NULL, strat_cat = NULL, strat_s
 
     # Sample censoring time from event times, and code NA if already censored
     controls <- which(strat_surv[, 4] == 0)
-    event_times_ctrls_fake <- sample(event_times, length(controls))
+    event_times_ctrls_fake <- sample(event_times, length(controls), replace = T)
     event_times_ctrls_fake[which(event_times_ctrls_fake > event_times_ctrls)] <- NA
 
     add_cont <- rep(NA, nrow(strat_cont))
@@ -259,7 +259,7 @@ stratify_control <- function(pheno, strat_cont = NULL, strat_cat = NULL, strat_s
   strata[["info"]] <- all_cases_combined
   strata[["ids"]] <- ids
   strata[["strat_miss"]] <- all_cases_nostrat
-  strata[["strat_details"]] <- all_strat_info  # Detailed info about each variable
+  strata[["strat_details"]] <- all_strat_info
   strata[["n_cont"]] <- if(!is.null(strat_cont)) ncol(strat_cont) - 2 else 0
   strata[["n_bin"]] <- if(!is.null(strat_cat)) ncol(strat_cat) - 2 else 0
   strata[["var_info"]] <- var_info
