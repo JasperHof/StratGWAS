@@ -1,5 +1,6 @@
 #include <Rcpp.h>
 #include "geno_utils.h"
+#include "readBedBlock.h"
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -121,4 +122,40 @@ int count_lines(const std::string& filename) {
         ++count;
     }
     return count;
+}
+
+// [[Rcpp::export]]
+Rcpp::NumericVector compute_maf_all(const std::string& filename) {
+ 
+    List bim = read_bim_file(filename);
+    List fam = read_fam_file(filename);
+ 
+    int n_snps       = Rcpp::as<Rcpp::CharacterVector>(bim["snp"]).size();
+    int n_total_inds = Rcpp::as<Rcpp::CharacterVector>(fam["iid"]).size();
+ 
+    NumericVector maf_all(n_snps);
+ 
+    int block_size = 256;
+    int n_blocks   = (n_snps + block_size - 1) / block_size;
+ 
+    for (int b = 0; b < n_blocks; ++b) {
+ 
+        int snp_start  = b * block_size;
+        int snp_end    = std::min(n_snps - 1, snp_start + block_size - 1);
+        int n_snps_blk = snp_end - snp_start + 1;
+ 
+        IntegerMatrix geno_block = readBedBlock(
+            filename + ".bed",
+            n_total_inds, n_snps,
+            0, n_total_inds - 1,
+            snp_start, snp_end
+        );
+ 
+        NumericVector maf_blk = computeMAF(geno_block);
+ 
+        for (int s = 0; s < n_snps_blk; ++s)
+            maf_all[snp_start + s] = maf_blk[s];
+    }
+ 
+    return maf_all;
 }

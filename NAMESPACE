@@ -2,8 +2,10 @@
 
 export(burden)
 export(compute_gencov)
+export(elastic)
 export(liability)
 export(linear)
+export(scores)
 export(stratify)
 export(stratify_control)
 export(sumher)

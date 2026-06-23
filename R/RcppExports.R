@@ -13,12 +13,20 @@ vb_elastic_net_prs <- function(filename, pheno_mat, maf_all, chr_all, h2, alpha_
     .Call(`_StratGWAS_vb_elastic_net_prs`, filename, pheno_mat, maf_all, chr_all, h2, alpha_param, p_en, F_en, chunk_size, tol, max_scans, loco, loco_chr)
 }
 
+vb_elastic_net_prs_multi <- function(filename, pheno_mat, maf_all, chr_all, h2, alpha_param, p_en, F_en, chunk_size, tol, max_scans, loco, loco_chr) {
+    .Call(`_StratGWAS_vb_elastic_net_prs_multi`, filename, pheno_mat, maf_all, chr_all, h2, alpha_param, p_en, F_en, chunk_size, tol, max_scans, loco, loco_chr)
+}
+
 read_bim_file <- function(filename) {
     .Call(`_StratGWAS_read_bim_file`, filename)
 }
 
 read_fam_file <- function(filename) {
     .Call(`_StratGWAS_read_fam_file`, filename)
+}
+
+compute_maf_all <- function(filename) {
+    .Call(`_StratGWAS_compute_maf_all`, filename)
 }
 
 he <- function(genotypes, pheno) {
