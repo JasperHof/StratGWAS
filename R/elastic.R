@@ -58,3 +58,28 @@ scores <- function(filename   = filename,
 
   return(prs)
 }
+
+#' Perform randomized partitioned Haseman-Elston regression
+#' 
+#' @export
+he_reg <- function(pheno, filename) {
+
+  # Stadardize
+  for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
+  for (j in 3:ncol(pheno)) {
+    if (any(is.na(pheno[, j]))) {
+      pheno[which(is.na(pheno[, j])), j] <- mean(pheno[, j], na.rm = T)
+    }
+  }
+  # Create multivariate phenotype
+  multi <- pheno
+  colnames(multi) <- c("FID", "IID", "Pheno")
+
+  # HE regression on the phenotype
+  multi_he <- as.matrix(multi[, -c(1, 2), drop = FALSE])
+  rownames(multi_he) <- multi[, 2]
+
+  her <- he_multi_part(filename, multi_he, 1000)
+
+  return(her)
+}

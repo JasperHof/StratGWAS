@@ -3,6 +3,7 @@
 export(burden)
 export(compute_gencov)
 export(elastic)
+export(he_reg)
 export(liability)
 export(linear)
 export(scores)
