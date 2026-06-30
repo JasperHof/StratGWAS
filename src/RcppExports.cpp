@@ -40,6 +40,20 @@ BEGIN_RCPP
     return R_NilValue;
 END_RCPP
 }
+// compute_burden_weights
+List compute_burden_weights(const std::string& burden_file, int max_neighbors, int n_inds_hint, bool return_pairs);
+RcppExport SEXP _StratGWAS_compute_burden_weights(SEXP burden_fileSEXP, SEXP max_neighborsSEXP, SEXP n_inds_hintSEXP, SEXP return_pairsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type burden_file(burden_fileSEXP);
+    Rcpp::traits::input_parameter< int >::type max_neighbors(max_neighborsSEXP);
+    Rcpp::traits::input_parameter< int >::type n_inds_hint(n_inds_hintSEXP);
+    Rcpp::traits::input_parameter< bool >::type return_pairs(return_pairsSEXP);
+    rcpp_result_gen = Rcpp::wrap(compute_burden_weights(burden_file, max_neighbors, n_inds_hint, return_pairs));
+    return rcpp_result_gen;
+END_RCPP
+}
 // vb_elastic_net_prs
 Rcpp::List vb_elastic_net_prs(const std::string& filename, const SEXP pheno_mat, const Rcpp::NumericVector& maf_all, const Rcpp::IntegerVector& chr_all, double h2, double alpha_param, double p_en, double F_en, int chunk_size, double tol, int max_scans, bool loco, int loco_chr);
 RcppExport SEXP _StratGWAS_vb_elastic_net_prs(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP maf_allSEXP, SEXP chr_allSEXP, SEXP h2SEXP, SEXP alpha_paramSEXP, SEXP p_enSEXP, SEXP F_enSEXP, SEXP chunk_sizeSEXP, SEXP tolSEXP, SEXP max_scansSEXP, SEXP locoSEXP, SEXP loco_chrSEXP) {
@@ -231,6 +245,7 @@ END_RCPP
 static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_compute_gene_burden", (DL_FUNC) &_StratGWAS_compute_gene_burden, 4},
     {"_StratGWAS_compute_burden_windows", (DL_FUNC) &_StratGWAS_compute_burden_windows, 7},
+    {"_StratGWAS_compute_burden_weights", (DL_FUNC) &_StratGWAS_compute_burden_weights, 4},
     {"_StratGWAS_vb_elastic_net_prs", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs, 13},
     {"_StratGWAS_vb_elastic_net_prs_multi", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs_multi, 13},
     {"_StratGWAS_read_bim_file", (DL_FUNC) &_StratGWAS_read_bim_file, 1},

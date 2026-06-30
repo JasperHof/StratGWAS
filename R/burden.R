@@ -24,3 +24,21 @@ burden <- function(bed_prefix, gene_file = NULL, kb_size = NULL, n_snps_per_wind
                        target_mac_per_ind = target_mac_per_ind)
   }
 }
+
+#' Compute burden correlations
+#'
+#' @export
+burden_correlations <- function(burden_file,
+                                max_neighbors = 100,
+                                n_inds_hint = -1,
+                                return_pairs = FALSE) {
+
+  weights <- compute_burden_weights(
+    burden_file,
+    max_neighbors = 100,
+    n_inds_hint = -1,
+    return_pairs = FALSE
+  )
+
+  return(weights)
+}
