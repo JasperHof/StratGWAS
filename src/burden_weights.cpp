@@ -6,172 +6,228 @@
 #include <fstream>
 #include <sstream>
 #include <cmath>
+#include <cstdio>
 
 using namespace Rcpp;
 using Eigen::MatrixXd;
 using Eigen::VectorXd;
 
 // ─────────────────────────────────────────────────────────────────────────
-// Reads a burden file written by compute_gene_burden(): no header, one row
-// per gene, tab-separated allele counts per individual. Returns an
-// (n_genes x n_inds) matrix.
-//
-// Assumes rows are in genomic order (true for compute_gene_burden's output,
-// since genes are processed in .bim-sorted order) — this is what makes the
-// "adjacent rows" = "adjacent genomically" assumption valid downstream.
+// Lightweight index of byte offsets for each line (gene/burden row) in the
+// burden file, built with a single fast pass over the file. This is what
+// lets us "readBedBlock"-style seek directly to a block of rows instead of
+// loading the whole file — the text-file analogue of random access into a
+// .bed file.
 // ─────────────────────────────────────────────────────────────────────────
-static MatrixXd read_burden_file(const std::string& path, int n_inds_hint = -1) {
-    std::ifstream in(path);
-    if (!in.is_open()) Rcpp::stop("Could not open burden file: " + path);
+struct BurdenFileIndex {
+    std::vector<std::streampos> line_offsets;  // byte offset of the start of each row
+    int n_genes;
+    int n_inds;
 
-    std::vector<std::vector<double>> rows;
-    std::string line;
-    int n_inds = -1;
+    BurdenFileIndex(const std::string& path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in.is_open()) Rcpp::stop("Could not open burden file: " + path);
 
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        std::istringstream iss(line);
-        std::vector<double> row;
-        if (n_inds_hint > 0) row.reserve(n_inds_hint);
-        std::string tok;
-        while (std::getline(iss, tok, '\t')) {
-            row.push_back(std::stod(tok));
+        n_inds = -1;
+        std::string line;
+        std::streampos pos = in.tellg();
+
+        while (true) {
+            pos = in.tellg();
+            if (!std::getline(in, line)) break;
+            if (line.empty()) continue;
+
+            if (n_inds == -1) {
+                // Count tab-separated fields on the first non-empty line
+                int tabs = 0;
+                for (char c : line) if (c == '\t') tabs++;
+                n_inds = tabs + 1;
+            }
+            line_offsets.push_back(pos);
         }
-        if (n_inds == -1) n_inds = (int)row.size();
-        else if ((int)row.size() != n_inds)
-            Rcpp::stop("Inconsistent number of columns in burden file at row " +
-                       std::to_string(rows.size() + 1));
-        rows.push_back(std::move(row));
+        n_genes = (int)line_offsets.size();
+        in.close();
+
+        if (n_genes == 0) Rcpp::stop("Burden file is empty: " + path);
+        Rcout << "Indexed burden file: " << n_genes << " genes x " << n_inds << " individuals\n";
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+// Reads rows [row_start, row_end] (inclusive, 0-indexed) from the burden
+// file into an Eigen matrix, parsing directly into pre-sized storage (no
+// vector<vector<double>> intermediate — fixes the doubling issue from the
+// whole-file version).
+//
+// Uses strtod for parsing, which is meaningfully faster than std::stod
+// (no exceptions, no std::string construction per token) — relevant given
+// how many numeric conversions a 40GB file requires.
+// ─────────────────────────────────────────────────────────────────────────
+static MatrixXd read_burden_block(
+    const std::string& path,
+    const BurdenFileIndex& idx,
+    int row_start,
+    int row_end
+) {
+    int n_block = row_end - row_start + 1;
+    int n_inds  = idx.n_inds;
+
+    MatrixXd block(n_block, n_inds);
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) Rcpp::stop("Could not reopen burden file: " + path);
+
+    std::string line;
+    for (int r = 0; r < n_block; ++r) {
+        in.seekg(idx.line_offsets[row_start + r]);
+        std::getline(in, line);
+
+        const char* p = line.c_str();
+        char* end;
+        for (int c = 0; c < n_inds; ++c) {
+            block(r, c) = std::strtod(p, &end);
+            p = end;
+            if (*p == '\t') ++p;
+        }
     }
     in.close();
-
-    int n_genes = (int)rows.size();
-    if (n_genes == 0) Rcpp::stop("Burden file is empty: " + path);
-
-    MatrixXd B(n_genes, n_inds);
-    for (int g = 0; g < n_genes; ++g)
-        for (int i = 0; i < n_inds; ++i)
-            B(g, i) = rows[g][i];
-
-    return B;
+    return block;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Standardizes each row (gene/burden) to mean 0, sd 1 across individuals.
-// Burdens with zero variance (e.g. monomorphic / all-zero burden) are left
-// as exact zeros after centering and flagged, so they contribute r = 0 to
-// every pairwise correlation rather than producing NaN/Inf.
+// Standardizes each row to mean 0, sd 1. Zero-variance rows are zeroed out
+// (contribute r = 0 to all pairs) rather than producing NaN.
 // ─────────────────────────────────────────────────────────────────────────
-static void standardize_rows(MatrixXd& B, std::vector<bool>& is_zero_var) {
-    int n_genes = B.rows();
-    int n_inds  = B.cols();
-    is_zero_var.assign(n_genes, false);
+static void standardize_rows_inplace(MatrixXd& B, std::vector<bool>& is_zero_var) {
+    int n_rows = B.rows();
+    int n_inds = B.cols();
+    is_zero_var.assign(n_rows, false);
 
-    for (int g = 0; g < n_genes; ++g) {
-        double mean = B.row(g).mean();
-        VectorXd centered = B.row(g).array() - mean;
+    for (int r = 0; r < n_rows; ++r) {
+        double mean = B.row(r).mean();
+        VectorXd centered = B.row(r).array() - mean;
         double ss = centered.squaredNorm();
         if (ss < 1e-12) {
-            B.row(g).setZero();
-            is_zero_var[g] = true;
+            B.row(r).setZero();
+            is_zero_var[r] = true;
         } else {
             double sd = std::sqrt(ss / (n_inds - 1));
-            B.row(g) = centered / sd;
+            B.row(r) = centered / sd;
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// compute_burden_weights
+// compute_burden_weights_blockwise
 //
-// Computes pairwise correlations between each burden (gene) and its
-// genomically-adjacent neighbours (within a local window of at most
-// max_neighbors genes on EACH side, so up to 2*max_neighbors total
-// comparisons per burden), then derives LDAK-style weights:
-//
-//     w_j = 1 / (1 + sum_{k in window, k != j} r_jk^2)
-//
-// Burdens with many highly-correlated neighbours (redundant signal, e.g.
-// overlapping window sizes or genes in high LD) get down-weighted; burdens
-// with little local correlation keep weight close to 1.
+// Sliding-window version of compute_burden_weights(): mirrors
+// computeLDscoresFromBED()'s block-read strategy. Reads at most
+// (2 * max_neighbors) burdens into memory at a time (a "padded" block),
+// computes correlations only for the central "core" rows of that block
+// against the full padded neighbourhood, then slides forward by
+// max_neighbors — so peak memory is O(max_neighbors * n_inds) rather than
+// O(n_genes * n_inds), exactly analogous to how the LD-score code keeps
+// only ~2 * max_block SNPs in memory rather than all n_snp.
 //
 // Arguments:
 //   burden_file   - path to a burden file from compute_gene_burden()
-//                    (no header, tab-separated, genes in genomic row order)
-//   max_neighbors - max number of adjacent genes to compare against on
-//                    EACH side (so total window size <= 2*max_neighbors + 1)
-//   n_inds_hint   - optional hint for row-reading buffer sizing (cosmetic)
+//   max_neighbors - number of adjacent genes considered on EACH side when
+//                    computing a burden's correlation sum (so each burden's
+//                    weight reflects up to 2*max_neighbors comparisons)
 //
-// Returns a List with:
-//   weights    - NumericVector, one weight per gene, same order as input rows
-//   m_eff      - sum(weights): the "effective number of independent burdens"
-//   mean_r2    - mean squared correlation across all computed neighbour pairs
-//                (diagnostic: how much redundancy is in the data overall)
-//   pair_chr_idx_i / pair_chr_idx_j / pair_r (optional diagnostics, see below)
+// Returns a List with weights, m_eff, mean_r2 (same fields as the
+// whole-file version), plus block-size diagnostics.
 // [[Rcpp::export]]
-List compute_burden_weights(
+List compute_burden_weights_blockwise(
     const std::string& burden_file,
-    int max_neighbors = 100,
-    int n_inds_hint = -1,
-    bool return_pairs = false   // if true, also returns the full pairwise list (can be large)
+    int max_neighbors = 100
 ) {
     if (max_neighbors < 1) Rcpp::stop("max_neighbors must be >= 1");
 
-    MatrixXd B = read_burden_file(burden_file, n_inds_hint);
-    int n_genes = B.rows();
-    int n_inds  = B.cols();
+    BurdenFileIndex idx(burden_file);
+    int n_genes = idx.n_genes;
+    int n_inds  = idx.n_inds;
 
-    Rcout << "Read " << n_genes << " burdens x " << n_inds << " individuals\n";
+    int read_block_size = 2 * max_neighbors;   // mirrors `2 * max_block` in the LD-score code
 
-    std::vector<bool> is_zero_var;
-    standardize_rows(B, is_zero_var);   // rows now standardized -> dot product = correlation
-
-    int n_zero_var = 0;
-    for (bool z : is_zero_var) if (z) n_zero_var++;
-    if (n_zero_var > 0)
-        Rcout << "Warning: " << n_zero_var
-              << " burdens have zero variance and are treated as uncorrelated (r=0) with everything\n";
-
-    VectorXd sum_r2 = VectorXd::Zero(n_genes);   // sum_{k in window} r_jk^2, per gene j
+    VectorXd sum_r2 = VectorXd::Zero(n_genes);
+    std::vector<bool> is_zero_var_global(n_genes, false);
     double total_r2_sum = 0.0;
     long   total_pairs   = 0;
 
-    // Diagnostic pairwise output (optional, can get large for genome-wide runs)
-    std::vector<int>    pair_i, pair_j;
-    std::vector<double> pair_r;
+    int start = 0;
+    int last_printed = -10000;
 
-    int denom = n_inds - 1;   // standardized rows -> correlation = dot/(n-1)
+    while (start < n_genes) {
 
-    for (int j = 0; j < n_genes; ++j) {
-        int lo = std::max(0, j - max_neighbors);
-        int hi = std::min(n_genes - 1, j + max_neighbors);
+        if (start / 5000 > last_printed / 5000) {
+            Rcout << "Processing gene " << (start / 5000) * 5000 << " / " << n_genes << "\n";
+            last_printed = (start / 5000) * 5000;
+        }
 
-        for (int k = lo; k <= hi; ++k) {
-            if (k == j) continue;
-            // Only compute each pair once (k > j), but accumulate into BOTH
-            // j's and k's running sum_r2, since correlation is symmetric.
-            if (k < j) continue;
+        int end = std::min(start + read_block_size - 1, n_genes - 1);
+        int n_block = end - start + 1;
 
-            double r = B.row(j).dot(B.row(k)) / (double)denom;
-            // Numerical safety: standardized rows can give |r| fractionally > 1
-            if (r > 1.0) r = 1.0;
-            if (r < -1.0) r = -1.0;
+        // ── Determine which rows within this block are the "core" rows we
+        //    actually compute final sum_r2 for (avoids double-counting,
+        //    exactly mirroring compute_start/compute_end in the LD-score code) ──
+        int core_start, core_end;   // indices relative to block start (0-based)
 
-            double r2 = r * r;
-            sum_r2(j) += r2;
-            sum_r2(k) += r2;
-            total_r2_sum += r2;
-            total_pairs++;
+        if (start == 0 && end == n_genes - 1) {
+            core_start = 0;
+            core_end   = n_block - 1;
+        } else if (start == 0) {
+            core_start = 0;
+            core_end   = std::min(start + (3 * max_neighbors) / 2 - 1, n_genes - 1) - start;
+        } else if (end == n_genes - 1) {
+            core_start = max_neighbors / 2;
+            core_end   = end - start;
+        } else {
+            core_start = max_neighbors / 2;
+            core_end   = std::min((3 * max_neighbors) / 2 - 1, end - start);
+        }
 
-            if (return_pairs) {
-                pair_i.push_back(j);
-                pair_j.push_back(k);
-                pair_r.push_back(r);
+        // ── Read and standardize this block only (not the whole file) ──────
+        MatrixXd B = read_burden_block(burden_file, idx, start, end);
+        std::vector<bool> is_zero_var_block;
+        standardize_rows_inplace(B, is_zero_var_block);
+        for (int r = 0; r < n_block; ++r)
+            is_zero_var_global[start + r] = is_zero_var_block[r];
+
+        int denom = n_inds - 1;
+
+        // ── For each core row, correlate against all OTHER rows in the
+        //    padded block (its full local neighbourhood), same as the
+        //    LD-score code's inner loop over k in [0, n_block) ──────────────
+        for (int j = core_start; j <= core_end; ++j) {
+            int global_j = start + j;
+
+            for (int k = 0; k < n_block; ++k) {
+                if (k == j) continue;
+                int global_k = start + k;
+
+                // Row-distance window: only count neighbours within
+                // max_neighbors rows (mirrors the 1Mb bp check in the
+                // LD-score code, but using row/gene index distance since
+                // burden files don't carry bp position).
+                if (std::abs(global_j - global_k) > max_neighbors) continue;
+
+                double r = B.row(j).dot(B.row(k)) / (double)denom;
+                if (r > 1.0) r = 1.0;
+                if (r < -1.0) r = -1.0;
+
+                double r2 = r * r;
+                sum_r2(global_j) += r2;
+
+                // Only tally each unordered pair once for the diagnostic mean
+                if (global_k > global_j) {
+                    total_r2_sum += r2;
+                    total_pairs++;
+                }
             }
         }
 
-        if ((j + 1) % 5000 == 0 || j + 1 == n_genes)
-            Rcout << "Processed correlations for " << j + 1 << "/" << n_genes << " burdens\n";
+        start += max_neighbors;   // slide forward, same as `start_snp += max_block`
     }
 
     // ── Derive weights ──────────────────────────────────────────────────
@@ -185,23 +241,20 @@ List compute_burden_weights(
 
     double mean_r2 = (total_pairs > 0) ? (total_r2_sum / (double)total_pairs) : 0.0;
 
+    int n_zero_var = 0;
+    for (bool z : is_zero_var_global) if (z) n_zero_var++;
+
     Rcout << "Done. m_raw = " << n_genes
           << ", m_eff = " << m_eff
-          << ", mean pairwise r^2 (within window) = " << mean_r2 << "\n";
+          << ", mean pairwise r^2 (within window) = " << mean_r2
+          << ", block size = " << read_block_size << " genes\n";
 
-    List result = List::create(
+    return List::create(
         Named("weights")  = weights,
         Named("m_raw")    = n_genes,
         Named("m_eff")    = m_eff,
         Named("mean_r2")  = mean_r2,
-        Named("n_zero_var_burdens") = n_zero_var
+        Named("n_zero_var_burdens") = n_zero_var,
+        Named("block_size") = read_block_size
     );
-
-    if (return_pairs) {
-        result["pair_i"] = wrap(pair_i);   // 0-indexed row of first burden in pair
-        result["pair_j"] = wrap(pair_j);   // 0-indexed row of second burden in pair
-        result["pair_r"] = wrap(pair_r);   // correlation between them
-    }
-
-    return result;
 }

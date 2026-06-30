@@ -33,11 +33,9 @@ burden_correlations <- function(burden_file,
                                 n_inds_hint = -1,
                                 return_pairs = FALSE) {
 
-  weights <- compute_burden_weights(
+  weights <- compute_burden_weights_blockwise(
     burden_file,
-    max_neighbors = 100,
-    n_inds_hint = -1,
-    return_pairs = FALSE
+    max_neighbors = 100
   )
 
   return(weights)

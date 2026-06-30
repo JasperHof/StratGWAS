@@ -40,17 +40,15 @@ BEGIN_RCPP
     return R_NilValue;
 END_RCPP
 }
-// compute_burden_weights
-List compute_burden_weights(const std::string& burden_file, int max_neighbors, int n_inds_hint, bool return_pairs);
-RcppExport SEXP _StratGWAS_compute_burden_weights(SEXP burden_fileSEXP, SEXP max_neighborsSEXP, SEXP n_inds_hintSEXP, SEXP return_pairsSEXP) {
+// compute_burden_weights_blockwise
+List compute_burden_weights_blockwise(const std::string& burden_file, int max_neighbors);
+RcppExport SEXP _StratGWAS_compute_burden_weights_blockwise(SEXP burden_fileSEXP, SEXP max_neighborsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< const std::string& >::type burden_file(burden_fileSEXP);
     Rcpp::traits::input_parameter< int >::type max_neighbors(max_neighborsSEXP);
-    Rcpp::traits::input_parameter< int >::type n_inds_hint(n_inds_hintSEXP);
-    Rcpp::traits::input_parameter< bool >::type return_pairs(return_pairsSEXP);
-    rcpp_result_gen = Rcpp::wrap(compute_burden_weights(burden_file, max_neighbors, n_inds_hint, return_pairs));
+    rcpp_result_gen = Rcpp::wrap(compute_burden_weights_blockwise(burden_file, max_neighbors));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -245,7 +243,7 @@ END_RCPP
 static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_compute_gene_burden", (DL_FUNC) &_StratGWAS_compute_gene_burden, 4},
     {"_StratGWAS_compute_burden_windows", (DL_FUNC) &_StratGWAS_compute_burden_windows, 7},
-    {"_StratGWAS_compute_burden_weights", (DL_FUNC) &_StratGWAS_compute_burden_weights, 4},
+    {"_StratGWAS_compute_burden_weights_blockwise", (DL_FUNC) &_StratGWAS_compute_burden_weights_blockwise, 2},
     {"_StratGWAS_vb_elastic_net_prs", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs, 13},
     {"_StratGWAS_vb_elastic_net_prs_multi", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs_multi, 13},
     {"_StratGWAS_read_bim_file", (DL_FUNC) &_StratGWAS_read_bim_file, 1},

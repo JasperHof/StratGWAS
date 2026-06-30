@@ -9,8 +9,8 @@ compute_burden_windows <- function(bed_prefix, out_file, kb_size = -1, n_snps_pe
     invisible(.Call(`_StratGWAS_compute_burden_windows`, bed_prefix, out_file, kb_size, n_snps_per_window, target_mac_per_ind, write_buffer_size, chunk_size))
 }
 
-compute_burden_weights <- function(burden_file, max_neighbors = 100L, n_inds_hint = -1L, return_pairs = FALSE) {
-    .Call(`_StratGWAS_compute_burden_weights`, burden_file, max_neighbors, n_inds_hint, return_pairs)
+compute_burden_weights_blockwise <- function(burden_file, max_neighbors = 100L) {
+    .Call(`_StratGWAS_compute_burden_weights_blockwise`, burden_file, max_neighbors)
 }
 
 vb_elastic_net_prs <- function(filename, pheno_mat, maf_all, chr_all, h2, alpha_param, p_en, F_en, chunk_size, tol, max_scans, loco, loco_chr) {
