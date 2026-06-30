@@ -35,7 +35,7 @@ burden_correlations <- function(burden_file,
 
   weights <- compute_burden_weights_blockwise(
     burden_file,
-    max_neighbors = 100
+    max_neighbors = max_neighbors
   )
 
   return(weights)
