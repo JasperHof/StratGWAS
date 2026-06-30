@@ -2,6 +2,8 @@
 
 StratGWAS is an R package for modelling disease heterogeneity of binary traits in genome-wide association studies (GWAS). StratGWAS can leverage secondary phenotypes (e.g. age at diagnosis, comorbodities) as continuous and/or categorical variables to stratify cases, estimate genetic covariance between strata, and construct a transformed phenotype that maximizes power to detect genetic associations.
 
+Below is a brief description on how to run StratGWAS. For more details, please visit the [Wiki](https://github.com/JasperHof/StratGWAS/wiki).
+
 ---
 
 ## Installation
