@@ -83,3 +83,28 @@ he_reg <- function(pheno, filename) {
 
   return(her)
 }
+
+#' Perform randomized double-partitioned Haseman-Elston regression
+#'
+#' @export
+he_reg_part <- function (filename, pheno, snp_cat, cat_names, block_size = 1000, outfile) {
+
+  # Stadardize
+  for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
+  for (j in 3:ncol(pheno)) {
+    if (any(is.na(pheno[, j]))) {
+      pheno[which(is.na(pheno[, j])), j] <- mean(pheno[, j], na.rm = T)
+    }
+  }
+  # Create multivariate phenotype
+  multi <- pheno
+  colnames(multi) <- c("FID", "IID", "Pheno")
+
+  # HE regression on the phenotype
+  multi_he <- as.matrix(multi[, -c(1, 2), drop = FALSE])
+  rownames(multi_he) <- multi[, 2]
+
+  hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
+
+  return(hers)
+}

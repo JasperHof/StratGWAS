@@ -37,6 +37,10 @@ he <- function(genotypes, pheno) {
     .Call(`_StratGWAS_he`, genotypes, pheno)
 }
 
+he_multi_part_enrich <- function(filename, pheno_mat, snp_cat, cat_names, block_size, outfile) {
+    .Call(`_StratGWAS_he_multi_part_enrich`, filename, pheno_mat, snp_cat, cat_names, block_size, outfile)
+}
+
 he_multi <- function(genotypes, pheno) {
     .Call(`_StratGWAS_he_multi`, genotypes, pheno)
 }

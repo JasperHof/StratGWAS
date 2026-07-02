@@ -1,7 +1,7 @@
 #' Compute genetic liability for all individuals
 #'
 #' !!! Note that this function is in development
-#' 
+#'
 #' @export
 liability <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, env = T) {
 
@@ -64,7 +64,7 @@ liability <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, env 
     Wmat = eigen(env_cor)                                                  # decompose E = U diag(Le) UT
     Wmat4 = Wmat$vectors %*% diag(1/sqrt(Wmat$values)) %*% t(Wmat$vectors) # get Wmat4 = U E^{-1/2} U^T
     Wmat5 = Wmat$vectors %*% diag(sqrt(Wmat$values)) %*% t(Wmat$vectors)   # get Wmat5 = U E^{1/2} U^T
-    M = Wmat3 = Wmat4 %*% as.matrix(gencov_adj) %*% Wmat4               # transform G into environment space (???) - and decompose after
+    M = Wmat3 = Wmat4 %*% as.matrix(gencov_adj) %*% Wmat4                  # transform G into environment space (???) - and decompose after
     V = eigen(Wmat3)$vectors                                               # now compute U for downstream use
     U1 = t(V) %*% Wmat4
     U2 = Wmat5 %*% V
@@ -78,7 +78,6 @@ liability <- function(pheno, filename, strat_cont = NULL, strat_cat = NULL, env 
     Wmat <- eigen(gencov_adj)
     weights <- Wmat$vectors[, 1]
   }
-  
 
   # Compute new phenotype
   trans <- cbind(multi[, c(1, 2)], as.matrix(multi[, -c(1, 2)]) %*% weights)
