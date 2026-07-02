@@ -25,8 +25,8 @@ BEGIN_RCPP
 END_RCPP
 }
 // compute_burden_windows
-void compute_burden_windows(const std::string& bed_prefix, const std::string& out_file, double kb_size, int n_snps_per_window, double target_mac_per_ind, int write_buffer_size, int chunk_size, std::string effects_file);
-RcppExport SEXP _StratGWAS_compute_burden_windows(SEXP bed_prefixSEXP, SEXP out_fileSEXP, SEXP kb_sizeSEXP, SEXP n_snps_per_windowSEXP, SEXP target_mac_per_indSEXP, SEXP write_buffer_sizeSEXP, SEXP chunk_sizeSEXP, SEXP effects_fileSEXP) {
+void compute_burden_windows(const std::string& bed_prefix, const std::string& out_file, double kb_size, int n_snps_per_window, double target_mac_per_ind, int write_buffer_size, int chunk_size, std::string effects_file, bool write_burden_scores);
+RcppExport SEXP _StratGWAS_compute_burden_windows(SEXP bed_prefixSEXP, SEXP out_fileSEXP, SEXP kb_sizeSEXP, SEXP n_snps_per_windowSEXP, SEXP target_mac_per_indSEXP, SEXP write_buffer_sizeSEXP, SEXP chunk_sizeSEXP, SEXP effects_fileSEXP, SEXP write_burden_scoresSEXP) {
 BEGIN_RCPP
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< const std::string& >::type bed_prefix(bed_prefixSEXP);
@@ -37,7 +37,8 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< int >::type write_buffer_size(write_buffer_sizeSEXP);
     Rcpp::traits::input_parameter< int >::type chunk_size(chunk_sizeSEXP);
     Rcpp::traits::input_parameter< std::string >::type effects_file(effects_fileSEXP);
-    compute_burden_windows(bed_prefix, out_file, kb_size, n_snps_per_window, target_mac_per_ind, write_buffer_size, chunk_size, effects_file);
+    Rcpp::traits::input_parameter< bool >::type write_burden_scores(write_burden_scoresSEXP);
+    compute_burden_windows(bed_prefix, out_file, kb_size, n_snps_per_window, target_mac_per_ind, write_buffer_size, chunk_size, effects_file, write_burden_scores);
     return R_NilValue;
 END_RCPP
 }
@@ -259,7 +260,7 @@ END_RCPP
 
 static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_compute_gene_burden", (DL_FUNC) &_StratGWAS_compute_gene_burden, 4},
-    {"_StratGWAS_compute_burden_windows", (DL_FUNC) &_StratGWAS_compute_burden_windows, 8},
+    {"_StratGWAS_compute_burden_windows", (DL_FUNC) &_StratGWAS_compute_burden_windows, 9},
     {"_StratGWAS_compute_burden_weights_blockwise", (DL_FUNC) &_StratGWAS_compute_burden_weights_blockwise, 2},
     {"_StratGWAS_vb_elastic_net_prs", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs, 13},
     {"_StratGWAS_vb_elastic_net_prs_multi", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs_multi, 13},

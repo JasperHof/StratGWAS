@@ -258,16 +258,21 @@ void write_burdens(
     int n_snps,
     const std::string& out_file,
     int write_buffer_size,
-    const std::vector<double>& beta   // empty = no heritability calculation
+    const std::vector<double>& beta,   // empty = no heritability calculation
+    bool write_burden_scores           // false = skip writing burden score / kept_windows files
 ) {
     bool has_effects = !beta.empty();
 
-    std::ofstream out(out_file);
-    if (!out.is_open()) Rcpp::stop("Could not open output file: " + out_file);
-
+    std::ofstream out;
+    std::ofstream kept_out;
     std::string kept_file = out_file + ".kept_windows";
-    std::ofstream kept_out(kept_file);
-    if (!kept_out.is_open()) Rcpp::stop("Could not open kept-windows file: " + kept_file);
+    if (write_burden_scores) {
+        out.open(out_file);
+        if (!out.is_open()) Rcpp::stop("Could not open output file: " + out_file);
+
+        kept_out.open(kept_file);
+        if (!kept_out.is_open()) Rcpp::stop("Could not open kept-windows file: " + kept_file);
+    }
 
     std::ofstream hers_out;
     if (has_effects) {
@@ -320,19 +325,21 @@ void write_burdens(
             }
         }
 
-        // Row: tab-separated burden scores, no labels
-        std::ostringstream row;
-        for (int i = 0; i < n_inds; ++i) {
-            if (i > 0) row << "\t";
-            row << burden_vec(i);
-        }
-        row_buf.push_back(row.str());
-
         // Window label: chr_bpstart_bpend_nsnps
         std::ostringstream wlabel;
         wlabel << w.chr << "_" << w.bp_start << "_" << w.bp_end
                << "_" << n_snps_win;
-        win_buf.push_back(wlabel.str());
+
+        if (write_burden_scores) {
+            // Row: tab-separated burden scores, no labels
+            std::ostringstream row;
+            for (int i = 0; i < n_inds; ++i) {
+                if (i > 0) row << "\t";
+                row << burden_vec(i);
+            }
+            row_buf.push_back(row.str());
+            win_buf.push_back(wlabel.str());
+        }
         n_written++;
 
         if (has_effects) {
@@ -354,7 +361,7 @@ void write_burdens(
             burden_total += burden_vec;
         }
 
-        if ((int)row_buf.size() >= write_buffer_size) {
+        if (write_burden_scores && (int)row_buf.size() >= write_buffer_size) {
             for (const auto& r : row_buf) out << r << "\n";
             for (const auto& wl : win_buf) kept_out << wl << "\n";
             row_buf.clear();
@@ -366,11 +373,12 @@ void write_burdens(
     }
 
     // Final flush
-    for (const auto& r : row_buf) out << r << "\n";
-    for (const auto& wl : win_buf) kept_out << wl << "\n";
-
-    out.close();
-    kept_out.close();
+    if (write_burden_scores) {
+        for (const auto& r : row_buf) out << r << "\n";
+        for (const auto& wl : win_buf) kept_out << wl << "\n";
+        out.close();
+        kept_out.close();
+    }
 
     if (has_effects) {
         double mean_total = g_total.mean();
@@ -397,7 +405,13 @@ void write_burdens(
 
     Rcout << "Done. " << n_written << " windows written";
     if (n_skipped > 0) Rcout << ", " << n_skipped << " skipped (empty)";
-    Rcout << "\nOutput: " << out_file << "\nWindow labels: " << kept_file << "\n";
+    if (write_burden_scores) {
+        Rcout << "\nOutput: " << out_file << "\nWindow labels: " << kept_file;
+    }
+    if (has_effects) {
+        Rcout << "\nHeritabilities: " << out_file << ".hers";
+    }
+    Rcout << "\n";
 }
 
 // Public R-callable function. Exactly one of kb_size, n_snps_per_window,
@@ -405,6 +419,8 @@ void write_burdens(
 // their default of -1 (meaning "not used"). effects_file is optional: if
 // given, also writes <out_file>.hers with per-window and total heritability
 // computed from the known true effect sizes (assumes var(phenotype) = 1).
+// write_burden_scores = false skips writing the burden score matrix and
+// .kept_windows file entirely, e.g. when only the .hers file is wanted.
 // [[Rcpp::export]]
 void compute_burden_windows(
     const std::string& bed_prefix,
@@ -414,7 +430,8 @@ void compute_burden_windows(
     double target_mac_per_ind  = -1,   // strategy 3: target MAC/n_inds
     int    write_buffer_size   = 500,
     int    chunk_size          = 5000, // only used for strategy 3 MAC scan
-    std::string effects_file   = ""    // optional: SNP, effect size
+    std::string effects_file   = "",   // optional: SNP, effect size
+    bool   write_burden_scores = true
 ) {
     // -- Read .bim --
     List bim_list = read_bim_file(bed_prefix);
@@ -459,5 +476,5 @@ void compute_burden_windows(
     Rcout << "Windows generated: " << windows.size() << "\n";
 
     // -- Compute and write burdens (and heritability, if effects given) --
-    write_burdens(windows, bed_prefix, n_inds, n_snps, out_file, write_buffer_size, beta);
+    write_burdens(windows, bed_prefix, n_inds, n_snps, out_file, write_buffer_size, beta, write_burden_scores);
 }
