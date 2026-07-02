@@ -11,7 +11,8 @@ burden(
   n_snps_per_window = NULL,
   target_mac_per_ind = NULL,
   out_file = NULL,
-  write_buffer_genes = 500
+  write_buffer_genes = 500,
+  effects_file = NULL
 )
 }
 \description{

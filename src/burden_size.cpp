@@ -9,13 +9,14 @@
 #include <sstream>
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 using namespace Rcpp;
 using Eigen::VectorXd;
 
-// ─────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // One window: a contiguous range of SNP indices in the .bim file
-// ─────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 struct Window {
     int chr;
     int start_idx;    // 0-based, inclusive, index into .bim
@@ -24,9 +25,9 @@ struct Window {
     long bp_end;
 };
 
-// ─────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // Read .bim into parallel vectors (chr, pos per SNP)
-// ─────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 struct BimData {
     std::vector<int>  chr;
     std::vector<long> pos;
@@ -45,11 +46,60 @@ BimData read_bim_data(const IntegerVector& chr_in, const NumericVector& pos_in) 
     return b;
 }
 
-// ─────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Read a two-column effects file (SNP, effect size) and align it to .bim
+// order. SNPs not found in the effects file get effect size 0.
+// ---------------------------------------------------------------------------
+std::vector<double> read_effects_file(const std::string& effects_file,
+                                       const CharacterVector& snp_ids) {
+    int n = snp_ids.size();
+    std::vector<double> beta(n, 0.0);
+
+    std::unordered_map<std::string, double> eff_map;
+    std::ifstream in(effects_file);
+    if (!in.is_open()) Rcpp::stop("Could not open effects file: " + effects_file);
+
+    std::string snp;
+    double b;
+    while (in >> snp >> b) eff_map[snp] = b;
+    in.close();
+
+    int n_matched = 0;
+    for (int i = 0; i < n; ++i) {
+        std::string s = as<std::string>(snp_ids[i]);
+        auto it = eff_map.find(s);
+        if (it != eff_map.end()) {
+            beta[i] = it->second;
+            ++n_matched;
+        }
+    }
+    Rcout << "Effects file: matched " << n_matched << "/" << n << " SNPs\n";
+    return beta;
+}
+
+// ---------------------------------------------------------------------------
+// Squared Pearson correlation between two vectors (e.g. burden score vs
+// true genetic score), used to convert true regional heritability into
+// the heritability actually captured by the burden score.
+// ---------------------------------------------------------------------------
+double compute_r2(const VectorXd& a, const VectorXd& b) {
+    double mean_a = a.mean();
+    double mean_b = b.mean();
+    VectorXd ac = a.array() - mean_a;
+    VectorXd bc = b.array() - mean_b;
+
+    double denom = ac.norm() * bc.norm();
+    if (denom < 1e-12) return 0.0;   // one side has no variance (e.g. window has no effects)
+
+    double r = ac.dot(bc) / denom;
+    return r * r;
+}
+
+// ---------------------------------------------------------------------------
 // Window-generation strategies
 // Each returns a vector of Window structs covering all SNPs in the bim,
 // leaving no SNPs unassigned (last window may be smaller than the target).
-// ─────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 
 // Strategy 1: fixed basepair window size
 std::vector<Window> windows_by_kb(const BimData& bim, double kb_size) {
@@ -146,7 +196,7 @@ std::vector<Window> windows_by_variation(
         frq_in.close();
     } else {
         // Slow path: compute MAC from genotype chunks
-        Rcout << "No .frq file found — computing MAC from genotype data\n";
+        Rcout << "No .frq file found - computing MAC from genotype data\n";
         int n_chunks = (n + chunk_size - 1) / chunk_size;
         for (int c = 0; c < n_chunks; ++c) {
             int snp_start = c * chunk_size;
@@ -195,24 +245,45 @@ std::vector<Window> windows_by_variation(
     return windows;
 }
 
-// ─────────────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
 // Shared output routine: given a set of windows, read genotypes and write
-// burden scores. Identical logic for all three strategies.
-// ─────────────────────────────────────────────────────────────────────────
+// burden scores. Identical logic for all three strategies. If beta is
+// non-empty, also computes true per-window heritability from known effects
+// (assumes var(phenotype) = 1) and writes it to out_file + ".hers".
+// ---------------------------------------------------------------------------
 void write_burdens(
     const std::vector<Window>& windows,
     const std::string& bed_prefix,
     int n_inds,
     int n_snps,
     const std::string& out_file,
-    int write_buffer_size
+    int write_buffer_size,
+    const std::vector<double>& beta   // empty = no heritability calculation
 ) {
+    bool has_effects = !beta.empty();
+
     std::ofstream out(out_file);
     if (!out.is_open()) Rcpp::stop("Could not open output file: " + out_file);
 
     std::string kept_file = out_file + ".kept_windows";
     std::ofstream kept_out(kept_file);
     if (!kept_out.is_open()) Rcpp::stop("Could not open kept-windows file: " + kept_file);
+
+    std::ofstream hers_out;
+    if (has_effects) {
+        std::string hers_file = out_file + ".hers";
+        hers_out.open(hers_file);
+        if (!hers_out.is_open()) Rcpp::stop("Could not open hers file: " + hers_file);
+        hers_out << "window\tchr\tbp_start\tbp_end\tn_snps\th2\tr2_burden\th2_burden\n";
+    }
+
+    // Running genetic score for the whole genome (only tracked if we have
+    // effects), used to report the actual total heritability alongside the
+    // naive sum of per-window heritabilities
+    VectorXd g_total = VectorXd::Zero(n_inds);
+    VectorXd burden_total = VectorXd::Zero(n_inds);
+    double sum_window_h2 = 0.0;
+    double sum_window_h2_burden = 0.0;
 
     std::vector<std::string> row_buf;
     std::vector<std::string> win_buf;
@@ -236,10 +307,16 @@ void write_burdens(
         );
 
         VectorXd burden_vec = VectorXd::Zero(n_inds);
+        VectorXd g_win = VectorXd::Zero(n_inds);   // true genetic score for this window
+
         for (int s = 0; s < n_snps_win; ++s) {
+            double b = has_effects ? beta[w.start_idx + s] : 0.0;
             for (int i = 0; i < n_inds; ++i) {
                 int g = geno_block(i, s);
-                if (g != -1) burden_vec(i) += g;
+                if (g != -1) {
+                    burden_vec(i) += g;
+                    if (has_effects && b != 0.0) g_win(i) += b * g;
+                }
             }
         }
 
@@ -257,6 +334,25 @@ void write_burdens(
                << "_" << n_snps_win;
         win_buf.push_back(wlabel.str());
         n_written++;
+
+        if (has_effects) {
+            double mean_g = g_win.mean();
+            double h2_win = (g_win.array() - mean_g).square().sum() / (n_inds - 1);
+
+            // How much of this window's true genetic signal the (unweighted)
+            // burden score actually captures: h2_burden = r2 * h2_true
+            double r2_win = compute_r2(burden_vec, g_win);
+            double h2_win_burden = r2_win * h2_win;
+
+            hers_out << wlabel.str() << "\t" << w.chr << "\t" << w.bp_start << "\t"
+                      << w.bp_end << "\t" << n_snps_win << "\t" << h2_win << "\t"
+                      << r2_win << "\t" << h2_win_burden << "\n";
+
+            sum_window_h2 += h2_win;
+            sum_window_h2_burden += h2_win_burden;
+            g_total += g_win;
+            burden_total += burden_vec;
+        }
 
         if ((int)row_buf.size() >= write_buffer_size) {
             for (const auto& r : row_buf) out << r << "\n";
@@ -276,6 +372,29 @@ void write_burdens(
     out.close();
     kept_out.close();
 
+    if (has_effects) {
+        double mean_total = g_total.mean();
+        double h2_total_actual = (g_total.array() - mean_total).square().sum() / (n_inds - 1);
+
+        // Genome-wide burden-captured h2, computed directly from the full
+        // accumulated burden score vs the full accumulated genetic score
+        // (not the same as summing per-window h2_burden, for the same
+        // reason TOTAL_SUM and TOTAL_ACTUAL can differ - see TOTAL_ACTUAL)
+        double r2_total = compute_r2(burden_total, g_total);
+        double h2_total_burden_actual = r2_total * h2_total_actual;
+
+        hers_out << "TOTAL_SUM\tNA\tNA\tNA\tNA\t" << sum_window_h2
+                  << "\tNA\t" << sum_window_h2_burden << "\n";
+        hers_out << "TOTAL_ACTUAL\tNA\tNA\tNA\tNA\t" << h2_total_actual
+                  << "\t" << r2_total << "\t" << h2_total_burden_actual << "\n";
+        hers_out.close();
+
+        Rcout << "Sum of per-window h2 (naive): " << sum_window_h2 << "\n";
+        Rcout << "Actual h2 of combined genetic score: " << h2_total_actual << "\n";
+        Rcout << "Sum of per-window burden-captured h2 (naive): " << sum_window_h2_burden << "\n";
+        Rcout << "Actual burden-captured h2 (genome-wide r2 x h2): " << h2_total_burden_actual << "\n";
+    }
+
     Rcout << "Done. " << n_written << " windows written";
     if (n_skipped > 0) Rcout << ", " << n_skipped << " skipped (empty)";
     Rcout << "\nOutput: " << out_file << "\nWindow labels: " << kept_file << "\n";
@@ -283,7 +402,9 @@ void write_burdens(
 
 // Public R-callable function. Exactly one of kb_size, n_snps_per_window,
 // or target_mac_per_ind should be positive; the others should be left at
-// their default of -1 (meaning "not used").
+// their default of -1 (meaning "not used"). effects_file is optional: if
+// given, also writes <out_file>.hers with per-window and total heritability
+// computed from the known true effect sizes (assumes var(phenotype) = 1).
 // [[Rcpp::export]]
 void compute_burden_windows(
     const std::string& bed_prefix,
@@ -292,28 +413,36 @@ void compute_burden_windows(
     int    n_snps_per_window   = -1,   // strategy 2: fixed SNP count
     double target_mac_per_ind  = -1,   // strategy 3: target MAC/n_inds
     int    write_buffer_size   = 500,
-    int    chunk_size          = 5000  // only used for strategy 3 MAC scan
+    int    chunk_size          = 5000, // only used for strategy 3 MAC scan
+    std::string effects_file   = ""    // optional: SNP, effect size
 ) {
-    // ── Read .bim ─────────────────────────────────────────────────────────
+    // -- Read .bim --
     List bim_list = read_bim_file(bed_prefix);
     IntegerVector snp_chr = bim_list["chr"];
     NumericVector snp_pos = bim_list["pos"];
     int n_snps = snp_chr.size();
     BimData bim = read_bim_data(snp_chr, snp_pos);
 
-    // ── Read .fam for n_inds ───────────────────────────────────────────────
+    // -- Read .fam for n_inds --
     List fam = read_fam_file(bed_prefix);
     int n_inds = as<CharacterVector>(fam["iid"]).size();
 
     Rcout << "Individuals: " << n_inds << "\n";
     Rcout << "SNPs: "        << n_snps << "\n";
 
-    // ── Check exactly one strategy is specified ────────────────────────────
+    // -- Optional effects file --
+    std::vector<double> beta;   // stays empty if no effects_file given
+    if (effects_file != "") {
+        CharacterVector snp_id = bim_list["snp"];
+        beta = read_effects_file(effects_file, snp_id);
+    }
+
+    // -- Check exactly one window strategy is specified --
     int n_strategies = (kb_size > 0) + (n_snps_per_window > 0) + (target_mac_per_ind > 0);
     if (n_strategies != 1)
         Rcpp::stop("Specify exactly one of: kb_size, n_snps_per_window, target_mac_per_ind");
 
-    // ── Generate windows ────────────────────────────────────────────────────
+    // -- Generate windows --
     std::vector<Window> windows;
 
     if (kb_size > 0) {
@@ -329,6 +458,6 @@ void compute_burden_windows(
 
     Rcout << "Windows generated: " << windows.size() << "\n";
 
-    // ── Compute and write burdens ────────────────────────────────────────────
-    write_burdens(windows, bed_prefix, n_inds, n_snps, out_file, write_buffer_size);
+    // -- Compute and write burdens (and heritability, if effects given) --
+    write_burdens(windows, bed_prefix, n_inds, n_snps, out_file, write_buffer_size, beta);
 }
