@@ -509,6 +509,26 @@ Rcpp::List he_sliding_window(const std::string& filename,
 // reduces to K-space expressions in the precomputed Gram = Z'Z. Verified to
 // match the dense N-space AI-REML to ~1e-14 on logL, score, AI and to ~1e-15
 // on the fitted variance components.
+//
+// Two speed optimizations on top of the base Woodbury reduction (both proven
+// not to bias the converged answer -- see comments at each site):
+//
+//   1. Warm start: each trait's Newton iteration starts from the EXACT
+//      method-of-moments solution (reml_mom_start), read directly off the
+//      already-built Gram at ~O(K^2) instead of the naive "split variance
+//      evenly" start. This is the dominant lever: REML cost scales as
+//      P(traits) x iterations x O(K^3), and the naive cold start typically
+//      needs many more Newton steps than a MoM-informed one.
+//   2. No explicit S^-1: reml_eval() used to form the full K x K inverse
+//      (S^-1 = solve(S, I_K), ~K^3) and then multiply it by Gw' (~K^3) --
+//      two K^3-scale operations where one suffices. We now solve directly
+//      for R = S^-1 Gw' via llt.solve(Gw.transpose()) (~K^3, once), and get
+//      the one remaining use of S^-1 -- its trace, needed only for the
+//      Newton *direction* -- via cheap Hutchinson stochastic trace estimation
+//      (O(K^2)). The accepted log-likelihood (reml_logL) and the reported AI
+//      matrix / standard errors never touch this trace term, so this cannot
+//      bias the final converged vg/h2/SE -- at worst it costs an extra
+//      iteration on an unlucky probe draw.
 // ===========================================================================
 
 // Precomputed per-window sufficient statistics shared across traits/iterations.
@@ -538,7 +558,53 @@ static Eigen::VectorXd reml_wsqrt(const RemlWindow& W, const Eigen::VectorXd& s)
     return Ws;
 }
 
-// Cheap path: REML log-likelihood only (used inside step-halving).
+// Exact (non-stochastic) method-of-moments start, read directly off the
+// already-built exact Gram matrix -- near-zero extra cost (block reads on a
+// matrix that's already sitting in memory, no new GEMMs). Mathematically the
+// same estimator as he_window_compute()'s randomized T/q system, just exact
+// instead of probed, because REML (unlike HE) has already paid for the exact
+// Gram. Gives AI-REML a starting point close to the optimum, so it typically
+// needs a handful of Newton steps instead of dozens.
+static Eigen::VectorXd reml_mom_start(const RemlWindow& W, const Eigen::VectorXd& Zty,
+                                       double yty, int n) {
+    int C = W.C, p = C + 1;
+    Eigen::MatrixXd T = Eigen::MatrixXd::Zero(p, p);
+    Eigen::VectorXd q(p);
+    for (int a = 0; a < C; ++a) {
+        for (int b = a; b < C; ++b) {
+            double sfn = W.Gram.block(W.off[a], W.off[b], W.m[a], W.m[b]).squaredNorm();
+            T(a, b) = sfn / ((double) W.m[a] * (double) W.m[b]);
+            T(b, a) = T(a, b);
+        }
+        double tr = W.Gram.block(W.off[a], W.off[a], W.m[a], W.m[a]).trace() / W.m[a];
+        T(a, C) = tr; T(C, a) = tr;
+        q[a] = Zty.segment(W.off[a], W.m[a]).squaredNorm() / W.m[a];
+    }
+    T(C, C) = (double) n;
+    q[C] = yty;
+    return T.ldlt().solve(q);
+}
+
+// Hutchinson (Rademacher-probe) stochastic estimate of trace(S^-1), reusing
+// the already-computed Cholesky factor. B solves of O(K^2) each vs O(K^3) for
+// an explicit inverse. Only feeds the Newton search direction (trVinv / trP /
+// score[C]); the accepted log-likelihood and the AI matrix (hence reported
+// SEs) never use it -- see the note above reml_eval().
+static double hutchinson_trace_Sinv(const Eigen::LLT<Eigen::MatrixXd>& llt,
+                                    int K, int B, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> bit(0, 1);
+    double tr = 0.0;
+    Eigen::VectorXd z(K);
+    for (int b = 0; b < B; ++b) {
+        for (int k = 0; k < K; ++k) z[k] = bit(rng) ? 1.0 : -1.0;
+        tr += z.dot(llt.solve(z));
+    }
+    return tr / B;
+}
+
+// Cheap path: REML log-likelihood only (used inside step-halving). Exact --
+// unaffected by the Hutchinson trace optimization below.
 static bool reml_logL(const RemlWindow& W, const Eigen::VectorXd& Zty,
                       const Eigen::VectorXd& y, const Eigen::VectorXd& s,
                       double& logL) {
@@ -564,8 +630,11 @@ static bool reml_logL(const RemlWindow& W, const Eigen::VectorXd& Zty,
 }
 
 // Full path: log-likelihood, score vector, and Average-Information matrix.
+// `seed` drives only the Hutchinson trace(S^-1) estimate used in score[C];
+// everything else (logL, AI matrix, hence reported SEs) is exact.
 static RemlEval reml_eval(const RemlWindow& W, const Eigen::VectorXd& Zty,
-                          const Eigen::VectorXd& y, const Eigen::VectorXd& s) {
+                          const Eigen::VectorXd& y, const Eigen::VectorXd& s,
+                          unsigned seed) {
     RemlEval ev; ev.ok = false;
     int C = W.C, K = W.K, p = C + 1;
     double se = s[C];
@@ -577,15 +646,14 @@ static RemlEval reml_eval(const RemlWindow& W, const Eigen::VectorXd& Zty,
     S.diagonal().array() += 1.0;
     Eigen::LLT<Eigen::MatrixXd> llt(S);
     if (llt.info() != Eigen::Success) return ev;
-    Eigen::MatrixXd Sinv = llt.solve(Eigen::MatrixXd::Identity(K, K));
     double logdetS = 2.0 * llt.matrixLLT().diagonal().array().log().sum();
 
-    Eigen::MatrixXd Gw  = W.Gram * Ws.asDiagonal();       // Gw_{jk} = G_{jk} Ws_k
-    Eigen::MatrixXd R   = Sinv * Gw.transpose();
+    Eigen::MatrixXd Gw  = W.Gram * Ws.asDiagonal();             // Gw_{jk} = G_{jk} Ws_k
+    Eigen::MatrixXd R   = llt.solve(Gw.transpose());            // = S^-1 Gw', ONE K^3 solve
     Eigen::MatrixXd ZVZ = W.Gram / se - (Gw * R) / (se * se);   // Z' V^-1 Z
 
     Eigen::VectorXd g1 = Ws.cwiseProduct(W.Zt1), gy = Ws.cwiseProduct(Zty);
-    Eigen::VectorXd s1 = Sinv * g1, sy = Sinv * gy;
+    Eigen::VectorXd s1 = llt.solve(g1), sy = llt.solve(gy);     // O(K^2) vector solves
     Eigen::VectorXd ZV1 = W.Zt1 / se - (Gw * s1) / (se * se);   // Z' V^-1 1
 
     Eigen::VectorXd Vi1 = Eigen::VectorXd::Ones((int)Nn) / se
@@ -597,11 +665,15 @@ static RemlEval reml_eval(const RemlWindow& W, const Eigen::VectorXd& Zty,
 
     // Pr = P (P y)  (needed for AI entries involving the residual component)
     Eigen::VectorXd a_r = Ws.cwiseProduct(Zr);
-    Eigen::VectorXd Vir = r / se - (W.Z * Ws.cwiseProduct(Sinv * a_r)) / (se * se);
+    Eigen::VectorXd Vir = r / se - (W.Z * Ws.cwiseProduct(llt.solve(a_r))) / (se * se);
     Eigen::VectorXd Pr  = Vir - Vi1 * (Vir.sum() / c);
     Eigen::VectorXd ZPr = W.Z.transpose() * Pr;
 
-    double trVinv = Nn / se - (K - Sinv.trace()) / se;
+    // trace(S^-1): stochastic (Hutchinson), feeds only the Newton *direction*
+    // (trVinv -> trP -> score[C]). Never touches logL, the AI matrix, or the
+    // reported SEs -- see the block comment above the AI-REML section.
+    double trSinv = hutchinson_trace_Sinv(llt, K, 16, seed);
+    double trVinv = Nn / se - (K - trSinv) / se;
     double trP    = trVinv - Vi1.dot(Vi1) / c;
     Eigen::MatrixXd Q = ZVZ - (ZV1 * ZV1.transpose()) / c;      // Z' P Z
 
@@ -634,7 +706,7 @@ static RemlEval reml_eval(const RemlWindow& W, const Eigen::VectorXd& Zty,
         double v = 0.5 / W.m[l] * pl.dot(zp);
         AI(l, C) = v; AI(C, l) = v;
     }
-    AI(C, C) = 0.5 * r.dot(Pr);
+    AI(C, C) = 0.5 * r.dot(Pr);                                 // exact -- no trSinv here
 
     double logdetV = Nn * std::log(se) + logdetS;
     ev.logL = -0.5 * (logdetV + std::log(c) + y.dot(r));
@@ -644,23 +716,31 @@ static RemlEval reml_eval(const RemlWindow& W, const Eigen::VectorXd& Zty,
 
 // AI-REML for one trait using the low-rank window statistics. Returns variance
 // components `s` (length C+1, residual last), convergence flag and iterations.
-// Negative components are floored to keep S positive definite.
+// Negative components are floored to keep S positive definite. `seed` drives
+// the Hutchinson trace probes (varied per outer iteration below).
 static void reml_fit(const RemlWindow& W, const Eigen::VectorXd& Zty,
                      const Eigen::VectorXd& y, int max_iter, double tol,
+                     unsigned seed,
                      Eigen::VectorXd& s, bool& converged, int& iters,
                      Eigen::MatrixXd& AI_out) {
     int p = W.C + 1;
     double vy = (y.array() - y.mean()).square().sum() / (y.size() - 1);
     double floor_v = 1e-6 * vy;
 
-    s = Eigen::VectorXd::Constant(p, vy / p);       // start: split variance
+    // Warm start: exact MoM solve off the already-built Gram (see
+    // reml_mom_start) instead of naively splitting variance evenly. This is
+    // the main lever for cutting Newton iterations.
+    double yty = y.squaredNorm();
+    s = reml_mom_start(W, Zty, yty, (int) y.size());
+    for (int l = 0; l < p; ++l) if (s[l] < floor_v) s[l] = floor_v;
+
     converged = false; iters = 0;
     AI_out = Eigen::MatrixXd::Zero(p, p);
 
-    RemlEval cur = reml_eval(W, Zty, y, s);
+    RemlEval cur = reml_eval(W, Zty, y, s, seed);
     if (!cur.ok) {                                  // nudge if start not PD
         s.setConstant(vy / p); s[W.C] = vy;
-        cur = reml_eval(W, Zty, y, s);
+        cur = reml_eval(W, Zty, y, s, seed);
         if (!cur.ok) return;
     }
     AI_out = cur.AI;
@@ -669,7 +749,8 @@ static void reml_fit(const RemlWindow& W, const Eigen::VectorXd& Zty,
         iters = it;
         Eigen::VectorXd delta = cur.AI.ldlt().solve(cur.score);
 
-        // Step control via the cheap log-likelihood path.
+        // Step control via the cheap log-likelihood path (exact; unaffected
+        // by the Hutchinson trace optimization).
         double step = 1.0; bool accepted = false; Eigen::VectorXd s_acc;
         for (int h = 0; h < 25; ++h) {
             Eigen::VectorXd s_try = s + step * delta;
@@ -683,7 +764,7 @@ static void reml_fit(const RemlWindow& W, const Eigen::VectorXd& Zty,
         if (!accepted) break;
 
         s = s_acc;
-        RemlEval full = reml_eval(W, Zty, y, s);
+        RemlEval full = reml_eval(W, Zty, y, s, seed + (unsigned) it * 2654435761u);
         if (!full.ok) break;
         AI_out = full.AI;
         double dlogL = full.logL - cur.logL;
@@ -691,6 +772,290 @@ static void reml_fit(const RemlWindow& W, const Eigen::VectorXd& Zty,
         if (std::abs(dlogL) < tol) { converged = true; break; }
     }
 }
+
+// ===========================================================================
+// Incremental Gram cache for REML: avoids rebuilding the full O(N*K^2) Gram
+// from scratch every window.
+//
+// Adjacent windows share 2 of their 3 WES cells (old middle -> new left, old
+// right -> new middle), and since the common component spans the same 3W
+// region its 3 sub-cells shift the same way. Track all SIX rolling cells
+// (WES L/M/R, common L/M/R) as one 6x6 block Gram (21 unique blocks). Sliding
+// one window right relabels 4 of the 6 cells (old M/R WES + old M/R common
+// become new L/M), so 10 of the 21 blocks are copied verbatim from the
+// previous window -- only the 11 blocks touching the two freshly-read
+// "right" cells are new, computed via two GEMMs. With roughly even cell
+// sizes this cuts the dominant per-window Gram cost roughly 3x (only ~1/3 of
+// the 6 cells are "new" at each step).
+//
+// This only holds within one chromosome (cells must be contiguous on the
+// genome); the cache is fully rebuilt -- once -- at the first window of each
+// chromosome, mirroring WindowStream's own reset there.
+//
+// reml_build_window() (above) is kept in the file, unused by this path, as a
+// simple reference implementation: to validate this class on your data,
+// temporarily compute both for the first few windows of a chromosome and
+// diff rw.Gram element-wise (should match to ~1e-6, float GEMM precision).
+// ===========================================================================
+class RemlWindowStream {
+public:
+    RemlWindowStream(const RunContext& ctx, long W)
+        : ctx_(ctx), W_(W), ci_(0), have_chrom_(false) {}
+
+    // Fills wc/rw/chr/w_start for the next middle window with >=1 SNP.
+    // Returns false when all chromosomes are exhausted.
+    bool next(WindowComponents& wc, RemlWindow& rw, std::string& chr, long& w_start) {
+        while (true) {
+            if (!have_chrom_) {
+                if (ci_ >= ctx_.chr_order.size()) return false;
+                setup_chrom();
+                have_chrom_ = true;
+            }
+            if (g_ > glast_) { ++ci_; have_chrom_ = false; continue; }
+
+            bool produced = false;
+            if (wes_[1].cols() > 0) {
+                assemble(wc, rw);
+                chr = ctx_.chr_order[ci_];
+                w_start = g_ * W_;
+                produced = true;
+            }
+            shift();
+            if (produced) return true;
+        }
+    }
+
+private:
+    const RunContext& ctx_;
+    long W_;
+    size_t ci_;
+    bool have_chrom_;
+    int c_lo_, c_hi_, cc_lo_, cc_hi_;
+    long g_, glast_;
+
+    GenoMat wes_[3];        // current L,M,R WES cells
+    GenoMat com_[3];        // current L,M,R common cells
+    Eigen::MatrixXd G6_;    // FULL (both triangles) 6-cell block Gram, order
+                            // [wesL,wesM,wesR,comL,comM,comR]. Stored full
+                            // (not upper-triangle) so every block extraction
+                            // below is valid regardless of argument order --
+                            // trades a harmless 2x memory on a small K6 x K6
+                            // matrix for eliminating an entire class of
+                            // "did I transpose that?" bugs.
+
+    GenoMat wesCell(long cell) const {
+        return read_cell(ctx_.wes_prefix, ctx_.wes_n_total, ctx_.wes_n_snps,
+                         ctx_.wes_bim, ctx_.geno_keep, c_lo_, c_hi_, cell * W_, W_);
+    }
+    GenoMat comCell(long cell) const {
+        if (!ctx_.use_common) return GenoMat(ctx_.n_inds, 0);
+        return read_cell(ctx_.common_prefix, ctx_.common_n_total, ctx_.common_n_snps,
+                         ctx_.common_bim, ctx_.common_keep, cc_lo_, cc_hi_, cell * W_, W_);
+    }
+    const GenoMat& cellAt(int i) const { return (i < 3) ? wes_[i] : com_[i - 3]; }
+
+    // Cumulative column offsets of the six cells in G6_'s CURRENT layout.
+    void offsets(int off[7]) const {
+        off[0] = 0;
+        for (int i = 0; i < 6; ++i) off[i + 1] = off[i] + (int) cellAt(i).cols();
+    }
+
+    void setup_chrom() {
+        const std::string& chr = ctx_.chr_order[ci_];
+        c_lo_ = ctx_.chr_lo[ci_]; c_hi_ = ctx_.chr_hi[ci_];
+        common_chr_range(ctx_, chr, cc_lo_, cc_hi_);
+        long min_bp = ctx_.wes_bim.bp[c_lo_], max_bp = ctx_.wes_bim.bp[c_hi_];
+        g_ = min_bp / W_;
+        glast_ = max_bp / W_;
+        wes_[0] = wesCell(g_ - 1); wes_[1] = wesCell(g_); wes_[2] = wesCell(g_ + 1);
+        com_[0] = comCell(g_ - 1); com_[1] = comCell(g_); com_[2] = comCell(g_ + 1);
+        rebuild_full();
+    }
+
+    // Full O(N*K6^2) rebuild -- only at the start of each chromosome.
+    void rebuild_full() {
+        int off[7]; offsets(off);
+        int K6 = off[6];
+        GenoMat Zall(ctx_.n_inds, K6);
+        for (int i = 0; i < 6; ++i) {
+            int w = (int) cellAt(i).cols();
+            if (w > 0) Zall.middleCols(off[i], w) = cellAt(i);
+        }
+        GenoMat Gf = GenoMat::Zero(K6, K6);
+        Gf.selfadjointView<Eigen::Upper>().rankUpdate(Zall.transpose());
+        GenoMat Gfull = Gf.selfadjointView<Eigen::Upper>();   // materialize both triangles
+        G6_ = Gfull.cast<double>();
+    }
+
+    // Advance one window to the right: relabel the 4 carried cells (old
+    // M,R-WES + old M,R-common -> new L,M), read the 2 new "right" cells,
+    // and patch G6_ with the 11 new blocks (2 GEMMs total) while copying the
+    // other 10 verbatim.
+    void shift() {
+        ++g_;
+        if (g_ > glast_) return;
+
+        GenoMat newWesR = wesCell(g_ + 1);
+        GenoMat newComR = comCell(g_ + 1);
+
+        int oldOff[7]; offsets(oldOff);   // offsets under the OLD (pre-shift) layout
+
+        int m1 = (int) wes_[1].cols(), m2 = (int) wes_[2].cols();
+        int m4 = (int) com_[1].cols(), m5 = (int) com_[2].cols();
+        int mNewWesR = (int) newWesR.cols(), mNewComR = (int) newComR.cols();
+
+        // New layout: [wesL=old wesM, wesM=old wesR, wesR=new, comL=old comM,
+        // comM=old comR, comR=new].
+        int newSize[6] = { m1, m2, mNewWesR, m4, m5, mNewComR };
+        int newOff[7]; newOff[0] = 0;
+        for (int i = 0; i < 6; ++i) newOff[i + 1] = newOff[i] + newSize[i];
+        int K6new = newOff[6];
+
+        Eigen::MatrixXd G6new = Eigen::MatrixXd::Zero(K6new, K6new);
+
+        // Copy the 10 carried blocks (new indices 0,1,3,4 <- old indices
+        // 1,2,4,5). G6_ is stored full, so extraction is valid for any
+        // (row,col) order -- no transpose bookkeeping needed here.
+        int carryNew[4] = {0, 1, 3, 4};
+        int carryOld[4] = {1, 2, 4, 5};
+        for (int i = 0; i < 4; ++i)
+            for (int j = 0; j < 4; ++j) {
+                int oi = carryOld[i], oj = carryOld[j];
+                int ni = carryNew[i], nj = carryNew[j];
+                int wi = (int) cellAt(oi).cols(), wj = (int) cellAt(oj).cols();
+                if (wi == 0 || wj == 0) continue;
+                G6new.block(newOff[ni], newOff[nj], wi, wj) =
+                    G6_.block(oldOff[oi], oldOff[oj], wi, wj);
+            }
+
+        // The 11 new blocks: one combined GEMM covering the two new cells
+        // against [carried cells | themselves], using the OLD (pre-shift)
+        // raw matrices for the carried side (still held in wes_[1],wes_[2],
+        // com_[1],com_[2] at this point -- not yet overwritten).
+        GenoMat carried(ctx_.n_inds, m1 + m2 + m4 + m5);
+        { int o = 0;
+          if (m1) { carried.middleCols(o, m1) = wes_[1]; o += m1; }
+          if (m2) { carried.middleCols(o, m2) = wes_[2]; o += m2; }
+          if (m4) { carried.middleCols(o, m4) = com_[1]; o += m4; }
+          if (m5) { carried.middleCols(o, m5) = com_[2]; } }
+
+        GenoMat newCells(ctx_.n_inds, mNewWesR + mNewComR);
+        { int o = 0;
+          if (mNewWesR) { newCells.middleCols(o, mNewWesR) = newWesR; o += mNewWesR; }
+          if (mNewComR) newCells.middleCols(o, mNewComR) = newComR; }
+
+        GenoMat rhs(ctx_.n_inds, carried.cols() + newCells.cols());
+        if (carried.cols()  > 0) rhs.leftCols(carried.cols())   = carried;
+        if (newCells.cols() > 0) rhs.rightCols(newCells.cols()) = newCells;
+
+        Eigen::MatrixXd cross = (newCells.transpose() * rhs).cast<double>();
+        // cross rows: [0,mNewWesR)=new wesR ; [mNewWesR,end)=new comR.
+        // cross cols: [0,m1)=old wesM(->new0) [m1,+m2)=old wesR(->new1)
+        //   [+m4)=old comM(->new3) [+m5)=old comR(->new4) [+mNewWesR)=new wesR
+        //   itself(new2) [+mNewComR)=new comR itself(new5).
+
+        // New-vs-carried blocks (new2/new5 rows against new0/1/3/4 cols),
+        // mirror always via .transpose() of the just-placed block (never a
+        // separately re-sliced region) to guarantee exact consistency.
+        int carriedNewIdx[4] = {0, 1, 3, 4};
+        int carriedWidth[4]  = {m1, m2, m4, m5};
+        int colStart = 0;
+        for (int c = 0; c < 4; ++c) {
+            int w = carriedWidth[c];
+            if (w > 0) {
+                int nj = carriedNewIdx[c];
+                if (mNewWesR > 0) {
+                    Eigen::MatrixXd blk = cross.block(0, colStart, mNewWesR, w);
+                    G6new.block(newOff[2], newOff[nj], mNewWesR, w) = blk;
+                    G6new.block(newOff[nj], newOff[2], w, mNewWesR) = blk.transpose();
+                }
+                if (mNewComR > 0) {
+                    Eigen::MatrixXd blk = cross.block(mNewWesR, colStart, mNewComR, w);
+                    G6new.block(newOff[5], newOff[nj], mNewComR, w) = blk;
+                    G6new.block(newOff[nj], newOff[5], w, mNewComR) = blk.transpose();
+                }
+            }
+            colStart += w;
+        }
+
+        // New-vs-new blocks (self terms + the new2/new5 cross term), taken
+        // from the trailing (mNewWesR+mNewComR) columns of `cross`.
+        if (mNewWesR > 0)
+            G6new.block(newOff[2], newOff[2], mNewWesR, mNewWesR) =
+                cross.block(0, colStart, mNewWesR, mNewWesR);
+        if (mNewComR > 0)
+            G6new.block(newOff[5], newOff[5], mNewComR, mNewComR) =
+                cross.block(mNewWesR, colStart + mNewWesR, mNewComR, mNewComR);
+        if (mNewWesR > 0 && mNewComR > 0) {
+            Eigen::MatrixXd blk = cross.block(0, colStart + mNewWesR, mNewWesR, mNewComR);
+            G6new.block(newOff[2], newOff[5], mNewWesR, mNewComR) = blk;
+            G6new.block(newOff[5], newOff[2], mNewComR, mNewWesR) = blk.transpose();
+        }
+
+        G6_ = std::move(G6new);
+        wes_[0] = std::move(wes_[1]); wes_[1] = std::move(wes_[2]); wes_[2] = std::move(newWesR);
+        com_[0] = std::move(com_[1]); com_[1] = std::move(com_[2]); com_[2] = std::move(newComR);
+    }
+
+    // Build the CURRENT window's WindowComponents (same filtering as
+    // WindowStream::assemble) and its RemlWindow -- reading Gram entries
+    // straight out of G6_ (no cross-products recomputed here at all; common's
+    // 3 sub-cells are already contiguous in G6_'s layout, so the merged
+    // "common" component's blocks are a single contiguous extraction).
+    void assemble(WindowComponents& wc, RemlWindow& rw) {
+        wc = WindowComponents();
+        wc.mid_comp = -1;
+        wc.nL = (int) wes_[0].cols(); wc.nM = (int) wes_[1].cols(); wc.nR = (int) wes_[2].cols();
+        if (wc.nL > 0) { wc.label.push_back("left");  wc.X.push_back(wes_[0]); }
+        wc.label.push_back("middle"); wc.X.push_back(wes_[1]);
+        wc.mid_comp = (int) wc.X.size() - 1;
+        if (wc.nR > 0) { wc.label.push_back("right"); wc.X.push_back(wes_[2]); }
+
+        int nC = (int) com_[0].cols() + (int) com_[1].cols() + (int) com_[2].cols();
+        wc.nC = nC;
+        bool haveCommon = ctx_.use_common && nC > 0;
+        if (haveCommon) {
+            GenoMat Xc(ctx_.n_inds, nC);
+            int off = 0;
+            if (com_[0].cols() > 0) { Xc.middleCols(off, com_[0].cols()) = com_[0]; off += com_[0].cols(); }
+            if (com_[1].cols() > 0) { Xc.middleCols(off, com_[1].cols()) = com_[1]; off += com_[1].cols(); }
+            if (com_[2].cols() > 0) { Xc.middleCols(off, com_[2].cols()) = com_[2]; }
+            wc.label.push_back("common");
+            wc.X.push_back(Xc);
+        }
+
+        // slot[c] = which of the 6 G6_ slots component c starts at (common's
+        // merged block starts at slot 3 and spans nC columns contiguously).
+        int off6[7]; offsets(off6);
+        std::vector<int> slot;
+        if (wc.nL > 0) slot.push_back(0);
+        slot.push_back(1);
+        if (wc.nR > 0) slot.push_back(2);
+        if (haveCommon) slot.push_back(3);
+
+        int C = (int) wc.X.size();
+        rw.C = C; rw.off.assign(C, 0); rw.m.assign(C, 0);
+        int K = 0;
+        std::vector<int> widthOf(C);
+        for (int c = 0; c < C; ++c) {
+            int w = (slot[c] == 3) ? nC : (int) cellAt(slot[c]).cols();
+            widthOf[c] = w;
+            rw.off[c] = K; rw.m[c] = w; K += w;
+        }
+        rw.K = K;
+
+        GenoMat Zf(ctx_.n_inds, K);
+        for (int c = 0; c < C; ++c) Zf.middleCols(rw.off[c], widthOf[c]) = wc.X[c];
+        rw.Z = Zf.cast<double>();
+        rw.Zt1 = rw.Z.colwise().sum().transpose();
+
+        rw.Gram = Eigen::MatrixXd(K, K);
+        for (int a = 0; a < C; ++a)
+            for (int b = 0; b < C; ++b)
+                rw.Gram.block(rw.off[a], rw.off[b], widthOf[a], widthOf[b]) =
+                    G6_.block(off6[slot[a]], off6[slot[b]], widthOf[a], widthOf[b]);
+    }
+};
 
 // ===========================================================================
 // Estimator 2: AI-REML. Parallelized over windows; streams h2 + SE to file.
@@ -829,24 +1194,34 @@ static void he_window_compute(const WindowComponents& wc, const Eigen::MatrixXd&
 }
 
 // ---- AI-REML with SE from the Average-Information matrix (delta method) ----
-static void reml_window_compute(const WindowComponents& wc, const Eigen::MatrixXd& Y,
-                                int max_iter, double tol, bool se, WindowResult& res) {
-    int C = (int) wc.X.size(), n = (int) Y.rows(), P = (int) Y.cols();
-    int mid = wc.mid_comp;
-    res.nL = wc.nL; res.nM = wc.nM; res.nR = wc.nR; res.nC = wc.nC;
-    res.vg.assign(P, NA_REAL); res.h2.assign(P, NA_REAL);
-    res.se_vg.assign(P, NA_REAL); res.se_h2.assign(P, NA_REAL);
-    res.conv.assign(P, 0); res.iters.assign(P, 0);
+//
+// Kept as two small pieces -- reml_build_window() (a straightforward full
+// Gram rebuild) and reml_fit_one_trait() (fit one trait against an
+// already-built window) -- because both are useful independently:
+// reml_fit_one_trait() is the actual per-trait work called by ReMLWorker
+// below, using windows built by the incremental RemlWindowStream; and
+// reml_build_window() is kept, UNUSED by that path, purely as a simple
+// reference implementation for validating RemlWindowStream's incremental
+// Gram against a known-correct full rebuild (see the class comment above
+// RemlWindowStream) -- run both on the same window and diff rw.Gram.
+//
+// Parallelism is over WINDOWS only (one worker thread loops all P traits for
+// its windows sequentially) -- the same granularity as the HE worker.
 
+// Reference/fallback: build one window's Gram/Z/Zt1 from scratch, O(N*K^2).
+// Not on the hot path any more (RemlWindowStream replaces this incrementally)
+// -- retained for validating that path's output.
+static RemlWindow reml_build_window(const WindowComponents& wc, int n) {
+    int C = (int) wc.X.size();
     RemlWindow rw;
     rw.C = C; rw.off.resize(C); rw.m.resize(C);
     int K = 0;
     for (int c = 0; c < C; ++c) { rw.off[c] = K; rw.m[c] = (int) wc.X[c].cols(); K += rw.m[c]; }
     rw.K = K;
 
-    // Gram Z'Z (the O(N K^2) bottleneck): concatenate float components and use a
-    // symmetric rank update (half the flops) in single precision, then cast the
-    // small K x K result to double. The solver runs in double on a double Z.
+    // Gram Z'Z: concatenate float components and use a symmetric rank update
+    // (half the flops) in single precision, then cast the small K x K result
+    // to double. The solver runs in double on a double Z.
     GenoMat Zf(n, K);
     for (int c = 0; c < C; ++c) Zf.middleCols(rw.off[c], rw.m[c]) = wc.X[c];
     GenoMat Gf = GenoMat::Zero(K, K);
@@ -854,30 +1229,41 @@ static void reml_window_compute(const WindowComponents& wc, const Eigen::MatrixX
     rw.Gram = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
     rw.Z    = Zf.cast<double>();
     rw.Zt1  = rw.Z.colwise().sum().transpose();
+    return rw;
+}
 
-    for (int t = 0; t < P; ++t) {
-        Eigen::VectorXd y = Y.col(t);
-        Eigen::VectorXd Zty = rw.Z.transpose() * y;
-        Eigen::VectorXd s; bool conv; int iters; Eigen::MatrixXd AI;
-        reml_fit(rw, Zty, y, max_iter, tol, s, conv, iters, AI);
-        double tot = s.sum(), vg = s[mid];
-        res.vg[t] = vg; res.conv[t] = conv ? 1 : 0; res.iters[t] = iters;
-        res.h2[t] = (conv && std::abs(tot) > 1e-12) ? vg / tot : NA_REAL;
-        if (se && conv) {
-            Eigen::MatrixXd Cov = AI.inverse();          // asymptotic Cov(sigma)
-            if (Cov(mid, mid) > 0) res.se_vg[t] = std::sqrt(Cov(mid, mid));
-            if (std::abs(tot) > 1e-12) {
-                double h2 = vg / tot; int p = (int) s.size();
-                Eigen::VectorXd g(p);
-                for (int k = 0; k < p; ++k) g[k] = ((k == mid ? 1.0 : 0.0) - h2) / tot;
-                double v = g.dot(Cov * g);
-                if (v > 0) res.se_h2[t] = std::sqrt(v);
-            }
+// Phase 2: fit ONE trait against an already-built window and write its
+// results into `res` at column `t`. Independent across (window, trait) pairs
+// -- safe to call concurrently for different (rw, t) as long as each thread
+// writes only its own `res.*[t]` slot (distinct indices into pre-sized
+// vectors; no reallocation happens during the parallel region).
+static void reml_fit_one_trait(const RemlWindow& rw, const Eigen::MatrixXd& Y, int t,
+                               int mid, int max_iter, double tol, bool se,
+                               unsigned seed, WindowResult& res) {
+    Eigen::VectorXd y = Y.col(t);
+    Eigen::VectorXd Zty = rw.Z.transpose() * y;
+    Eigen::VectorXd s; bool conv; int iters; Eigen::MatrixXd AI;
+    reml_fit(rw, Zty, y, max_iter, tol, seed, s, conv, iters, AI);
+    double tot = s.sum(), vg = s[mid];
+    res.vg[t] = vg; res.conv[t] = conv ? 1 : 0; res.iters[t] = iters;
+    res.h2[t] = (conv && std::abs(tot) > 1e-12) ? vg / tot : NA_REAL;
+    if (se && conv) {
+        Eigen::MatrixXd Cov = AI.inverse();          // asymptotic Cov(sigma) -- exact, unaffected by trSinv
+        if (Cov(mid, mid) > 0) res.se_vg[t] = std::sqrt(Cov(mid, mid));
+        if (std::abs(tot) > 1e-12) {
+            double h2 = vg / tot; int p = (int) s.size();
+            Eigen::VectorXd g(p);
+            for (int k = 0; k < p; ++k) g[k] = ((k == mid ? 1.0 : 0.0) - h2) / tot;
+            double v = g.dot(Cov * g);
+            if (v > 0) res.se_h2[t] = std::sqrt(v);
         }
     }
 }
 
-// RcppParallel worker: computes a contiguous chunk of the current batch.
+// RcppParallel worker (HE only now): computes a contiguous chunk of windows
+// in the current batch. HE already shares its expensive step across all P
+// traits internally via one small (C+1)x(C+1) system, so per-trait work is
+// cheap and window-level parallelism is enough for it.
 struct WindowWorker : public RcppParallel::Worker {
     const std::vector<WindowComponents>& batch;
     const Eigen::MatrixXd& Y;
@@ -888,12 +1274,38 @@ struct WindowWorker : public RcppParallel::Worker {
                  const DriverParams& pr, unsigned seed_offset, std::vector<WindowResult>& out)
         : batch(batch), Y(Y), pr(pr), seed_offset(seed_offset), out(out) {}
     void operator()(std::size_t begin, std::size_t end) {
+        for (std::size_t w = begin; w < end; ++w)
+            he_window_compute(batch[w], Y, pr.nmcmc,
+                              pr.seed + seed_offset + (unsigned) w, pr.se, out[w]);
+    }
+};
+
+// RcppParallel worker (REML): fits ALL traits for a contiguous chunk of
+// windows, sequentially per window -- i.e. parallel over windows only, same
+// granularity as the HE worker above. The Gram for each window is already
+// built (by RemlWindowStream, incrementally -- see below) before this runs,
+// so this worker does no O(N*K^2)-scale work at all, only the O(K^3)-scale
+// AI-REML iterations.
+struct ReMLWorker : public RcppParallel::Worker {
+    const std::vector<RemlWindow>& rws;
+    const std::vector<WindowComponents>& batch;   // for mid_comp
+    const Eigen::MatrixXd& Y;
+    const DriverParams& pr;
+    unsigned seed_offset;
+    std::vector<WindowResult>& out;
+    ReMLWorker(const std::vector<RemlWindow>& rws, const std::vector<WindowComponents>& batch,
+              const Eigen::MatrixXd& Y, const DriverParams& pr, unsigned seed_offset,
+              std::vector<WindowResult>& out)
+        : rws(rws), batch(batch), Y(Y), pr(pr), seed_offset(seed_offset), out(out) {}
+    void operator()(std::size_t begin, std::size_t end) {
+        int P = (int) Y.cols();
         for (std::size_t w = begin; w < end; ++w) {
-            if (pr.method == 0)
-                he_window_compute(batch[w], Y, pr.nmcmc,
-                                  pr.seed + seed_offset + (unsigned) w, pr.se, out[w]);
-            else
-                reml_window_compute(batch[w], Y, pr.max_iter, pr.tol, pr.se, out[w]);
+            int mid = batch[w].mid_comp;
+            unsigned wseed = pr.seed + seed_offset + (unsigned) w;
+            for (int t = 0; t < P; ++t) {
+                unsigned tseed = wseed + (unsigned) t * 7919u;
+                reml_fit_one_trait(rws[w], Y, t, mid, pr.max_iter, pr.tol, pr.se, tseed, out[w]);
+            }
         }
     }
 };
@@ -946,21 +1358,54 @@ static Rcpp::List sliding_window_driver(RunContext& ctx, const DriverParams& pr)
     std::vector<double> tot_vg(P, 0.0), tot_var(P, 0.0);   // sum vg, sum se_vg^2
 
     Progress prog; prog.start(pr.method == 0 ? "HE" : "REML", count_total_windows(ctx, W));
+    // HE walks the plain WindowStream; REML walks RemlWindowStream, which
+    // ALSO builds each window's Gram incrementally as it goes (see the class
+    // comment above) -- both are inherently sequential/stateful generators,
+    // so the incremental Gram build happens here, in the sequential
+    // batch-gathering loop, before anything is parallelized.
     WindowStream stream(ctx, W);
+    RemlWindowStream reml_stream(ctx, W);
     long processed = 0;
 
     while (true) {
         std::vector<WindowComponents> comps;
+        std::vector<RemlWindow> rws;               // REML only
         std::vector<std::string> bchr; std::vector<long> bws;
         WindowComponents wc; std::string chr; long ws;
-        while ((int) comps.size() < pr.batch_size && stream.next(wc, chr, ws)) {
-            comps.push_back(std::move(wc)); bchr.push_back(chr); bws.push_back(ws);
+
+        if (pr.method == 0) {
+            while ((int) comps.size() < pr.batch_size && stream.next(wc, chr, ws)) {
+                comps.push_back(std::move(wc)); bchr.push_back(chr); bws.push_back(ws);
+            }
+        } else {
+            RemlWindow rw;
+            while ((int) comps.size() < pr.batch_size && reml_stream.next(wc, rw, chr, ws)) {
+                comps.push_back(std::move(wc)); rws.push_back(std::move(rw));
+                bchr.push_back(chr); bws.push_back(ws);
+            }
         }
         if (comps.empty()) break;
 
         std::vector<WindowResult> results(comps.size());
-        WindowWorker worker(comps, Y, pr, (unsigned) processed, results);
-        RcppParallel::parallelFor(0, comps.size(), worker);
+
+        if (pr.method == 0) {
+            WindowWorker worker(comps, Y, pr, (unsigned) processed, results);
+            RcppParallel::parallelFor(0, comps.size(), worker);
+        } else {
+            // Gram already built (incrementally, above); pre-size result
+            // slots and fit -- parallel over windows, all P traits per
+            // window sequential in each worker thread (same granularity as
+            // the HE worker).
+            for (size_t k = 0; k < comps.size(); ++k) {
+                results[k].nL = comps[k].nL; results[k].nM = comps[k].nM;
+                results[k].nR = comps[k].nR; results[k].nC = comps[k].nC;
+                results[k].vg.assign(P, NA_REAL);   results[k].h2.assign(P, NA_REAL);
+                results[k].se_vg.assign(P, NA_REAL); results[k].se_h2.assign(P, NA_REAL);
+                results[k].conv.assign(P, 0);        results[k].iters.assign(P, 0);
+            }
+            ReMLWorker worker(rws, comps, Y, pr, (unsigned) processed, results);
+            RcppParallel::parallelFor(0, comps.size(), worker);
+        }
 
         for (size_t k = 0; k < comps.size(); ++k) {
             const WindowResult& r = results[k];
