@@ -108,3 +108,49 @@ he_reg_part <- function (filename, pheno, snp_cat, cat_names, block_size = 1000,
 
   return(hers)
 }
+
+#' Compute heritability based on sliding windows that account for flanking regions
+#'
+#' @export
+sliding_window <- function(filename, pheno, method = "HE", window_size = 1e3,
+                           common_filename = NULL, tol = 1e-3, nmcmc = 20,
+                           outfile) {
+
+  # Stadardize
+  for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
+  for (j in 3:ncol(pheno)) {
+    if (any(is.na(pheno[, j]))) {
+      pheno[which(is.na(pheno[, j])), j] <- mean(pheno[, j], na.rm = T)
+    }
+  }
+  # Create multivariate phenotype
+  multi <- pheno
+  colnames(multi) <- c("FID", "IID", "Pheno")
+
+  # HE regression on the phenotype
+  multi_he <- as.matrix(multi[, -c(1, 2), drop = FALSE])
+  rownames(multi_he) <- multi[, 2]
+
+  # HE
+  if (method == "HE") {
+    res <- he_sliding_window(
+      filename    = filename,
+      pheno_mat   = multi_he,
+      window_size = window_size,
+      nmcmc       = nmcmc,
+      common_filename = common_filename
+    )
+  }
+  if (method == "REML") {
+    res <- reml_sliding_window(
+      filename        = filename,
+      pheno_mat       = multi_he,
+      window_size     = window_size,
+      common_filename = common_filename,
+      max_iter        = 10,
+      tol             = tol
+    )
+  }
+
+  write.table(res$windows, outfile, col = TRUE, row = FALSE, quote = FALSE)
+}

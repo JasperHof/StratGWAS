@@ -41,12 +41,24 @@ he_multi_part_enrich <- function(filename, pheno_mat, snp_cat, cat_names, block_
     .Call(`_StratGWAS_he_multi_part_enrich`, filename, pheno_mat, snp_cat, cat_names, block_size, outfile)
 }
 
+he_multi_part_enrich_alpha <- function(filename, pheno_mat, snp_cat, cat_names, block_size, outfile, alpha_grid = as.numeric( c(-1.0, -0.75, -0.5, -0.25, 0.0))) {
+    .Call(`_StratGWAS_he_multi_part_enrich_alpha`, filename, pheno_mat, snp_cat, cat_names, block_size, outfile, alpha_grid)
+}
+
 he_multi <- function(genotypes, pheno) {
     .Call(`_StratGWAS_he_multi`, genotypes, pheno)
 }
 
 he_multi_part <- function(filename, pheno_mat, block_size) {
     .Call(`_StratGWAS_he_multi_part`, filename, pheno_mat, block_size)
+}
+
+he_sliding_window <- function(filename, pheno_mat, window_size = 1e6, common_filename = NULL, nmcmc = 20L) {
+    .Call(`_StratGWAS_he_sliding_window`, filename, pheno_mat, window_size, common_filename, nmcmc)
+}
+
+reml_sliding_window <- function(filename, pheno_mat, window_size = 1e6, common_filename = NULL, max_iter = 100L, tol = 1e-4) {
+    .Call(`_StratGWAS_reml_sliding_window`, filename, pheno_mat, window_size, common_filename, max_iter, tol)
 }
 
 computeLDscoresFromBED <- function(file_prefix, geno_set) {

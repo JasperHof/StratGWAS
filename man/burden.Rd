@@ -12,7 +12,7 @@ burden(
   target_mac_per_ind = NULL,
   out_file = NULL,
   write_buffer_genes = 500,
-  effects_file = NULL,
+  effects_file = "",
   write_burden_scores = TRUE
 )
 }

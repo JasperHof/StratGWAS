@@ -161,6 +161,23 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// he_multi_part_enrich_alpha
+Rcpp::List he_multi_part_enrich_alpha(const std::string& filename, const SEXP pheno_mat, const IntegerMatrix snp_cat, const CharacterVector cat_names, int block_size, const std::string& outfile, Rcpp::NumericVector alpha_grid);
+RcppExport SEXP _StratGWAS_he_multi_part_enrich_alpha(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP snp_catSEXP, SEXP cat_namesSEXP, SEXP block_sizeSEXP, SEXP outfileSEXP, SEXP alpha_gridSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
+    Rcpp::traits::input_parameter< const IntegerMatrix >::type snp_cat(snp_catSEXP);
+    Rcpp::traits::input_parameter< const CharacterVector >::type cat_names(cat_namesSEXP);
+    Rcpp::traits::input_parameter< int >::type block_size(block_sizeSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type outfile(outfileSEXP);
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type alpha_grid(alpha_gridSEXP);
+    rcpp_result_gen = Rcpp::wrap(he_multi_part_enrich_alpha(filename, pheno_mat, snp_cat, cat_names, block_size, outfile, alpha_grid));
+    return rcpp_result_gen;
+END_RCPP
+}
 // he_multi
 Rcpp::NumericMatrix he_multi(const Eigen::MatrixXd& genotypes, const Rcpp::NumericMatrix& pheno);
 RcppExport SEXP _StratGWAS_he_multi(SEXP genotypesSEXP, SEXP phenoSEXP) {
@@ -183,6 +200,37 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
     Rcpp::traits::input_parameter< int >::type block_size(block_sizeSEXP);
     rcpp_result_gen = Rcpp::wrap(he_multi_part(filename, pheno_mat, block_size));
+    return rcpp_result_gen;
+END_RCPP
+}
+// he_sliding_window
+Rcpp::List he_sliding_window(const std::string& filename, const SEXP pheno_mat, double window_size, Rcpp::Nullable<Rcpp::String> common_filename, int nmcmc);
+RcppExport SEXP _StratGWAS_he_sliding_window(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP window_sizeSEXP, SEXP common_filenameSEXP, SEXP nmcmcSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
+    Rcpp::traits::input_parameter< double >::type window_size(window_sizeSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::String> >::type common_filename(common_filenameSEXP);
+    Rcpp::traits::input_parameter< int >::type nmcmc(nmcmcSEXP);
+    rcpp_result_gen = Rcpp::wrap(he_sliding_window(filename, pheno_mat, window_size, common_filename, nmcmc));
+    return rcpp_result_gen;
+END_RCPP
+}
+// reml_sliding_window
+Rcpp::List reml_sliding_window(const std::string& filename, const SEXP pheno_mat, double window_size, Rcpp::Nullable<Rcpp::String> common_filename, int max_iter, double tol);
+RcppExport SEXP _StratGWAS_reml_sliding_window(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP window_sizeSEXP, SEXP common_filenameSEXP, SEXP max_iterSEXP, SEXP tolSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
+    Rcpp::traits::input_parameter< double >::type window_size(window_sizeSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::String> >::type common_filename(common_filenameSEXP);
+    Rcpp::traits::input_parameter< int >::type max_iter(max_iterSEXP);
+    Rcpp::traits::input_parameter< double >::type tol(tolSEXP);
+    rcpp_result_gen = Rcpp::wrap(reml_sliding_window(filename, pheno_mat, window_size, common_filename, max_iter, tol));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -269,8 +317,11 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_compute_maf_all", (DL_FUNC) &_StratGWAS_compute_maf_all, 1},
     {"_StratGWAS_he", (DL_FUNC) &_StratGWAS_he, 2},
     {"_StratGWAS_he_multi_part_enrich", (DL_FUNC) &_StratGWAS_he_multi_part_enrich, 6},
+    {"_StratGWAS_he_multi_part_enrich_alpha", (DL_FUNC) &_StratGWAS_he_multi_part_enrich_alpha, 7},
     {"_StratGWAS_he_multi", (DL_FUNC) &_StratGWAS_he_multi, 2},
     {"_StratGWAS_he_multi_part", (DL_FUNC) &_StratGWAS_he_multi_part, 3},
+    {"_StratGWAS_he_sliding_window", (DL_FUNC) &_StratGWAS_he_sliding_window, 5},
+    {"_StratGWAS_reml_sliding_window", (DL_FUNC) &_StratGWAS_reml_sliding_window, 6},
     {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 2},
     {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},
     {"_StratGWAS_linear_gwas_parallel", (DL_FUNC) &_StratGWAS_linear_gwas_parallel, 4},
