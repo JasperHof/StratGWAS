@@ -86,51 +86,57 @@ static int lower_index(const std::vector<long>& bp, int lo, int hi, long value) 
     return (int)(it - b);
 }
 
-// Column-standardize an Eigen matrix in place: missing (== -1) -> column mean,
-// then centre and scale to unit variance (denominator n-1). Monomorphic
-// columns are set to zero.
-static void standardize_columns(Eigen::MatrixXd& X) {
+// Genotypes are stored in SINGLE precision (float) -- they are small integers
+// (0/1/2, standardized to ~unit variance), and the big genotype matrix products
+// dominate memory bandwidth at biobank N. float halves the bandwidth and
+// doubles SIMD width (~2x). All *reductions* (means, variances, traces, dot
+// products over N) are still accumulated in double to avoid loss of precision.
+typedef Eigen::MatrixXf GenoMat;
+
+// Column-standardize a genotype matrix in place: missing (== -1) -> column mean,
+// then centre and scale to unit variance (denominator n-1); monomorphic columns
+// -> 0. Mean/variance are accumulated in double; only the stored values are float.
+static void standardize_columns(GenoMat& X) {
+    const int n = (int) X.rows();
     for (int col = 0; col < X.cols(); ++col) {
-        Eigen::VectorXd v = X.col(col);
         double sum = 0.0; int n_valid = 0;
-        for (int i = 0; i < v.size(); ++i)
-            if (v[i] != -1) { sum += v[i]; ++n_valid; }
+        for (int i = 0; i < n; ++i) { float g = X(i, col); if (g != -1.f) { sum += g; ++n_valid; } }
         if (n_valid == 0) { X.col(col).setZero(); continue; }
         double mean = sum / n_valid;
         double sq_sum = 0.0;
-        for (int i = 0; i < v.size(); ++i) {
-            if (v[i] == -1) v[i] = mean;             // mean-impute
-            sq_sum += (v[i] - mean) * (v[i] - mean);
+        for (int i = 0; i < n; ++i) { double g = (X(i, col) == -1.f) ? mean : (double) X(i, col); sq_sum += (g - mean) * (g - mean); }
+        double stddev = std::sqrt(sq_sum / (n - 1));
+        if (stddev > 1e-10) {
+            for (int i = 0; i < n; ++i) { double g = (X(i, col) == -1.f) ? mean : (double) X(i, col); X(i, col) = (float)((g - mean) / stddev); }
+        } else {
+            X.col(col).setZero();                    // monomorphic
         }
-        double stddev = std::sqrt(sq_sum / (v.size() - 1));
-        if (stddev > 1e-10) X.col(col) = (v.array() - mean) / stddev;
-        else                X.col(col).setZero();    // monomorphic
     }
 }
 
 // Read a contiguous SNP range from a .bed, subset to `keep_rows` individuals,
-// return an (n_keep x n_cols) double matrix with missing preserved as -1.
-static Eigen::MatrixXd read_geno_double(const std::string& bed_prefix,
-                                        int n_total_inds, int n_snps,
-                                        const std::vector<int>& keep_rows,
-                                        int snp_lo, int snp_hi) {
+// return an (n_keep x n_cols) float matrix with missing preserved as -1.
+static GenoMat read_geno_float(const std::string& bed_prefix,
+                               int n_total_inds, int n_snps,
+                               const std::vector<int>& keep_rows,
+                               int snp_lo, int snp_hi) {
     int n_cols = snp_hi - snp_lo + 1;
     int n_keep = (int) keep_rows.size();
-    Eigen::MatrixXd X(n_keep, n_cols);
+    GenoMat X(n_keep, n_cols);
     if (n_cols <= 0) return X;
     IntegerMatrix block = readBedBlock(
         bed_prefix + ".bed", n_total_inds, n_snps,
         0, n_total_inds - 1, snp_lo, snp_hi);
     for (int i = 0; i < n_keep; ++i)
         for (int j = 0; j < n_cols; ++j)
-            X(i, j) = block(keep_rows[i], j);
+            X(i, j) = (float) block(keep_rows[i], j);
     return X;
 }
 
 // Standardized genotype components for one middle window.
 struct WindowComponents {
-    std::vector<std::string>     label;   // "left","middle","right","common"
-    std::vector<Eigen::MatrixXd> X;       // standardized genotypes per component
+    std::vector<std::string> label;      // "left","middle","right","common"
+    std::vector<GenoMat>     X;          // standardized genotypes per component (float)
     int mid_comp;                          // index of the middle component (-1 = skip)
     int nL, nM, nR, nC;                    // SNP counts
 };
@@ -139,15 +145,15 @@ struct WindowComponents {
 // fileset whose bp fall in [cell_start, cell_start + W) on chromosome index
 // range [lo, hi]. Returns an (n_keep x m) matrix (m may be 0). This is the unit
 // that the rolling WindowStream caches and shifts so each cell is read once.
-static Eigen::MatrixXd read_cell(const std::string& prefix, int n_total, int n_snps,
-                                 const BimInfo& bim, const std::vector<int>& keep,
-                                 int lo, int hi, long cell_start, long W) {
-    if (lo < 0 || hi < lo) return Eigen::MatrixXd(keep.size(), 0);
+static GenoMat read_cell(const std::string& prefix, int n_total, int n_snps,
+                         const BimInfo& bim, const std::vector<int>& keep,
+                         int lo, int hi, long cell_start, long W) {
+    if (lo < 0 || hi < lo) return GenoMat(keep.size(), 0);
     int i0 = lower_index(bim.bp, lo, hi, cell_start);
     int i1 = lower_index(bim.bp, lo, hi, cell_start + W);   // one past
     int m = i1 - i0;
-    if (m <= 0) return Eigen::MatrixXd(keep.size(), 0);
-    Eigen::MatrixXd X = read_geno_double(prefix, n_total, n_snps, keep, i0, i1 - 1);
+    if (m <= 0) return GenoMat(keep.size(), 0);
+    GenoMat X = read_geno_float(prefix, n_total, n_snps, keep, i0, i1 - 1);
     standardize_columns(X);
     return X;
 }
@@ -317,15 +323,15 @@ private:
     bool have_chrom_;
     int c_lo_, c_hi_, cc_lo_, cc_hi_;
     long g_, glast_;
-    Eigen::MatrixXd wesL_, wesM_, wesR_;     // cells g-1, g, g+1 (WES)
-    Eigen::MatrixXd comL_, comM_, comR_;     // cells g-1, g, g+1 (common)
+    GenoMat wesL_, wesM_, wesR_;     // cells g-1, g, g+1 (WES)
+    GenoMat comL_, comM_, comR_;     // cells g-1, g, g+1 (common)
 
-    Eigen::MatrixXd wesCell(long cell) const {
+    GenoMat wesCell(long cell) const {
         return read_cell(ctx_.wes_prefix, ctx_.wes_n_total, ctx_.wes_n_snps,
                          ctx_.wes_bim, ctx_.geno_keep, c_lo_, c_hi_, cell * W_, W_);
     }
-    Eigen::MatrixXd comCell(long cell) const {
-        if (!ctx_.use_common) return Eigen::MatrixXd(ctx_.n_inds, 0);
+    GenoMat comCell(long cell) const {
+        if (!ctx_.use_common) return GenoMat(ctx_.n_inds, 0);
         return read_cell(ctx_.common_prefix, ctx_.common_n_total, ctx_.common_n_snps,
                          ctx_.common_bim, ctx_.common_keep, cc_lo_, cc_hi_, cell * W_, W_);
     }
@@ -360,7 +366,7 @@ private:
         int nC = (int) comL_.cols() + (int) comM_.cols() + (int) comR_.cols();
         wc.nC = nC;
         if (ctx_.use_common && nC > 0) {
-            Eigen::MatrixXd Xc(ctx_.n_inds, nC);
+            GenoMat Xc(ctx_.n_inds, nC);
             int off = 0;
             if (comL_.cols() > 0) { Xc.middleCols(off, comL_.cols()) = comL_; off += comL_.cols(); }
             if (comM_.cols() > 0) { Xc.middleCols(off, comM_.cols()) = comM_; off += comM_.cols(); }
@@ -723,27 +729,29 @@ struct WindowResult {
     std::vector<int> conv, iters;            // REML only
 };
 
-// Apply Sigma = sum_c (sig[c]/M[c]) X_c X_c' + sig[C] I to a vector (matrix-free).
-static inline Eigen::VectorXd apply_Sigma(const std::vector<Eigen::MatrixXd>& X,
-                                          const std::vector<double>& M,
-                                          const Eigen::VectorXd& sig,
-                                          const Eigen::VectorXd& v) {
+// Apply Sigma = sum_c (sig[c]/M[c]) X_c X_c' + sig[C] I to a block of probe
+// vectors (columns), in float. All big products are float GEMMs.
+static inline GenoMat apply_Sigma_mat(const std::vector<GenoMat>& X,
+                                      const std::vector<double>& M,
+                                      const Eigen::VectorXd& sig, const GenoMat& Zb) {
     int C = (int) X.size();
-    Eigen::VectorXd o = sig[C] * v;
+    GenoMat o = (float) sig[C] * Zb;
     for (int c = 0; c < C; ++c)
-        o.noalias() += (sig[c] / M[c]) * (X[c] * (X[c].transpose() * v));
+        o.noalias() += (float)(sig[c] / M[c]) * (X[c] * (X[c].transpose() * Zb));
     return o;
 }
-// Apply the c-th GRM K_c = X_c X_c'/M_c (or the identity for c == C) to a vector.
-static inline Eigen::VectorXd apply_K(const std::vector<Eigen::MatrixXd>& X,
-                                      const std::vector<double>& M,
-                                      int c, const Eigen::VectorXd& v) {
-    if (c == (int) X.size()) return v;
-    return (X[c] * (X[c].transpose() * v)) / M[c];
+// Apply K_c = X_c X_c'/M_c (identity for c == C) to a block of probe vectors.
+static inline GenoMat apply_K_mat(const std::vector<GenoMat>& X,
+                                  const std::vector<double>& M,
+                                  int c, const GenoMat& Zb) {
+    if (c == (int) X.size()) return Zb;
+    return (X[c] * (X[c].transpose() * Zb)) / (float) M[c];
 }
 
 // ---- HE (randomized method of moments) with moment-based standard errors ----
-// Thread-safe: probes use a per-window std::mt19937 seeded from `seed`.
+// Thread-safe: probes use a per-window std::mt19937 seeded from `seed`. All
+// genotype products are single-precision GEMMs with the B probes batched into
+// one matrix; the moment matrix, q, and Cov(q) are accumulated in double.
 static void he_window_compute(const WindowComponents& wc, const Eigen::MatrixXd& Y,
                               int nmcmc, unsigned seed, bool se, WindowResult& res) {
     int C = (int) wc.X.size(), env = C, n = (int) Y.rows(), P = (int) Y.cols();
@@ -754,27 +762,36 @@ static void he_window_compute(const WindowComponents& wc, const Eigen::MatrixXd&
 
     std::vector<double> M(C);
     for (int c = 0; c < C; ++c) M[c] = (double) wc.X[c].cols();
-    std::vector<Eigen::MatrixXd> XtY(C);
-    for (int c = 0; c < C; ++c) XtY[c] = wc.X[c].transpose() * Y;
 
-    // Moment matrix T (tr(K_i K_j)), residual last; GRM-GRM traces stochastic.
+    GenoMat Yf = Y.cast<float>();                        // phenotype in float
+    std::vector<GenoMat> XtY(C);
     Eigen::MatrixXd T = Eigen::MatrixXd::Zero(C + 1, C + 1);
-    for (int c = 0; c < C; ++c) { double tr = wc.X[c].squaredNorm() / M[c]; T(c, env) = tr; T(env, c) = tr; }
-    T(env, env) = n;
-    std::mt19937 rng(seed);
-    std::normal_distribution<double> nd(0.0, 1.0);
-    for (int r = 0; r < nmcmc; ++r) {
-        Eigen::VectorXd z(n); for (int i = 0; i < n; ++i) z[i] = nd(rng);
-        std::vector<Eigen::VectorXd> Gz(C);
-        for (int c = 0; c < C; ++c) { Eigen::VectorXd t = wc.X[c].transpose() * z; Gz[c] = (wc.X[c] * t) / M[c]; }
-        for (int a = 0; a < C; ++a) for (int b = a; b < C; ++b) T(a, b) += Gz[a].dot(Gz[b]);
+    for (int c = 0; c < C; ++c) {
+        XtY[c] = wc.X[c].transpose() * Yf;               // m_c x P (float)
+        double tr = wc.X[c].colwise().squaredNorm().cast<double>().sum() / M[c];  // tr(G_c) exact, double
+        T(c, env) = tr; T(env, c) = tr;
     }
-    for (int a = 0; a < C; ++a) for (int b = a; b < C; ++b) { T(a, b) /= nmcmc; T(b, a) = T(a, b); }
+    T(env, env) = n;
+
+    // Batched probes: one N x B float matrix -> two GEMMs per component.
+    int B = nmcmc;
+    GenoMat Z(n, B);
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (int p = 0; p < B; ++p) for (int i = 0; i < n; ++i) Z(i, p) = nd(rng);
+    std::vector<GenoMat> Gz(C);
+    for (int c = 0; c < C; ++c) Gz[c] = (wc.X[c] * (wc.X[c].transpose() * Z)) / (float) M[c];
+    for (int a = 0; a < C; ++a)
+        for (int b = a; b < C; ++b) {
+            double t = 0.0;
+            for (int p = 0; p < B; ++p) t += (double) Gz[a].col(p).dot(Gz[b].col(p));
+            T(a, b) = t / B; T(b, a) = T(a, b);          // tr(K_a K_b), double-accumulated
+        }
     Eigen::MatrixXd Tinv = T.inverse();
 
     for (int t = 0; t < P; ++t) {
         Eigen::VectorXd q(C + 1);
-        for (int c = 0; c < C; ++c) q[c] = XtY[c].col(t).squaredNorm() / M[c];
+        for (int c = 0; c < C; ++c) q[c] = XtY[c].col(t).cast<double>().squaredNorm() / M[c];
         q[env] = Y.col(t).squaredNorm();
         Eigen::VectorXd sigma = Tinv * q;
         double tot = sigma.sum(), vg = sigma[mid];
@@ -782,22 +799,22 @@ static void he_window_compute(const WindowComponents& wc, const Eigen::MatrixXd&
         res.h2[t] = (std::abs(tot) > 1e-12) ? vg / tot : NA_REAL;
         if (!se) continue;                               // skip the expensive SE pass
 
-        // SE: Cov(sigma) = Tinv Cov(q) Tinv, Cov(q)_ij = 2 tr(K_i Sigma K_j Sigma),
-        // with Sigma the plug-in fitted covariance. Traces estimated by probes.
-        Eigen::MatrixXd Covq = Eigen::MatrixXd::Zero(C + 1, C + 1);
-        std::mt19937 rng2(seed + 2654435761u * (unsigned)(t + 1));
-        std::normal_distribution<double> nd2(0.0, 1.0);
-        for (int r = 0; r < nmcmc; ++r) {
-            Eigen::VectorXd z(n); for (int i = 0; i < n; ++i) z[i] = nd2(rng2);
-            Eigen::VectorXd u = apply_Sigma(wc.X, M, sigma, z);
-            std::vector<Eigen::VectorXd> kiz(C + 1), skju(C + 1);
-            for (int l = 0; l <= C; ++l) {
-                kiz[l]  = apply_K(wc.X, M, l, z);
-                skju[l] = apply_Sigma(wc.X, M, sigma, apply_K(wc.X, M, l, u));
+        // SE: Cov(sigma) = Tinv Cov(q) Tinv, Cov(q)_ij = 2 tr(K_i Sigma K_j Sigma).
+        // Reuse the probe block Z and Gz (= K_i z). Batched float; double sums.
+        GenoMat u = apply_Sigma_mat(wc.X, M, sigma, Z);          // Sigma z
+        std::vector<GenoMat> skju(C + 1);
+        for (int l = 0; l <= C; ++l)
+            skju[l] = apply_Sigma_mat(wc.X, M, sigma, apply_K_mat(wc.X, M, l, u));
+        Eigen::MatrixXd Covq(C + 1, C + 1);
+        for (int i = 0; i <= C; ++i) {
+            const GenoMat& kizi = (i < C) ? Gz[i] : Z;          // K_i z (identity for residual)
+            for (int j = 0; j <= C; ++j) {
+                double v = 0.0;
+                for (int p = 0; p < B; ++p) v += (double) kizi.col(p).dot(skju[j].col(p));
+                Covq(i, j) = v;
             }
-            for (int i = 0; i <= C; ++i) for (int j = 0; j <= C; ++j) Covq(i, j) += kiz[i].dot(skju[j]);
         }
-        Covq = (Covq / nmcmc) * 2.0;
+        Covq = (Covq / B) * 2.0;
         Covq = (0.5 * (Covq + Covq.transpose())).eval();
         Eigen::MatrixXd Cov = Tinv * Covq * Tinv;
         if (Cov(mid, mid) > 0) res.se_vg[t] = std::sqrt(Cov(mid, mid));
@@ -826,9 +843,16 @@ static void reml_window_compute(const WindowComponents& wc, const Eigen::MatrixX
     int K = 0;
     for (int c = 0; c < C; ++c) { rw.off[c] = K; rw.m[c] = (int) wc.X[c].cols(); K += rw.m[c]; }
     rw.K = K;
-    rw.Z.resize(n, K);
-    for (int c = 0; c < C; ++c) rw.Z.middleCols(rw.off[c], rw.m[c]) = wc.X[c];
-    rw.Gram = rw.Z.transpose() * rw.Z;
+
+    // Gram Z'Z (the O(N K^2) bottleneck): concatenate float components and use a
+    // symmetric rank update (half the flops) in single precision, then cast the
+    // small K x K result to double. The solver runs in double on a double Z.
+    GenoMat Zf(n, K);
+    for (int c = 0; c < C; ++c) Zf.middleCols(rw.off[c], rw.m[c]) = wc.X[c];
+    GenoMat Gf = GenoMat::Zero(K, K);
+    Gf.selfadjointView<Eigen::Upper>().rankUpdate(Zf.transpose());   // Gf = Zf' Zf (upper)
+    rw.Gram = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
+    rw.Z    = Zf.cast<double>();
     rw.Zt1  = rw.Z.colwise().sum().transpose();
 
     for (int t = 0; t < P; ++t) {
