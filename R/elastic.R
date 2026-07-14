@@ -84,7 +84,7 @@ he_reg <- function(pheno, filename) {
   return(her)
 }
 
-#' Perform randomized double-partitioned Haseman-Elston regression
+#' Perform randomized double-partitioned Haseman-Elston regression for enrichment analysis
 #'
 #' @export
 he_reg_part <- function (filename, pheno, snp_cat, cat_names, block_size = 1000, outfile) {
@@ -107,6 +107,39 @@ he_reg_part <- function (filename, pheno, snp_cat, cat_names, block_size = 1000,
   hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
 
   return(hers)
+}
+
+#' Perform randomized double-partitioned Haseman-Elston regression for enrichment analysis AND alpha estimation
+#' Alpha from -1, -.75, -.5, -.25, 0, by default (and can't change in current implementation)
+#'
+#' @export
+he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, block_size = 1000, outfile) {
+
+  # Stadardize
+  for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
+  for (j in 3:ncol(pheno)) {
+    if (any(is.na(pheno[, j]))) {
+      pheno[which(is.na(pheno[, j])), j] <- mean(pheno[, j], na.rm = T)
+    }
+  }
+  # Create multivariate phenotype
+  multi <- pheno
+  colnames(multi) <- c("FID", "IID", "Pheno")
+
+  # HE regression on the phenotype
+  multi_he <- as.matrix(multi[, -c(1, 2), drop = FALSE])
+  rownames(multi_he) <- multi[, 2]
+
+  #hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
+  hers <- he_multi_part_enrich_alpha(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
+  
+  # hers$genome_h2 contains the genome estimates per alpha
+  # hers$$best_alpha contains best alpha based on Frobenius norm
+  
+  info <- cbind(rownames(hers$genome_h2), hers$genome_h2, hers$genome_se, hers$fit_score, hers$best_alpha)
+  rownames(info) <- colnames(info) <- NULL
+
+  return(info)
 }
 
 #' Compute heritability based on sliding windows that account for flanking regions

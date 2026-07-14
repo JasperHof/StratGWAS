@@ -2,10 +2,10 @@
 % Please edit documentation in R/elastic.R
 \name{he_reg_part}
 \alias{he_reg_part}
-\title{Perform randomized double-partitioned Haseman-Elston regression}
+\title{Perform randomized double-partitioned Haseman-Elston regression for enrichment analysis}
 \usage{
 he_reg_part(filename, pheno, snp_cat, cat_names, block_size = 1000, outfile)
 }
 \description{
-Perform randomized double-partitioned Haseman-Elston regression
+Perform randomized double-partitioned Haseman-Elston regression for enrichment analysis
 }
