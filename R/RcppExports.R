@@ -53,12 +53,12 @@ he_multi_part <- function(filename, pheno_mat, block_size) {
     .Call(`_StratGWAS_he_multi_part`, filename, pheno_mat, block_size)
 }
 
-he_sliding_window <- function(filename, pheno_mat, window_size = 1e6, common_filename = NULL, nmcmc = 20L) {
-    .Call(`_StratGWAS_he_sliding_window`, filename, pheno_mat, window_size, common_filename, nmcmc)
+he_sliding_window <- function(filename, pheno_mat, window_size = 1e6, common_filename = NULL, nmcmc = 20L, se = TRUE, out_file = "", batch_size = 64L, n_threads = 0L, seed = 12345L) {
+    .Call(`_StratGWAS_he_sliding_window`, filename, pheno_mat, window_size, common_filename, nmcmc, se, out_file, batch_size, n_threads, seed)
 }
 
-reml_sliding_window <- function(filename, pheno_mat, window_size = 1e6, common_filename = NULL, max_iter = 100L, tol = 1e-4) {
-    .Call(`_StratGWAS_reml_sliding_window`, filename, pheno_mat, window_size, common_filename, max_iter, tol)
+reml_sliding_window <- function(filename, pheno_mat, window_size = 1e6, common_filename = NULL, max_iter = 100L, tol = 1e-4, se = TRUE, out_file = "", batch_size = 16L, n_threads = 0L, seed = 12345L) {
+    .Call(`_StratGWAS_reml_sliding_window`, filename, pheno_mat, window_size, common_filename, max_iter, tol, se, out_file, batch_size, n_threads, seed)
 }
 
 computeLDscoresFromBED <- function(file_prefix, geno_set) {

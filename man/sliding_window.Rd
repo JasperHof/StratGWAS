@@ -12,7 +12,8 @@ sliding_window(
   common_filename = NULL,
   tol = 0.001,
   nmcmc = 20,
-  outfile
+  outfile,
+  se = FALSE
 )
 }
 \description{

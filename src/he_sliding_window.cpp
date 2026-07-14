@@ -1,6 +1,8 @@
 // [[Rcpp::depends(RcppEigen)]]
+// [[Rcpp::depends(RcppParallel)]]
 #include <RcppEigen.h>
 #include <Rcpp.h>
+#include <RcppParallel.h>
 #include "readBedBlock.h"
 #include "geno_utils.h"
 #include <vector>
@@ -11,6 +13,9 @@
 #include <limits>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <random>
+#include <cmath>
 
 using namespace Rcpp;
 
@@ -443,117 +448,39 @@ struct Progress {
     }
 };
 
+// Parameters passed to the shared parallel + streaming driver (defined at the
+// end of the file, after the per-window compute functions).
+struct DriverParams {
+    long W; int method;                    // method: 0 = HE, 1 = REML
+    int nmcmc; int max_iter; double tol;
+    bool se;                               // compute standard errors?
+    std::string out_file; int batch_size; int n_threads; unsigned seed;
+};
+static Rcpp::List sliding_window_driver(RunContext& ctx, const DriverParams& pr);
+
 // ===========================================================================
-// Estimator 1: randomized Haseman-Elston (method of moments), multi-trait.
+// Estimator 1: randomized Haseman-Elston (method of moments). Parallelized over
+// windows; streams per-window h2 + SE to `out_file` while running.
 // ===========================================================================
 // [[Rcpp::export]]
 Rcpp::List he_sliding_window(const std::string& filename,
                              const SEXP pheno_mat,
                              double window_size = 1e6,
                              Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
-                             int nmcmc = 20) {
-
-    const long W = (long) window_size;
-    if (W <= 0) stop("window_size must be positive");
-
+                             int nmcmc = 20,
+                             bool se = true,
+                             std::string out_file = "",
+                             int batch_size = 64,
+                             int n_threads = 0,
+                             int seed = 12345) {
+    if (window_size <= 0) stop("window_size must be positive");
     RunContext ctx = setup_context(filename, pheno_mat, common_filename);
-    const int n_inds = ctx.n_inds, n_pheno = ctx.n_pheno;
-    const Eigen::MatrixXd& Y = ctx.Y;
-
-    std::vector<std::string> out_chr;
-    std::vector<double> out_start, out_end;
-    std::vector<int> out_nL, out_nM, out_nR, out_nC;
-    std::vector< std::vector<double> > out_vg(n_pheno), out_h2(n_pheno);
-    std::vector<NumericMatrix> gencov_list;
-
-    Progress prog; prog.start("HE", count_total_windows(ctx, W));
-
-    WindowStream stream(ctx, W);
-    WindowComponents wc; std::string chr; long w_start;
-    while (stream.next(wc, chr, w_start)) {
-            prog.tick(chr, wc.nM);
-            Rcpp::checkUserInterrupt();
-
-            int C = (int) wc.X.size();
-            int env = C;
-            std::vector<double> M(C);
-            for (int c = 0; c < C; ++c) M[c] = (double) wc.X[c].cols();
-
-            std::vector<Eigen::MatrixXd> XtY(C);
-            for (int c = 0; c < C; ++c) XtY[c] = wc.X[c].transpose() * Y;
-
-            // Moment matrix S (C+1), residual last.
-            Eigen::MatrixXd S = Eigen::MatrixXd::Zero(C + 1, C + 1);
-            for (int c = 0; c < C; ++c) {
-                double trGc = wc.X[c].squaredNorm() / M[c];   // tr(G_c) exact
-                S(c, env) = trGc; S(env, c) = trGc;
-            }
-            S(env, env) = n_inds;                             // tr(I) = N
-
-            for (int r = 0; r < nmcmc; ++r) {
-                NumericVector z_r = rnorm(n_inds, 0.0, 1.0);
-                Eigen::VectorXd z = Eigen::Map<Eigen::VectorXd>(z_r.begin(), n_inds);
-                std::vector<Eigen::VectorXd> Gz(C);
-                for (int c = 0; c < C; ++c) {
-                    Eigen::VectorXd t = wc.X[c].transpose() * z;
-                    Gz[c] = (wc.X[c] * t) / M[c];
-                }
-                for (int a = 0; a < C; ++a)
-                    for (int b = a; b < C; ++b)
-                        S(a, b) += Gz[a].dot(Gz[b]);          // tr(G_a G_b)
-            }
-            for (int a = 0; a < C; ++a)
-                for (int b = a; b < C; ++b) { S(a, b) /= nmcmc; S(b, a) = S(a, b); }
-
-            Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(S);
-
-            NumericMatrix gencov(n_pheno, n_pheno);
-            std::vector<double> vg_diag(n_pheno, NA_REAL), h2_diag(n_pheno, NA_REAL);
-            for (int i = 0; i < n_pheno; ++i)
-                for (int j = i; j < n_pheno; ++j) {
-                    Eigen::VectorXd q(C + 1);
-                    for (int c = 0; c < C; ++c)
-                        q[c] = XtY[c].col(i).dot(XtY[c].col(j)) / M[c];
-                    q[env] = Y.col(i).dot(Y.col(j));
-                    Eigen::VectorXd sigma = qr.solve(q);
-                    double mid = sigma[wc.mid_comp];
-                    gencov(i, j) = mid;
-                    if (i != j) gencov(j, i) = mid;
-                    if (i == j) {
-                        double tot = sigma.sum();
-                        vg_diag[i] = mid;
-                        h2_diag[i] = (std::abs(tot) > 1e-12) ? mid / tot : NA_REAL;
-                    }
-                }
-
-            out_chr.push_back(chr);
-            out_start.push_back((double)(w_start));
-            out_end.push_back((double)(w_start + W));
-            out_nL.push_back(wc.nL); out_nM.push_back(wc.nM);
-            out_nR.push_back(wc.nR); out_nC.push_back(wc.nC);
-            for (int i = 0; i < n_pheno; ++i) {
-                out_vg[i].push_back(vg_diag[i]);
-                out_h2[i].push_back(h2_diag[i]);
-            }
-            gencov_list.push_back(gencov);
-    }
-
-    int n_win = (int) out_chr.size();
-    Rcout << "Windows estimated: " << n_win << "\n";
-
-    List df;
-    df["chr"] = wrap(out_chr); df["start"] = wrap(out_start); df["end"] = wrap(out_end);
-    df["n_left"] = wrap(out_nL); df["n_middle"] = wrap(out_nM); df["n_right"] = wrap(out_nR);
-    if (ctx.use_common) df["n_common"] = wrap(out_nC);
-    for (int i = 0; i < n_pheno; ++i) {
-        std::string nm = as<std::string>(ctx.trait_names[i]);
-        df["vg_mid_" + nm] = wrap(out_vg[i]);
-        df["h2_mid_" + nm] = wrap(out_h2[i]);
-    }
-    finalize_dataframe(df, n_win);
-
-    return List::create(_["windows"] = df, _["gencov"] = gencov_list,
-                        _["trait_names"] = ctx.trait_names, _["method"] = "HE");
+    DriverParams pr;
+    pr.W = (long) window_size; pr.method = 0;
+    pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se;
+    pr.out_file = out_file; pr.batch_size = batch_size;
+    pr.n_threads = n_threads; pr.seed = (unsigned) seed;
+    return sliding_window_driver(ctx, pr);
 }
 
 // ===========================================================================
@@ -714,13 +641,15 @@ static RemlEval reml_eval(const RemlWindow& W, const Eigen::VectorXd& Zty,
 // Negative components are floored to keep S positive definite.
 static void reml_fit(const RemlWindow& W, const Eigen::VectorXd& Zty,
                      const Eigen::VectorXd& y, int max_iter, double tol,
-                     Eigen::VectorXd& s, bool& converged, int& iters) {
+                     Eigen::VectorXd& s, bool& converged, int& iters,
+                     Eigen::MatrixXd& AI_out) {
     int p = W.C + 1;
     double vy = (y.array() - y.mean()).square().sum() / (y.size() - 1);
     double floor_v = 1e-6 * vy;
 
     s = Eigen::VectorXd::Constant(p, vy / p);       // start: split variance
     converged = false; iters = 0;
+    AI_out = Eigen::MatrixXd::Zero(p, p);
 
     RemlEval cur = reml_eval(W, Zty, y, s);
     if (!cur.ok) {                                  // nudge if start not PD
@@ -728,6 +657,7 @@ static void reml_fit(const RemlWindow& W, const Eigen::VectorXd& Zty,
         cur = reml_eval(W, Zty, y, s);
         if (!cur.ok) return;
     }
+    AI_out = cur.AI;
 
     for (int it = 1; it <= max_iter; ++it) {
         iters = it;
@@ -749,94 +679,348 @@ static void reml_fit(const RemlWindow& W, const Eigen::VectorXd& Zty,
         s = s_acc;
         RemlEval full = reml_eval(W, Zty, y, s);
         if (!full.ok) break;
+        AI_out = full.AI;
         double dlogL = full.logL - cur.logL;
         cur = full;
         if (std::abs(dlogL) < tol) { converged = true; break; }
     }
 }
 
+// ===========================================================================
+// Estimator 2: AI-REML. Parallelized over windows; streams h2 + SE to file.
+// ===========================================================================
 // [[Rcpp::export]]
 Rcpp::List reml_sliding_window(const std::string& filename,
                                const SEXP pheno_mat,
                                double window_size = 1e6,
                                Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
                                int max_iter = 100,
-                               double tol = 1e-4) {
-
-    const long W = (long) window_size;
-    if (W <= 0) stop("window_size must be positive");
-
+                               double tol = 1e-4,
+                               bool se = true,
+                               std::string out_file = "",
+                               int batch_size = 16,
+                               int n_threads = 0,
+                               int seed = 12345) {
+    if (window_size <= 0) stop("window_size must be positive");
     RunContext ctx = setup_context(filename, pheno_mat, common_filename);
-    const int n_inds  = ctx.n_inds;
-    const int n_pheno = ctx.n_pheno;
+    DriverParams pr;
+    pr.W = (long) window_size; pr.method = 1;
+    pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se;
+    pr.out_file = out_file; pr.batch_size = batch_size;
+    pr.n_threads = n_threads; pr.seed = (unsigned) seed;
+    return sliding_window_driver(ctx, pr);
+}
+
+// ===========================================================================
+// Per-window compute kernels (thread-safe: pure Eigen/STL, no R API) + the
+// RcppParallel worker and the batched, streaming driver.
+// ===========================================================================
+
+// One window's results (all traits), filled by a worker thread.
+struct WindowResult {
+    int nL, nM, nR, nC;
+    std::vector<double> vg, h2, se_vg, se_h2;
+    std::vector<int> conv, iters;            // REML only
+};
+
+// Apply Sigma = sum_c (sig[c]/M[c]) X_c X_c' + sig[C] I to a vector (matrix-free).
+static inline Eigen::VectorXd apply_Sigma(const std::vector<Eigen::MatrixXd>& X,
+                                          const std::vector<double>& M,
+                                          const Eigen::VectorXd& sig,
+                                          const Eigen::VectorXd& v) {
+    int C = (int) X.size();
+    Eigen::VectorXd o = sig[C] * v;
+    for (int c = 0; c < C; ++c)
+        o.noalias() += (sig[c] / M[c]) * (X[c] * (X[c].transpose() * v));
+    return o;
+}
+// Apply the c-th GRM K_c = X_c X_c'/M_c (or the identity for c == C) to a vector.
+static inline Eigen::VectorXd apply_K(const std::vector<Eigen::MatrixXd>& X,
+                                      const std::vector<double>& M,
+                                      int c, const Eigen::VectorXd& v) {
+    if (c == (int) X.size()) return v;
+    return (X[c] * (X[c].transpose() * v)) / M[c];
+}
+
+// ---- HE (randomized method of moments) with moment-based standard errors ----
+// Thread-safe: probes use a per-window std::mt19937 seeded from `seed`.
+static void he_window_compute(const WindowComponents& wc, const Eigen::MatrixXd& Y,
+                              int nmcmc, unsigned seed, bool se, WindowResult& res) {
+    int C = (int) wc.X.size(), env = C, n = (int) Y.rows(), P = (int) Y.cols();
+    int mid = wc.mid_comp;
+    res.nL = wc.nL; res.nM = wc.nM; res.nR = wc.nR; res.nC = wc.nC;
+    res.vg.assign(P, NA_REAL); res.h2.assign(P, NA_REAL);
+    res.se_vg.assign(P, NA_REAL); res.se_h2.assign(P, NA_REAL);
+
+    std::vector<double> M(C);
+    for (int c = 0; c < C; ++c) M[c] = (double) wc.X[c].cols();
+    std::vector<Eigen::MatrixXd> XtY(C);
+    for (int c = 0; c < C; ++c) XtY[c] = wc.X[c].transpose() * Y;
+
+    // Moment matrix T (tr(K_i K_j)), residual last; GRM-GRM traces stochastic.
+    Eigen::MatrixXd T = Eigen::MatrixXd::Zero(C + 1, C + 1);
+    for (int c = 0; c < C; ++c) { double tr = wc.X[c].squaredNorm() / M[c]; T(c, env) = tr; T(env, c) = tr; }
+    T(env, env) = n;
+    std::mt19937 rng(seed);
+    std::normal_distribution<double> nd(0.0, 1.0);
+    for (int r = 0; r < nmcmc; ++r) {
+        Eigen::VectorXd z(n); for (int i = 0; i < n; ++i) z[i] = nd(rng);
+        std::vector<Eigen::VectorXd> Gz(C);
+        for (int c = 0; c < C; ++c) { Eigen::VectorXd t = wc.X[c].transpose() * z; Gz[c] = (wc.X[c] * t) / M[c]; }
+        for (int a = 0; a < C; ++a) for (int b = a; b < C; ++b) T(a, b) += Gz[a].dot(Gz[b]);
+    }
+    for (int a = 0; a < C; ++a) for (int b = a; b < C; ++b) { T(a, b) /= nmcmc; T(b, a) = T(a, b); }
+    Eigen::MatrixXd Tinv = T.inverse();
+
+    for (int t = 0; t < P; ++t) {
+        Eigen::VectorXd q(C + 1);
+        for (int c = 0; c < C; ++c) q[c] = XtY[c].col(t).squaredNorm() / M[c];
+        q[env] = Y.col(t).squaredNorm();
+        Eigen::VectorXd sigma = Tinv * q;
+        double tot = sigma.sum(), vg = sigma[mid];
+        res.vg[t] = vg;
+        res.h2[t] = (std::abs(tot) > 1e-12) ? vg / tot : NA_REAL;
+        if (!se) continue;                               // skip the expensive SE pass
+
+        // SE: Cov(sigma) = Tinv Cov(q) Tinv, Cov(q)_ij = 2 tr(K_i Sigma K_j Sigma),
+        // with Sigma the plug-in fitted covariance. Traces estimated by probes.
+        Eigen::MatrixXd Covq = Eigen::MatrixXd::Zero(C + 1, C + 1);
+        std::mt19937 rng2(seed + 2654435761u * (unsigned)(t + 1));
+        std::normal_distribution<double> nd2(0.0, 1.0);
+        for (int r = 0; r < nmcmc; ++r) {
+            Eigen::VectorXd z(n); for (int i = 0; i < n; ++i) z[i] = nd2(rng2);
+            Eigen::VectorXd u = apply_Sigma(wc.X, M, sigma, z);
+            std::vector<Eigen::VectorXd> kiz(C + 1), skju(C + 1);
+            for (int l = 0; l <= C; ++l) {
+                kiz[l]  = apply_K(wc.X, M, l, z);
+                skju[l] = apply_Sigma(wc.X, M, sigma, apply_K(wc.X, M, l, u));
+            }
+            for (int i = 0; i <= C; ++i) for (int j = 0; j <= C; ++j) Covq(i, j) += kiz[i].dot(skju[j]);
+        }
+        Covq = (Covq / nmcmc) * 2.0;
+        Covq = (0.5 * (Covq + Covq.transpose())).eval();
+        Eigen::MatrixXd Cov = Tinv * Covq * Tinv;
+        if (Cov(mid, mid) > 0) res.se_vg[t] = std::sqrt(Cov(mid, mid));
+        if (std::abs(tot) > 1e-12) {
+            double h2 = vg / tot;
+            Eigen::VectorXd g(C + 1);
+            for (int k = 0; k <= C; ++k) g[k] = ((k == mid ? 1.0 : 0.0) - h2) / tot;
+            double v = g.dot(Cov * g);
+            if (v > 0) res.se_h2[t] = std::sqrt(v);
+        }
+    }
+}
+
+// ---- AI-REML with SE from the Average-Information matrix (delta method) ----
+static void reml_window_compute(const WindowComponents& wc, const Eigen::MatrixXd& Y,
+                                int max_iter, double tol, bool se, WindowResult& res) {
+    int C = (int) wc.X.size(), n = (int) Y.rows(), P = (int) Y.cols();
+    int mid = wc.mid_comp;
+    res.nL = wc.nL; res.nM = wc.nM; res.nR = wc.nR; res.nC = wc.nC;
+    res.vg.assign(P, NA_REAL); res.h2.assign(P, NA_REAL);
+    res.se_vg.assign(P, NA_REAL); res.se_h2.assign(P, NA_REAL);
+    res.conv.assign(P, 0); res.iters.assign(P, 0);
+
+    RemlWindow rw;
+    rw.C = C; rw.off.resize(C); rw.m.resize(C);
+    int K = 0;
+    for (int c = 0; c < C; ++c) { rw.off[c] = K; rw.m[c] = (int) wc.X[c].cols(); K += rw.m[c]; }
+    rw.K = K;
+    rw.Z.resize(n, K);
+    for (int c = 0; c < C; ++c) rw.Z.middleCols(rw.off[c], rw.m[c]) = wc.X[c];
+    rw.Gram = rw.Z.transpose() * rw.Z;
+    rw.Zt1  = rw.Z.colwise().sum().transpose();
+
+    for (int t = 0; t < P; ++t) {
+        Eigen::VectorXd y = Y.col(t);
+        Eigen::VectorXd Zty = rw.Z.transpose() * y;
+        Eigen::VectorXd s; bool conv; int iters; Eigen::MatrixXd AI;
+        reml_fit(rw, Zty, y, max_iter, tol, s, conv, iters, AI);
+        double tot = s.sum(), vg = s[mid];
+        res.vg[t] = vg; res.conv[t] = conv ? 1 : 0; res.iters[t] = iters;
+        res.h2[t] = (conv && std::abs(tot) > 1e-12) ? vg / tot : NA_REAL;
+        if (se && conv) {
+            Eigen::MatrixXd Cov = AI.inverse();          // asymptotic Cov(sigma)
+            if (Cov(mid, mid) > 0) res.se_vg[t] = std::sqrt(Cov(mid, mid));
+            if (std::abs(tot) > 1e-12) {
+                double h2 = vg / tot; int p = (int) s.size();
+                Eigen::VectorXd g(p);
+                for (int k = 0; k < p; ++k) g[k] = ((k == mid ? 1.0 : 0.0) - h2) / tot;
+                double v = g.dot(Cov * g);
+                if (v > 0) res.se_h2[t] = std::sqrt(v);
+            }
+        }
+    }
+}
+
+// RcppParallel worker: computes a contiguous chunk of the current batch.
+struct WindowWorker : public RcppParallel::Worker {
+    const std::vector<WindowComponents>& batch;
+    const Eigen::MatrixXd& Y;
+    const DriverParams& pr;
+    unsigned seed_offset;
+    std::vector<WindowResult>& out;
+    WindowWorker(const std::vector<WindowComponents>& batch, const Eigen::MatrixXd& Y,
+                 const DriverParams& pr, unsigned seed_offset, std::vector<WindowResult>& out)
+        : batch(batch), Y(Y), pr(pr), seed_offset(seed_offset), out(out) {}
+    void operator()(std::size_t begin, std::size_t end) {
+        for (std::size_t w = begin; w < end; ++w) {
+            if (pr.method == 0)
+                he_window_compute(batch[w], Y, pr.nmcmc,
+                                  pr.seed + seed_offset + (unsigned) w, pr.se, out[w]);
+            else
+                reml_window_compute(batch[w], Y, pr.max_iter, pr.tol, pr.se, out[w]);
+        }
+    }
+};
+
+// Batched, streaming, parallel driver shared by both estimators.
+static Rcpp::List sliding_window_driver(RunContext& ctx, const DriverParams& pr) {
+    const long W = pr.W;
+    const int P = ctx.n_pheno;
     const Eigen::MatrixXd& Y = ctx.Y;
 
-    std::vector<std::string> out_chr;
-    std::vector<double> out_start, out_end;
-    std::vector<int> out_nL, out_nM, out_nR, out_nC;
-    std::vector< std::vector<double> > out_vg(n_pheno), out_h2(n_pheno);
-    std::vector< std::vector<int> >    out_conv(n_pheno), out_iter(n_pheno);
-
-    Progress prog; prog.start("REML", count_total_windows(ctx, W));
-
-    WindowStream stream(ctx, W);
-    WindowComponents wc; std::string chr; long w_start;
-    while (stream.next(wc, chr, w_start)) {
-            prog.tick(chr, wc.nM);
-            Rcpp::checkUserInterrupt();
-
-            int C = (int) wc.X.size();
-
-            // Low-rank window statistics: Z = [X_1 | ... | X_C], Gram = Z'Z.
-            // Built once per window and shared across all traits (no N x N).
-            RemlWindow rw;
-            rw.C = C;
-            rw.off.resize(C); rw.m.resize(C);
-            int K = 0;
-            for (int c = 0; c < C; ++c) { rw.off[c] = K; rw.m[c] = (int) wc.X[c].cols(); K += rw.m[c]; }
-            rw.K = K;
-            rw.Z.resize(n_inds, K);
-            for (int c = 0; c < C; ++c) rw.Z.middleCols(rw.off[c], rw.m[c]) = wc.X[c];
-            wc.X.clear();                                   // free component copies
-            rw.Gram = rw.Z.transpose() * rw.Z;              // O(N K^2), once per window
-            rw.Zt1  = rw.Z.colwise().sum().transpose();
-
-            out_chr.push_back(chr);
-            out_start.push_back((double)(w_start));
-            out_end.push_back((double)(w_start + W));
-            out_nL.push_back(wc.nL); out_nM.push_back(wc.nM);
-            out_nR.push_back(wc.nR); out_nC.push_back(wc.nC);
-
-            for (int t = 0; t < n_pheno; ++t) {
-                Eigen::VectorXd y = Y.col(t);
-                Eigen::VectorXd Zty = rw.Z.transpose() * y;
-                Eigen::VectorXd s; bool conv; int iters;
-                reml_fit(rw, Zty, y, max_iter, tol, s, conv, iters);
-                double mid = s[wc.mid_comp];
-                double tot = s.sum();
-                out_vg[t].push_back(mid);
-                out_h2[t].push_back(conv && std::abs(tot) > 1e-12 ? mid / tot : NA_REAL);
-                out_conv[t].push_back(conv ? 1 : 0);
-                out_iter[t].push_back(iters);
-            }
+    Eigen::setNbThreads(1);                              // RcppParallel owns threads
+    // setThreadOptions() is an R-level function, not part of the C++ API. The
+    // RcppParallel backend reads the thread count from this env var instead.
+    if (pr.n_threads > 0) {
+        std::string nt = std::to_string(pr.n_threads);
+#ifdef _WIN32
+        _putenv_s("RCPP_PARALLEL_NUM_THREADS", nt.c_str());
+#else
+        setenv("RCPP_PARALLEL_NUM_THREADS", nt.c_str(), 1);
+#endif
     }
 
-    int n_win = (int) out_chr.size();
+    std::vector<double> Vp(P);                           // phenotypic variance / trait
+    for (int t = 0; t < P; ++t) {
+        double m = Y.col(t).mean();
+        Vp[t] = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1);
+    }
+
+    const bool tofile = !pr.out_file.empty();
+    std::ofstream fout;
+    auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
+    if (tofile) {
+        fout.open(pr.out_file.c_str());
+        if (!fout.is_open()) stop("Could not open out_file for writing: " + pr.out_file);
+        fout << "chr\tstart\tend\tn_left\tn_middle\tn_right";
+        if (ctx.use_common) fout << "\tn_common";
+        for (int t = 0; t < P; ++t) {
+            std::string nm = as<std::string>(ctx.trait_names[t]);
+            fout << "\tvg_" << nm << "\tse_vg_" << nm << "\th2_" << nm << "\tse_h2_" << nm;
+            if (pr.method == 1) fout << "\tconv_" << nm << "\tn_iter_" << nm;
+        }
+        fout << "\n";
+    }
+
+    std::vector<std::string> a_chr;
+    std::vector<double> a_start, a_end;
+    std::vector<int> a_nL, a_nM, a_nR, a_nC;
+    std::vector< std::vector<double> > a_vg(P), a_h2(P), a_sevg(P), a_seh2(P);
+    std::vector< std::vector<int> > a_conv(P), a_iter(P);
+    std::vector<double> tot_vg(P, 0.0), tot_var(P, 0.0);   // sum vg, sum se_vg^2
+
+    Progress prog; prog.start(pr.method == 0 ? "HE" : "REML", count_total_windows(ctx, W));
+    WindowStream stream(ctx, W);
+    long processed = 0;
+
+    while (true) {
+        std::vector<WindowComponents> comps;
+        std::vector<std::string> bchr; std::vector<long> bws;
+        WindowComponents wc; std::string chr; long ws;
+        while ((int) comps.size() < pr.batch_size && stream.next(wc, chr, ws)) {
+            comps.push_back(std::move(wc)); bchr.push_back(chr); bws.push_back(ws);
+        }
+        if (comps.empty()) break;
+
+        std::vector<WindowResult> results(comps.size());
+        WindowWorker worker(comps, Y, pr, (unsigned) processed, results);
+        RcppParallel::parallelFor(0, comps.size(), worker);
+
+        for (size_t k = 0; k < comps.size(); ++k) {
+            const WindowResult& r = results[k];
+            prog.tick(bchr[k], r.nM);
+            if (tofile) {
+                fout << bchr[k] << '\t' << bws[k] << '\t' << (bws[k] + W)
+                     << '\t' << r.nL << '\t' << r.nM << '\t' << r.nR;
+                if (ctx.use_common) fout << '\t' << r.nC;
+                for (int t = 0; t < P; ++t) {
+                    fout << '\t'; wr(fout, r.vg[t]);
+                    fout << '\t'; wr(fout, r.se_vg[t]);
+                    fout << '\t'; wr(fout, r.h2[t]);
+                    fout << '\t'; wr(fout, r.se_h2[t]);
+                    if (pr.method == 1) fout << '\t' << r.conv[t] << '\t' << r.iters[t];
+                }
+                fout << '\n';
+            }
+            a_chr.push_back(bchr[k]); a_start.push_back((double) bws[k]);
+            a_end.push_back((double)(bws[k] + W));
+            a_nL.push_back(r.nL); a_nM.push_back(r.nM); a_nR.push_back(r.nR); a_nC.push_back(r.nC);
+            for (int t = 0; t < P; ++t) {
+                a_vg[t].push_back(r.vg[t]); a_h2[t].push_back(r.h2[t]);
+                a_sevg[t].push_back(r.se_vg[t]); a_seh2[t].push_back(r.se_h2[t]);
+                if (pr.method == 1) { a_conv[t].push_back(r.conv[t]); a_iter[t].push_back(r.iters[t]); }
+                if (!std::isnan(r.vg[t]))    tot_vg[t]  += r.vg[t];
+                if (!std::isnan(r.se_vg[t])) tot_var[t] += r.se_vg[t] * r.se_vg[t];
+            }
+        }
+        processed += (long) comps.size();
+        if (tofile) fout.flush();
+        Rcpp::checkUserInterrupt();
+    }
+
+    // Total = sum of middle-window genetic variance over the genome; SE from
+    // summed per-window variances (windows treated as ~independent segments).
+    std::vector<double> tot_h2(P), tot_h2_se(P), tot_se_vg(P);
+    for (int t = 0; t < P; ++t) {
+        tot_se_vg[t] = std::sqrt(tot_var[t]);
+        tot_h2[t]    = (Vp[t] > 0) ? tot_vg[t]    / Vp[t] : NA_REAL;
+        tot_h2_se[t] = (Vp[t] > 0) ? tot_se_vg[t] / Vp[t] : NA_REAL;
+    }
+    if (tofile) {
+        fout << "TOTAL\tNA\tNA\tNA\tNA\tNA";
+        if (ctx.use_common) fout << "\tNA";
+        for (int t = 0; t < P; ++t) {
+            fout << '\t'; wr(fout, tot_vg[t]);
+            fout << '\t'; wr(fout, tot_se_vg[t]);
+            fout << '\t'; wr(fout, tot_h2[t]);
+            fout << '\t'; wr(fout, tot_h2_se[t]);
+            if (pr.method == 1) fout << "\tNA\tNA";
+        }
+        fout << "\n";
+        fout.close();
+    }
+
+    int n_win = (int) a_chr.size();
     Rcout << "Windows estimated: " << n_win << "\n";
 
     List df;
-    df["chr"] = wrap(out_chr); df["start"] = wrap(out_start); df["end"] = wrap(out_end);
-    df["n_left"] = wrap(out_nL); df["n_middle"] = wrap(out_nM); df["n_right"] = wrap(out_nR);
-    if (ctx.use_common) df["n_common"] = wrap(out_nC);
-    for (int t = 0; t < n_pheno; ++t) {
+    df["chr"] = wrap(a_chr); df["start"] = wrap(a_start); df["end"] = wrap(a_end);
+    df["n_left"] = wrap(a_nL); df["n_middle"] = wrap(a_nM); df["n_right"] = wrap(a_nR);
+    if (ctx.use_common) df["n_common"] = wrap(a_nC);
+    for (int t = 0; t < P; ++t) {
         std::string nm = as<std::string>(ctx.trait_names[t]);
-        df["vg_mid_" + nm]   = wrap(out_vg[t]);
-        df["h2_mid_" + nm]   = wrap(out_h2[t]);
-        df["converged_" + nm] = wrap(out_conv[t]);
-        df["n_iter_" + nm]    = wrap(out_iter[t]);
+        df["vg_" + nm]    = wrap(a_vg[t]);
+        df["se_vg_" + nm] = wrap(a_sevg[t]);
+        df["h2_" + nm]    = wrap(a_h2[t]);
+        df["se_h2_" + nm] = wrap(a_seh2[t]);
+        if (pr.method == 1) {
+            df["converged_" + nm] = wrap(a_conv[t]);
+            df["n_iter_" + nm]    = wrap(a_iter[t]);
+        }
     }
     finalize_dataframe(df, n_win);
 
-    return List::create(_["windows"] = df, _["trait_names"] = ctx.trait_names,
-                        _["method"] = "REML");
+    List tot;
+    tot["trait"]        = ctx.trait_names;
+    tot["total_vg"]     = wrap(tot_vg);
+    tot["total_se_vg"]  = wrap(tot_se_vg);
+    tot["total_h2"]     = wrap(tot_h2);
+    tot["total_h2_se"]  = wrap(tot_h2_se);
+    finalize_dataframe(tot, P);
+
+    return List::create(_["windows"] = df, _["total"] = tot,
+                        _["trait_names"] = ctx.trait_names,
+                        _["method"] = (pr.method == 0 ? "HE" : "REML"));
 }

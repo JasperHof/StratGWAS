@@ -114,7 +114,7 @@ he_reg_part <- function (filename, pheno, snp_cat, cat_names, block_size = 1000,
 #' @export
 sliding_window <- function(filename, pheno, method = "HE", window_size = 1e3,
                            common_filename = NULL, tol = 1e-3, nmcmc = 20,
-                           outfile) {
+                           outfile, se = FALSE) {
 
   # Stadardize
   for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
@@ -138,6 +138,7 @@ sliding_window <- function(filename, pheno, method = "HE", window_size = 1e3,
       pheno_mat   = multi_he,
       window_size = window_size,
       nmcmc       = nmcmc,
+      se = se,
       common_filename = common_filename
     )
   }
