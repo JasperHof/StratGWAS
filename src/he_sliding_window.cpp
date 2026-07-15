@@ -1152,13 +1152,20 @@ static void he_window_compute(const WindowComponents& wc, const Eigen::MatrixXd&
             for (int p = 0; p < B; ++p) t += (double) Gz[a].col(p).dot(Gz[b].col(p));
             T(a, b) = t / B; T(b, a) = T(a, b);          // tr(K_a K_b), double-accumulated
         }
-    Eigen::MatrixXd Tinv = T.inverse();
+    // Robust solve: T can be singular (a local common-SNP GRM on unrelated
+    // individuals is nearly collinear with the residual / other components).
+    // T.inverse() returns NaN there -- this is what produced NA rows whenever
+    // n_common > 0. A rank-revealing decomposition gives the minimum-norm
+    // least-squares solution, keeping the well-identified components (the
+    // middle) finite and stable.
+    Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
+    Eigen::MatrixXd Tinv = Tcod.pseudoInverse();          // used for the SE below
 
     for (int t = 0; t < P; ++t) {
         Eigen::VectorXd q(C + 1);
         for (int c = 0; c < C; ++c) q[c] = XtY[c].col(t).cast<double>().squaredNorm() / M[c];
         q[env] = Y.col(t).squaredNorm();
-        Eigen::VectorXd sigma = Tinv * q;
+        Eigen::VectorXd sigma = Tcod.solve(q);
         double tot = sigma.sum(), vg = sigma[mid];
         res.vg[t] = vg;
         res.h2[t] = (std::abs(tot) > 1e-12) ? vg / tot : NA_REAL;
@@ -1248,7 +1255,8 @@ static void reml_fit_one_trait(const RemlWindow& rw, const Eigen::MatrixXd& Y, i
     res.vg[t] = vg; res.conv[t] = conv ? 1 : 0; res.iters[t] = iters;
     res.h2[t] = (conv && std::abs(tot) > 1e-12) ? vg / tot : NA_REAL;
     if (se && conv) {
-        Eigen::MatrixXd Cov = AI.inverse();          // asymptotic Cov(sigma) -- exact, unaffected by trSinv
+        // pseudo-inverse: robust if AI is singular (e.g. a redundant common GRM)
+        Eigen::MatrixXd Cov = AI.completeOrthogonalDecomposition().pseudoInverse();  // asymptotic Cov(sigma)
         if (Cov(mid, mid) > 0) res.se_vg[t] = std::sqrt(Cov(mid, mid));
         if (std::abs(tot) > 1e-12) {
             double h2 = vg / tot; int p = (int) s.size();
