@@ -158,11 +158,13 @@ static GenoMat build_component(const GenoMat& X, const std::vector<float>& maf,
     int m = (int) cols.size();
     if (m == 0) return GenoMat(X.rows(), 0);
     GenoMat W(X.rows(), m);
+    bool unit = (alpha == -1.0);                 // weight = 1 everywhere; skip pow
     double e = (1.0 + alpha) / 2.0;
     for (int k = 0; k < m; ++k) {
         int j = cols[k];
+        if (unit) { W.col(k) = X.col(j); continue; }
         double f = maf[j];
-        double w = (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), e) : 1.0;
+        double w = (f > 0.0 && f < 1.0) ? std::pow(f * (1.0 - f), e) : 1.0;
         W.col(k) = X.col(j) * (float) w;
     }
     double ss = W.colwise().squaredNorm().cast<double>().sum();   // ||W||_F^2, double
@@ -301,18 +303,31 @@ struct PartWindow {
     int mid_total;                 // total middle SNPs actually partitioned
 };
 
-// Rolling reader: caches L/M/R WES cells and L/M/R common cells, shifts them,
-// reads only the new right cell each step (each cell read once per pass).
+// One window's RAW cells (standardized, but NOT yet alpha-weighted / trace-
+// normalized / partitioned). Produced serially by the main thread (only
+// readBedBlock + standardization are serial); the heavy per-window building is
+// done later in the parallel worker via build_part_window().
+struct RawWindow {
+    std::string chr; long w_start;
+    int nL, nM, nR, nC;
+    Cell wesL, wesM, wesR;         // standardized WES cells (left/middle/right)
+    Cell com;                      // standardized, concatenated common cell (may be empty)
+    int mid_i0;                    // .bim index of the middle cell's first SNP
+};
+
+// Rolling reader: caches L/M/R WES cells and L/M/R common cells (each read +
+// standardized once), shifts them, and hands each window its cells as a
+// RawWindow -- WITHOUT building components (that happens in the worker).
 class PartStream {
 public:
     PartStream(const RunContext& ctx, long W) : ctx_(ctx), W_(W), ci_(0), have_(false) {}
 
-    bool next(PartWindow& pw) {
+    bool next(RawWindow& rw) {
         while (true) {
             if (!have_) { if (ci_ >= ctx_.chr_order.size()) return false; setup_chrom(); have_ = true; }
             if (g_ > glast_) { ++ci_; have_ = false; continue; }
             bool produced = false;
-            if (wesM_.X.cols() > 0) { assemble(pw); produced = true; }
+            if (wesM_.X.cols() > 0) { assemble(rw); produced = true; }
             shift();
             if (produced) return true;
         }
@@ -347,68 +362,81 @@ private:
         comL_ = std::move(comM_); comM_ = std::move(comR_); comR_ = comCell(g_ + 1);
     }
 
-    // helper: push a background component (all columns of a cell) if non-empty
-    void push_bg(PartWindow& pw, const Cell& cell, int& counter) {
-        int m = (int) cell.X.cols();
-        counter = m;
-        if (m == 0) return;
-        std::vector<int> cols(m); for (int j = 0; j < m; ++j) cols[j] = j;
-        GenoMat g = build_component(cell.X, cell.maf, cols, ctx_.alpha, ctx_.n_inds);
-        if (g.cols() > 0) pw.X.push_back(std::move(g));
-    }
+    void assemble(RawWindow& rw) {
+        rw = RawWindow();
+        rw.chr = ctx_.chr_order[ci_];
+        rw.w_start = g_ * W_;
+        rw.mid_i0 = wesM_.i0;
+        rw.nL = (int) wesL_.X.cols();
+        rw.nM = (int) wesM_.X.cols();
+        rw.nR = (int) wesR_.X.cols();
+        rw.wesL = wesL_; rw.wesM = wesM_; rw.wesR = wesR_;    // copies (standardized)
 
-    void assemble(PartWindow& pw) {
-        pw = PartWindow();
-        pw.chr = ctx_.chr_order[ci_];
-        pw.w_start = g_ * W_;
-        pw.nM = (int) wesM_.X.cols();
-
-        // ---- background: left, right (WES flanks), common (3 sub-cells) ----
-        push_bg(pw, wesL_, pw.nL);
-        push_bg(pw, wesR_, pw.nR);
-
-        // common = concat of comL/comM/comR
+        // concatenate the 3 common cells into ONE standardized cell (single copy;
+        // the alpha weighting / trace-norm happen later, in the worker)
         int cm = (int) comL_.X.cols() + (int) comM_.X.cols() + (int) comR_.X.cols();
-        pw.nC = cm;
+        rw.nC = cm; rw.com.i0 = -1;
         if (ctx_.use_common && cm > 0) {
-            GenoMat Xc(ctx_.n_inds, cm);
-            std::vector<float> mafc(cm);
-            int off = 0;
-            const Cell* cc[3] = { &comL_, &comM_, &comR_ };
+            rw.com.X = GenoMat(ctx_.n_inds, cm);
+            rw.com.maf.resize(cm);
+            int off = 0; const Cell* cc[3] = { &comL_, &comM_, &comR_ };
             for (int t = 0; t < 3; ++t) {
                 int mt = (int) cc[t]->X.cols();
-                if (mt > 0) { Xc.middleCols(off, mt) = cc[t]->X;
-                              for (int j = 0; j < mt; ++j) mafc[off + j] = cc[t]->maf[j];
+                if (mt > 0) { rw.com.X.middleCols(off, mt) = cc[t]->X;
+                              for (int j = 0; j < mt; ++j) rw.com.maf[off + j] = cc[t]->maf[j];
                               off += mt; }
             }
-            std::vector<int> cols(cm); for (int j = 0; j < cm; ++j) cols[j] = j;
-            GenoMat g = build_component(Xc, mafc, cols, ctx_.alpha, ctx_.n_inds);
-            if (g.cols() > 0) pw.X.push_back(std::move(g));
-        }
-
-        // ---- middle: partition columns by category ----
-        int mid_i0 = wesM_.i0;
-        std::vector< std::vector<int> > cat_cols(ctx_.n_cat + 1);   // +1 = uncategorized
-        for (int j = 0; j < pw.nM; ++j) {
-            int snp = mid_i0 + j;
-            const std::vector<int>& cs = ctx_.snp_cats[snp];
-            if (cs.empty()) cat_cols[ctx_.n_cat].push_back(j);      // uncategorized
-            else for (size_t k = 0; k < cs.size(); ++k) cat_cols[cs[k]].push_back(j);
-        }
-        pw.mid_total = 0;
-        for (int c = 0; c <= ctx_.n_cat; ++c) {
-            int m = (int) cat_cols[c].size();
-            if (m == 0) continue;
-            GenoMat g = build_component(wesM_.X, wesM_.maf, cat_cols[c], ctx_.alpha, ctx_.n_inds);
-            if (g.cols() == 0) continue;
-            pw.sig.push_back((int) pw.X.size());
-            pw.sig_cat.push_back(c);
-            pw.sig_m.push_back(m);
-            pw.mid_total += m;
-            pw.X.push_back(std::move(g));
+        } else {
+            rw.com.X = GenoMat(ctx_.n_inds, 0);
         }
     }
 };
+
+// Build the component matrices for one window from its raw cells. Runs in the
+// WORKER thread (thread-safe: only reads ctx.snp_cats/alpha/n_inds and calls the
+// pure build_component). This is where the alpha weighting, trace-normalization
+// and category partitioning happen -- moved off the serial main thread so they
+// parallelize across cores.
+static void build_part_window(const RawWindow& rw, const RunContext& ctx, PartWindow& pw) {
+    pw = PartWindow();
+    pw.chr = rw.chr; pw.w_start = rw.w_start;
+    pw.nL = rw.nL; pw.nR = rw.nR; pw.nC = rw.nC; pw.nM = rw.nM;
+
+    // background components: left, right (WES flanks), common
+    if (rw.nL > 0) { std::vector<int> cols(rw.nL); for (int j = 0; j < rw.nL; ++j) cols[j] = j;
+        GenoMat g = build_component(rw.wesL.X, rw.wesL.maf, cols, ctx.alpha, ctx.n_inds);
+        if (g.cols() > 0) pw.X.push_back(std::move(g)); }
+    if (rw.nR > 0) { std::vector<int> cols(rw.nR); for (int j = 0; j < rw.nR; ++j) cols[j] = j;
+        GenoMat g = build_component(rw.wesR.X, rw.wesR.maf, cols, ctx.alpha, ctx.n_inds);
+        if (g.cols() > 0) pw.X.push_back(std::move(g)); }
+    if (ctx.use_common && rw.nC > 0) { std::vector<int> cols(rw.nC); for (int j = 0; j < rw.nC; ++j) cols[j] = j;
+        GenoMat g = build_component(rw.com.X, rw.com.maf, cols, ctx.alpha, ctx.n_inds);
+        if (g.cols() > 0) pw.X.push_back(std::move(g)); }
+
+    // middle: partition columns by category
+    int mid_i0 = rw.mid_i0;
+    int ncat_snp = (int) ctx.snp_cats.size();
+    std::vector< std::vector<int> > cat_cols(ctx.n_cat + 1);   // +1 = uncategorized
+    for (int j = 0; j < rw.nM; ++j) {
+        int snp = mid_i0 + j;
+        if (snp < 0 || snp >= ncat_snp) continue;              // guard (no stop() in worker)
+        const std::vector<int>& cs = ctx.snp_cats[snp];
+        if (cs.empty()) cat_cols[ctx.n_cat].push_back(j);
+        else for (size_t k = 0; k < cs.size(); ++k) cat_cols[cs[k]].push_back(j);
+    }
+    pw.mid_total = 0;
+    for (int c = 0; c <= ctx.n_cat; ++c) {
+        int m = (int) cat_cols[c].size();
+        if (m == 0) continue;
+        GenoMat g = build_component(rw.wesM.X, rw.wesM.maf, cat_cols[c], ctx.alpha, ctx.n_inds);
+        if (g.cols() == 0) continue;
+        pw.sig.push_back((int) pw.X.size());
+        pw.sig_cat.push_back(c);
+        pw.sig_m.push_back(m);
+        pw.mid_total += m;
+        pw.X.push_back(std::move(g));
+    }
+}
 
 // ===========================================================================
 // Low-rank AI-REML kernels (copied from he_sliding_window.cpp; work on any set
@@ -556,9 +584,14 @@ struct PartResult {
     // per trait (whole-window model fit): HE = sigma' q (Frobenius explained
     // moment; higher = better), REML = converged restricted log-likelihood.
     std::vector<double> fit;
+    // window metadata (copied from the built PartWindow so the main-thread
+    // driver can write output without re-touching the components)
+    std::string chr; long w_start; int nL, nR, nC, mid_total;
+    std::vector<int> sig_cat, sig_m;
 };
 
-static void alloc_result(PartResult& res, int nsig, int P) {
+static void alloc_result(PartResult& res, const PartWindow& pw, int P) {
+    int nsig = (int) pw.sig.size();
     res.vg.assign(nsig, std::vector<double>(P, NA_REAL));
     res.se_vg.assign(nsig, std::vector<double>(P, NA_REAL));
     res.h2.assign(nsig, std::vector<double>(P, NA_REAL));
@@ -566,6 +599,9 @@ static void alloc_result(PartResult& res, int nsig, int P) {
     res.conv.assign(nsig, std::vector<int>(P, 0));
     res.iters.assign(nsig, std::vector<int>(P, 0));
     res.fit.assign(P, NA_REAL);
+    res.chr = pw.chr; res.w_start = pw.w_start;
+    res.nL = pw.nL; res.nR = pw.nR; res.nC = pw.nC; res.mid_total = pw.mid_total;
+    res.sig_cat = pw.sig_cat; res.sig_m = pw.sig_m;
 }
 
 // ---- HE (randomized MoM), records every signal component ----
@@ -574,7 +610,7 @@ static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
                             bool se, PartResult& res) {
     int C = (int) pw.X.size(), env = C, n = (int) Y.rows(), P = (int) Y.cols();
     int nsig = (int) pw.sig.size();
-    alloc_result(res, nsig, P);
+    alloc_result(res, pw, P);
     if (C == 0) return;
 
     std::vector<double> M(C);
@@ -659,7 +695,7 @@ static void reml_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
                               bool se, unsigned seed, PartResult& res) {
     int C = (int) pw.X.size(), n = (int) Y.rows(), P = (int) Y.cols();
     int nsig = (int) pw.sig.size();
-    alloc_result(res, nsig, P);
+    alloc_result(res, pw, P);
     if (C == 0) return;
 
     // Build concatenated RemlWindow (Gram via float rankUpdate -> double)
@@ -706,26 +742,35 @@ struct PartParams {
     std::string out_file; int batch_size; int n_threads; unsigned seed;
 };
 
+// Workers now BUILD each window's components (build_part_window) and THEN
+// estimate -- so the alpha weighting / trace-normalization / partitioning run
+// in parallel across cores instead of serially on the main thread.
 struct HEWorker : public RcppParallel::Worker {
-    const std::vector<PartWindow>& batch; const Eigen::MatrixXd& Y; const std::vector<double>& Vp;
+    const std::vector<RawWindow>& batch; const RunContext& ctx;
+    const Eigen::MatrixXd& Y; const std::vector<double>& Vp;
     const PartParams& pr; unsigned soff; std::vector<PartResult>& out;
-    HEWorker(const std::vector<PartWindow>& b, const Eigen::MatrixXd& Y, const std::vector<double>& Vp,
-             const PartParams& pr, unsigned soff, std::vector<PartResult>& out)
-        : batch(b), Y(Y), Vp(Vp), pr(pr), soff(soff), out(out) {}
+    HEWorker(const std::vector<RawWindow>& b, const RunContext& ctx, const Eigen::MatrixXd& Y,
+             const std::vector<double>& Vp, const PartParams& pr, unsigned soff, std::vector<PartResult>& out)
+        : batch(b), ctx(ctx), Y(Y), Vp(Vp), pr(pr), soff(soff), out(out) {}
     void operator()(std::size_t begin, std::size_t end) {
-        for (std::size_t w = begin; w < end; ++w)
-            he_part_compute(batch[w], Y, Vp, pr.nmcmc, pr.seed + soff + (unsigned) w, pr.se, out[w]);
+        for (std::size_t w = begin; w < end; ++w) {
+            PartWindow pw; build_part_window(batch[w], ctx, pw);
+            he_part_compute(pw, Y, Vp, pr.nmcmc, pr.seed + soff + (unsigned) w, pr.se, out[w]);
+        }
     }
 };
 struct RMLWorker : public RcppParallel::Worker {
-    const std::vector<PartWindow>& batch; const Eigen::MatrixXd& Y; const std::vector<double>& Vp;
+    const std::vector<RawWindow>& batch; const RunContext& ctx;
+    const Eigen::MatrixXd& Y; const std::vector<double>& Vp;
     const PartParams& pr; unsigned soff; std::vector<PartResult>& out;
-    RMLWorker(const std::vector<PartWindow>& b, const Eigen::MatrixXd& Y, const std::vector<double>& Vp,
-              const PartParams& pr, unsigned soff, std::vector<PartResult>& out)
-        : batch(b), Y(Y), Vp(Vp), pr(pr), soff(soff), out(out) {}
+    RMLWorker(const std::vector<RawWindow>& b, const RunContext& ctx, const Eigen::MatrixXd& Y,
+              const std::vector<double>& Vp, const PartParams& pr, unsigned soff, std::vector<PartResult>& out)
+        : batch(b), ctx(ctx), Y(Y), Vp(Vp), pr(pr), soff(soff), out(out) {}
     void operator()(std::size_t begin, std::size_t end) {
-        for (std::size_t w = begin; w < end; ++w)
-            reml_part_compute(batch[w], Y, Vp, pr.max_iter, pr.tol, pr.se, pr.seed + soff + (unsigned) w, out[w]);
+        for (std::size_t w = begin; w < end; ++w) {
+            PartWindow pw; build_part_window(batch[w], ctx, pw);
+            reml_part_compute(pw, Y, Vp, pr.max_iter, pr.tol, pr.se, pr.seed + soff + (unsigned) w, out[w]);
+        }
     }
 };
 
@@ -780,38 +825,37 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
 
     while (true) {
         dbgclk::time_point t0 = dbgclk::now();
-        std::vector<PartWindow> batch;
-        PartWindow pw;
-        while ((int) batch.size() < pr.batch_size && stream.next(pw)) batch.push_back(std::move(pw));
+        std::vector<RawWindow> batch;
+        RawWindow rw;
+        while ((int) batch.size() < pr.batch_size && stream.next(rw)) batch.push_back(std::move(rw));
         if (batch.empty()) break;
         dbgclk::time_point t1 = dbgclk::now();
-        t_read += dbg_secs(t0, t1);
+        t_read += dbg_secs(t0, t1);   // read + standardize only (build now in worker)
 #if DEBUG_PART
-        // record component sizes for this batch
         for (size_t bb = 0; bb < batch.size(); ++bb) {
-            int Kt = 0; for (size_t cc = 0; cc < batch[bb].X.size(); ++cc) Kt += (int) batch[bb].X[cc].cols();
+            int Kt = batch[bb].nL + batch[bb].nM + batch[bb].nR + batch[bb].nC;
             snps_seen += Kt; if (Kt > max_K) max_K = Kt; if (batch[bb].nC > max_nC) max_nC = batch[bb].nC;
         }
-        if (dbg_batch < 3) {   // detail for the first few batches
-            const PartWindow& w0 = batch.front();
+        if (dbg_batch < 3) {
+            const RawWindow& w0 = batch.front();
             Rcout << "[dbg] batch " << dbg_batch << " (" << batch.size() << " win) first: "
                   << "chr " << w0.chr << " nL=" << w0.nL << " nM=" << w0.nM
                   << " nR=" << w0.nR << " nC=" << w0.nC
-                  << " n_comp=" << w0.X.size() << " | read(+build) so far=" << t_read << "s\n";
+                  << " | read+std so far=" << t_read << "s\n";
         }
 #endif
 
         std::vector<PartResult> results(batch.size());
         dbgclk::time_point t2 = dbgclk::now();
-        if (pr.method == 0) { HEWorker wk(batch, Y, Vp, pr, (unsigned) processed, results);
+        if (pr.method == 0) { HEWorker wk(batch, ctx, Y, Vp, pr, (unsigned) processed, results);
                               RcppParallel::parallelFor(0, batch.size(), wk); }
-        else                { RMLWorker wk(batch, Y, Vp, pr, (unsigned) processed, results);
+        else                { RMLWorker wk(batch, ctx, Y, Vp, pr, (unsigned) processed, results);
                               RcppParallel::parallelFor(0, batch.size(), wk); }
         dbgclk::time_point t3 = dbgclk::now();
-        t_comp += dbg_secs(t2, t3);
+        t_comp += dbg_secs(t2, t3);   // build + estimate (parallel)
 #if DEBUG_PART
         if (dbg_batch < 3 || (dbg_batch % 50 == 0))
-            Rcout << "[dbg] cum: read(+build)=" << t_read << "s  compute=" << t_comp
+            Rcout << "[dbg] cum: read+std=" << t_read << "s  build+compute=" << t_comp
                   << "s  write=" << t_write << "s  windows=" << n_win
                   << "  max_K=" << max_K << "  max_nC=" << max_nC << "\n";
         ++dbg_batch;
@@ -819,9 +863,8 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
 #endif
 
         for (size_t b = 0; b < batch.size(); ++b) {
-            const PartWindow& w = batch[b];
             const PartResult& r = results[b];
-            int nsig = (int) w.sig.size();
+            int nsig = (int) r.sig_cat.size();
             for (int t = 0; t < P; ++t) {
                 std::string ph = as<std::string>(ctx.trait_names[t]);
                 if (!std::isnan(r.fit[t])) tot_fit[t] += r.fit[t];   // once per window x trait
@@ -829,14 +872,14 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                 double mid_vg = 0.0;
                 for (int k = 0; k < nsig; ++k) if (!std::isnan(r.vg[k][t])) mid_vg += r.vg[k][t];
                 for (int k = 0; k < nsig; ++k) {
-                    int cat = w.sig_cat[k]; int mc = w.sig_m[k];
+                    int cat = r.sig_cat[k]; int mc = r.sig_m[k];
                     double vg = r.vg[k][t];
-                    double expected = (w.mid_total > 0) ? (double) mc / w.mid_total : NA_REAL;
+                    double expected = (r.mid_total > 0) ? (double) mc / r.mid_total : NA_REAL;
                     double share = (mid_vg != 0.0 && !std::isnan(vg)) ? vg / mid_vg : NA_REAL;
                     double enr = (!std::isnan(share) && !std::isnan(expected) && expected > 0) ? share / expected : NA_REAL;
                     if (tofile) {
-                        fout << w.chr << '\t' << w.w_start << '\t' << (w.w_start + W) << '\t'
-                             << w.nL << '\t' << w.nR << '\t' << w.nC << '\t' << ph << '\t'
+                        fout << r.chr << '\t' << r.w_start << '\t' << (r.w_start + W) << '\t'
+                             << r.nL << '\t' << r.nR << '\t' << r.nC << '\t' << ph << '\t'
                              << ctx.cat_names[cat] << '\t' << mc << '\t';
                         wr(fout, vg); fout << '\t'; wr(fout, r.se_vg[k][t]); fout << '\t';
                         wr(fout, r.h2[k][t]); fout << '\t'; wr(fout, r.se_h2[k][t]); fout << '\t';
@@ -926,7 +969,7 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   int nmcmc = 20,
                                   bool se = true,
                                   std::string out_file = "",
-                                  int batch_size = 64,
+                                  int batch_size = 8,
                                   int n_threads = 0,
                                   int seed = 12345) {
     if (window_size <= 0) stop("window_size must be positive");
@@ -949,7 +992,7 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
                                     double tol = 1e-4,
                                     bool se = true,
                                     std::string out_file = "",
-                                    int batch_size = 16,
+                                    int batch_size = 4,
                                     int n_threads = 0,
                                     int seed = 12345) {
     if (window_size <= 0) stop("window_size must be positive");

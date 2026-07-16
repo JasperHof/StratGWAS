@@ -12,9 +12,8 @@ he_reg_part_alpha(
   cat_names,
   common_filename = NULL,
   alpha = -1,
-  window_size = 1e+07,
+  window_size = 1e+06,
   nmcmc = 20,
-  block_size = 1000,
   outfile,
   n_threads = 1
 )

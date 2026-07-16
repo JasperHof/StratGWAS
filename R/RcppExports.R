@@ -57,11 +57,11 @@ reml_sliding_window <- function(filename, pheno_mat, window_size = 1e6, common_f
     .Call(`_StratGWAS_reml_sliding_window`, filename, pheno_mat, window_size, common_filename, max_iter, tol, se, out_file, batch_size, n_threads, seed)
 }
 
-he_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, alpha = -1.0, common_filename = NULL, nmcmc = 20L, se = TRUE, out_file = "", batch_size = 64L, n_threads = 0L, seed = 12345L) {
+he_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, alpha = -1.0, common_filename = NULL, nmcmc = 20L, se = TRUE, out_file = "", batch_size = 8L, n_threads = 0L, seed = 12345L) {
     .Call(`_StratGWAS_he_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, alpha, common_filename, nmcmc, se, out_file, batch_size, n_threads, seed)
 }
 
-reml_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, alpha = -1.0, common_filename = NULL, max_iter = 100L, tol = 1e-4, se = TRUE, out_file = "", batch_size = 16L, n_threads = 0L, seed = 12345L) {
+reml_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, alpha = -1.0, common_filename = NULL, max_iter = 100L, tol = 1e-4, se = TRUE, out_file = "", batch_size = 4L, n_threads = 0L, seed = 12345L) {
     .Call(`_StratGWAS_reml_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, alpha, common_filename, max_iter, tol, se, out_file, batch_size, n_threads, seed)
 }
 
