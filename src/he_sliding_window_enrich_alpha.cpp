@@ -164,7 +164,7 @@ static GenoMat build_component(const GenoMat& X, const std::vector<float>& maf,
         int j = cols[k];
         if (unit) { W.col(k) = X.col(j); continue; }
         double f = maf[j];
-        double w = (f > 0.0 && f < 1.0) ? std::pow(f * (1.0 - f), e) : 1.0;
+        double w = (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), e) : 1.0;
         W.col(k) = X.col(j) * (float) w;
     }
     double ss = W.colwise().squaredNorm().cast<double>().sum();   // ||W||_F^2, double
@@ -734,6 +734,77 @@ static void reml_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
 }
 
 // ===========================================================================
+// Progress bar (same throttled single-line style as he_sliding_window.cpp)
+// ===========================================================================
+// Count windows that will actually be processed (middle window has >=1 SNP),
+// without any genotype I/O, so we can show a percentage / ETA.
+static int count_total_windows(const RunContext& ctx, long W) {
+    int total = 0;
+    for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
+        int c_lo = ctx.chr_lo[ci], c_hi = ctx.chr_hi[ci];
+        long min_bp = ctx.wes_bim.bp[c_lo], max_bp = ctx.wes_bim.bp[c_hi];
+        long first = (min_bp / W) * W;
+        for (long w = first; w <= max_bp; w += W) {
+            int iM0 = lower_index(ctx.wes_bim.bp, c_lo, c_hi, w);
+            int iR0 = lower_index(ctx.wes_bim.bp, c_lo, c_hi, w + W);
+            if (iR0 - iM0 > 0) ++total;
+        }
+    }
+    return total;
+}
+
+// mm:ss formatter for elapsed / remaining time.
+static std::string fmt_time(double s) {
+    if (s < 0 || !(s == s)) s = 0;               // guard NaN / negative
+    int t = (int)(s + 0.5);
+    char b[24];
+    std::snprintf(b, sizeof(b), "%d:%02d", t / 60, t % 60);
+    return std::string(b);
+}
+
+// Throttled, single-line progress bar with elapsed time and ETA.
+struct Progress {
+    typedef std::chrono::steady_clock clock;
+    int total, done;
+    clock::time_point t0, tlast;
+    std::string tag;
+
+    void start(const std::string& t, int tot) {
+        tag = t; total = tot; done = 0;
+        t0 = tlast = clock::now();
+        Rcout << "[" << tag << "] scanning " << total << " windows...\n";
+    }
+    static double secs(clock::time_point a, clock::time_point b) {
+        return std::chrono::duration<double>(b - a).count();
+    }
+    void tick(const std::string& chr, int mid_snps) {
+        ++done;
+        clock::time_point now = clock::now();
+        bool last = (done >= total);
+        if (!last && secs(tlast, now) < 0.2) return;   // throttle to ~5 Hz
+        tlast = now;
+
+        double elapsed = secs(t0, now);
+        double frac = total > 0 ? (double) done / total : 1.0;
+        double eta = (frac > 0.0) ? elapsed * (1.0 - frac) / frac : 0.0;
+
+        const int barw = 24;
+        int filled = (int)(barw * frac + 0.5);
+        std::string bar(barw, '-');
+        for (int i = 0; i < filled && i < barw; ++i) bar[i] = '#';
+
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "\r[%s] [%s] %3d%% | chr %-3s | %d/%d | mid=%d SNPs | %s elapsed | ~%s left    ",
+            tag.c_str(), bar.c_str(), (int)(100.0 * frac + 0.5),
+            chr.c_str(), done, total, mid_snps,
+            fmt_time(elapsed).c_str(), fmt_time(eta).c_str());
+        Rcout << buf << std::flush;
+        if (last) Rcout << "\n";
+    }
+};
+
+// ===========================================================================
 // Driver (parallel over windows in batches; streams a long-format table)
 // ===========================================================================
 struct PartParams {
@@ -812,14 +883,17 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
 
     PartStream stream(ctx, W);
     long processed = 0; int n_win = 0;
-    Rcout << "[" << (pr.method == 0 ? "HE" : "REML") << "-part] streaming windows...\n";
+    Progress prog; prog.start(pr.method == 0 ? "HE-part" : "REML-part",
+                              count_total_windows(ctx, W));
 
-    // -------- DEBUG timing/size checkpoints (set DEBUG_PART 0 to silence) -----
-#define DEBUG_PART 1
+    // -------- DEBUG timing/size checkpoints (set DEBUG_PART 1 to enable) ------
+#define DEBUG_PART 0
     typedef std::chrono::steady_clock dbgclk;
     double t_read = 0.0, t_comp = 0.0, t_write = 0.0;   // seconds in each phase
     long long snps_seen = 0; int max_K = 0, max_nC = 0;  // component-size peaks
     int dbg_batch = 0;
+    (void) t_read; (void) t_comp; (void) t_write;        // silence when DEBUG_PART=0
+    (void) snps_seen; (void) max_K; (void) max_nC; (void) dbg_batch;
     auto dbg_secs = [](dbgclk::time_point a, dbgclk::time_point b) {
         return std::chrono::duration<double>(b - a).count(); };
 
@@ -892,6 +966,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                 }
             }
             ++n_win;
+            prog.tick(r.chr, r.mid_total);          // one tick per finished window
         }
         processed += (long) batch.size();
         if (tofile) fout.flush();
