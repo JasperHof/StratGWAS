@@ -114,7 +114,7 @@ he_reg_part <- function (filename, pheno, snp_cat, cat_names, block_size = 1000,
 #'
 #' @export
 he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filename = NULL, alpha = -1,
-                               window_size = 1e7, nmcmc = 20, block_size = 1000, outfile, n_threads = 1) {
+                               window_size = 1e6, nmcmc = 20, outfile, n_threads = 1) {
 
 
   storage.mode(snp_cat) <- "integer"          # <- force integer
