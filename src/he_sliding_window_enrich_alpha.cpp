@@ -769,17 +769,54 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
     long processed = 0; int n_win = 0;
     Rcout << "[" << (pr.method == 0 ? "HE" : "REML") << "-part] streaming windows...\n";
 
+    // -------- DEBUG timing/size checkpoints (set DEBUG_PART 0 to silence) -----
+#define DEBUG_PART 1
+    typedef std::chrono::steady_clock dbgclk;
+    double t_read = 0.0, t_comp = 0.0, t_write = 0.0;   // seconds in each phase
+    long long snps_seen = 0; int max_K = 0, max_nC = 0;  // component-size peaks
+    int dbg_batch = 0;
+    auto dbg_secs = [](dbgclk::time_point a, dbgclk::time_point b) {
+        return std::chrono::duration<double>(b - a).count(); };
+
     while (true) {
+        dbgclk::time_point t0 = dbgclk::now();
         std::vector<PartWindow> batch;
         PartWindow pw;
         while ((int) batch.size() < pr.batch_size && stream.next(pw)) batch.push_back(std::move(pw));
         if (batch.empty()) break;
+        dbgclk::time_point t1 = dbgclk::now();
+        t_read += dbg_secs(t0, t1);
+#if DEBUG_PART
+        // record component sizes for this batch
+        for (size_t bb = 0; bb < batch.size(); ++bb) {
+            int Kt = 0; for (size_t cc = 0; cc < batch[bb].X.size(); ++cc) Kt += (int) batch[bb].X[cc].cols();
+            snps_seen += Kt; if (Kt > max_K) max_K = Kt; if (batch[bb].nC > max_nC) max_nC = batch[bb].nC;
+        }
+        if (dbg_batch < 3) {   // detail for the first few batches
+            const PartWindow& w0 = batch.front();
+            Rcout << "[dbg] batch " << dbg_batch << " (" << batch.size() << " win) first: "
+                  << "chr " << w0.chr << " nL=" << w0.nL << " nM=" << w0.nM
+                  << " nR=" << w0.nR << " nC=" << w0.nC
+                  << " n_comp=" << w0.X.size() << " | read(+build) so far=" << t_read << "s\n";
+        }
+#endif
 
         std::vector<PartResult> results(batch.size());
+        dbgclk::time_point t2 = dbgclk::now();
         if (pr.method == 0) { HEWorker wk(batch, Y, Vp, pr, (unsigned) processed, results);
                               RcppParallel::parallelFor(0, batch.size(), wk); }
         else                { RMLWorker wk(batch, Y, Vp, pr, (unsigned) processed, results);
                               RcppParallel::parallelFor(0, batch.size(), wk); }
+        dbgclk::time_point t3 = dbgclk::now();
+        t_comp += dbg_secs(t2, t3);
+#if DEBUG_PART
+        if (dbg_batch < 3 || (dbg_batch % 50 == 0))
+            Rcout << "[dbg] cum: read(+build)=" << t_read << "s  compute=" << t_comp
+                  << "s  write=" << t_write << "s  windows=" << n_win
+                  << "  max_K=" << max_K << "  max_nC=" << max_nC << "\n";
+        ++dbg_batch;
+        dbgclk::time_point tw0 = dbgclk::now();
+#endif
 
         for (size_t b = 0; b < batch.size(); ++b) {
             const PartWindow& w = batch[b];
@@ -816,7 +853,18 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
         processed += (long) batch.size();
         if (tofile) fout.flush();
         Rcpp::checkUserInterrupt();
+#if DEBUG_PART
+        t_write += dbg_secs(tw0, dbgclk::now());
+#endif
     }
+
+#if DEBUG_PART
+    Rcout << "[dbg] TIMING TOTAL: read(+build)=" << t_read << "s  compute=" << t_comp
+          << "s  write=" << t_write << "s\n"
+          << "[dbg] windows=" << n_win << "  mean SNPs/window(K_total)="
+          << (n_win > 0 ? (double) snps_seen / n_win : 0.0)
+          << "  max_K=" << max_K << "  max_nC(common)=" << max_nC << "\n";
+#endif
 
     // genome-wide TOTAL rows (one per category per trait)
     if (tofile) {
