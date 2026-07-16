@@ -15,7 +15,8 @@ he_reg_part_alpha(
   window_size = 1e+06,
   nmcmc = 20,
   outfile,
-  n_threads = 1
+  n_threads = 1,
+  batch_size = 16
 )
 }
 \description{
