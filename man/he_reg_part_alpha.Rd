@@ -2,7 +2,7 @@
 % Please edit documentation in R/elastic.R
 \name{he_reg_part_alpha}
 \alias{he_reg_part_alpha}
-\title{Perform randomized double-partitioned Haseman-Elston regression for enrichment analysis AND alpha estimation
+\title{Perform randomized double-partitioned window-based Haseman-Elston regression for enrichment analysis AND alpha estimation
 Alpha from -1, -.75, -.5, -.25, 0, by default (and can't change in current implementation)}
 \usage{
 he_reg_part_alpha(
@@ -10,11 +10,16 @@ he_reg_part_alpha(
   pheno,
   snp_cat,
   cat_names,
+  common_filename = NULL,
+  alpha = -1,
+  window_size = 1e+07,
+  nmcmc = 20,
   block_size = 1000,
-  outfile
+  outfile,
+  n_threads = 1
 )
 }
 \description{
-Perform randomized double-partitioned Haseman-Elston regression for enrichment analysis AND alpha estimation
+Perform randomized double-partitioned window-based Haseman-Elston regression for enrichment analysis AND alpha estimation
 Alpha from -1, -.75, -.5, -.25, 0, by default (and can't change in current implementation)
 }

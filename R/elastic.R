@@ -109,11 +109,17 @@ he_reg_part <- function (filename, pheno, snp_cat, cat_names, block_size = 1000,
   return(hers)
 }
 
-#' Perform randomized double-partitioned Haseman-Elston regression for enrichment analysis AND alpha estimation
+#' Perform randomized double-partitioned window-based Haseman-Elston regression for enrichment analysis AND alpha estimation
 #' Alpha from -1, -.75, -.5, -.25, 0, by default (and can't change in current implementation)
 #'
 #' @export
-he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, block_size = 1000, outfile) {
+he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filename = NULL, alpha = -1,
+                               window_size = 1e7, nmcmc = 20, block_size = 1000, outfile, n_threads = 1) {
+
+
+  storage.mode(snp_cat) <- "integer"          # <- force integer
+  snp_cat <- as.matrix(snp_cat)               # ensure it's a matrix, not df
+  cat_names <- as.character(cat_names)
 
   # Stadardize
   for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
@@ -131,15 +137,29 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, block_size =
   rownames(multi_he) <- multi[, 2]
 
   #hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
-  hers <- he_multi_part_enrich_alpha(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
+  #hers <- he_multi_part_enrich_alpha(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
   
+  res <- he_sliding_window_part(
+    filename    = filename,               # PLINK prefix (WES)
+    pheno_mat   = multi_he,
+    snp_cat     = snp_cat,
+    cat_names   = cat_names,
+    window_size = window_size,
+    alpha       = alpha,                  # heritability model; -1 = unweighted (default)
+    common_filename = common_filename,    # optional common-SNP background GRM
+    nmcmc       = nmcmc,
+    se          = FALSE,
+    out_file    = outfile,
+    n_threads   = n_threads, seed = 12345
+  )
+
   # hers$genome_h2 contains the genome estimates per alpha
   # hers$$best_alpha contains best alpha based on Frobenius norm
   
-  info <- cbind(rownames(hers$genome_h2), hers$genome_h2, hers$genome_se, hers$fit_score, hers$best_alpha)
-  rownames(info) <- colnames(info) <- NULL
+  #info <- cbind(rownames(hers$genome_h2), hers$genome_h2, hers$genome_se, hers$fit_score, hers$best_alpha)
+  #rownames(info) <- colnames(info) <- NULL
 
-  return(info)
+  return(res)
 }
 
 #' Compute heritability based on sliding windows that account for flanking regions
