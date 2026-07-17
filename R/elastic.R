@@ -84,38 +84,13 @@ he_reg <- function(pheno, filename) {
   return(her)
 }
 
-#' Perform randomized double-partitioned Haseman-Elston regression for enrichment analysis
-#'
-#' @export
-he_reg_part <- function (filename, pheno, snp_cat, cat_names, block_size = 1000, outfile) {
-
-  # Stadardize
-  for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
-  for (j in 3:ncol(pheno)) {
-    if (any(is.na(pheno[, j]))) {
-      pheno[which(is.na(pheno[, j])), j] <- mean(pheno[, j], na.rm = T)
-    }
-  }
-  # Create multivariate phenotype
-  multi <- pheno
-  colnames(multi) <- c("FID", "IID", "Pheno")
-
-  # HE regression on the phenotype
-  multi_he <- as.matrix(multi[, -c(1, 2), drop = FALSE])
-  rownames(multi_he) <- multi[, 2]
-
-  hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
-
-  return(hers)
-}
-
 #' Perform randomized double-partitioned window-based Haseman-Elston regression for enrichment analysis AND alpha estimation
 #' Alpha from -1, -.75, -.5, -.25, 0, by default (and can't change in current implementation)
 #'
 #' @export
 he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filename = NULL, alpha = -1,
                                window_size = 1e6, nmcmc = 20, outfile, n_threads = 1,
-                               batch_size = 16) {
+                               batch_size = 16, genome_wide = FALSE) {
 
 
   storage.mode(snp_cat) <- "integer"          # <- force integer
@@ -140,22 +115,39 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
   #hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
   #hers <- he_multi_part_enrich_alpha(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
   
-  res <- he_sliding_window_part(
-    filename    = filename,               # PLINK prefix (WES)
-    pheno_mat   = multi_he,
-    snp_cat     = snp_cat,
-    cat_names   = cat_names,
-    window_size = window_size,
-    alpha       = alpha,                  # heritability model; -1 = unweighted (default)
-    common_filename = common_filename,    # optional common-SNP background GRM
-    nmcmc       = nmcmc,
-    se          = FALSE,
-    out_file    = outfile,
-    n_threads   = n_threads, 
-    batch_size  = batch_size,
-    seed        = 12345
-  )
-
+  if (!genome_wide) {
+    res <- he_sliding_window_part(
+      filename    = filename,               # PLINK prefix (WES)
+      pheno_mat   = multi_he,
+      snp_cat     = snp_cat,
+      cat_names   = cat_names,
+      window_size = window_size,
+      alpha       = alpha,                  # heritability model; -1 = unweighted (default)
+      common_filename = common_filename,    # optional common-SNP background GRM
+      nmcmc       = nmcmc,
+      se          = FALSE,
+      out_file    = outfile,
+      n_threads   = n_threads, 
+      batch_size  = batch_size,
+      seed        = 12345
+    )
+  } else {
+    res <- he_sliding_window_part_gw(
+      filename    = filename,               
+      pheno_mat   = multi_he,
+      snp_cat     = snp_cat,
+      cat_names   = cat_names,
+      window_size = window_size,
+      alpha       = alpha,                  
+      common_filename = common_filename,    
+      nmcmc       = nmcmc,
+      se          = FALSE,
+      out_file    = outfile,
+      n_threads   = n_threads, 
+      batch_size  = batch_size,
+      seed        = 12345
+    )
+  }
   # hers$genome_h2 contains the genome estimates per alpha
   # hers$$best_alpha contains best alpha based on Frobenius norm
   
