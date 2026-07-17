@@ -115,39 +115,22 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
   #hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
   #hers <- he_multi_part_enrich_alpha(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
   
-  if (!genome_wide) {
-    res <- he_sliding_window_part(
-      filename    = filename,               # PLINK prefix (WES)
-      pheno_mat   = multi_he,
-      snp_cat     = snp_cat,
-      cat_names   = cat_names,
-      window_size = window_size,
-      alpha       = alpha,                  # heritability model; -1 = unweighted (default)
-      common_filename = common_filename,    # optional common-SNP background GRM
-      nmcmc       = nmcmc,
-      se          = FALSE,
-      out_file    = outfile,
-      n_threads   = n_threads, 
-      batch_size  = batch_size,
-      seed        = 12345
-    )
-  } else {
-    res <- he_sliding_window_part_gw(
-      filename    = filename,               
-      pheno_mat   = multi_he,
-      snp_cat     = snp_cat,
-      cat_names   = cat_names,
-      window_size = window_size,
-      alpha       = alpha,                  
-      common_filename = common_filename,    
-      nmcmc       = nmcmc,
-      se          = FALSE,
-      out_file    = outfile,
-      n_threads   = n_threads, 
-      batch_size  = batch_size,
-      seed        = 12345
-    )
-  }
+  res <- he_sliding_window_part(
+    filename    = filename,               # PLINK prefix (WES)
+    pheno_mat   = multi_he,
+    snp_cat     = snp_cat,
+    cat_names   = cat_names,
+    window_size = window_size,
+    alpha       = alpha,                  # heritability model; -1 = unweighted (default)
+    common_filename = common_filename,    # optional common-SNP background GRM
+    nmcmc       = nmcmc,
+    se          = FALSE,
+    out_file    = outfile,
+    n_threads   = n_threads, 
+    batch_size  = batch_size,
+    seed        = 12345
+  )
+  
   # hers$genome_h2 contains the genome estimates per alpha
   # hers$$best_alpha contains best alpha based on Frobenius norm
   

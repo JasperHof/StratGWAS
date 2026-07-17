@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <random>
 #include <cmath>
+#include <utility>
 
 using namespace Rcpp;
 
@@ -30,6 +31,13 @@ using namespace Rcpp;
 //   components per window = { left, right, [common] }  (background)
 //                         + { cat_1, cat_2, ... }      (middle, RECORDED)
 //                         + residual (I)
+//
+// WINDOW SIZING (window_size + min_snps): the genome is partitioned into
+// consecutive CELLS, each of which is at least `window_size` bp AND at least
+// `min_snps` SNPs. A cell grows past window_size until it has min_snps SNPs (so
+// sparse regions are not chopped into tiny, high-variance windows). Each cell
+// serves as a middle exactly once and as a flank for its two neighbours, so the
+// rolling cache still reads every cell only once (right -> middle -> left).
 //
 // Two knobs beyond he_sliding_window:
 //   * snp_cat / cat_names : an (n_snps x n_cat) 0/1 membership matrix aligned to
@@ -128,11 +136,33 @@ static void standardize_capture_maf(GenoMat& X, std::vector<float>& maf) {
     }
 }
 
+// Read a WES cell by SNP-INDEX range [i0, i1) (a cell is defined by SNP indices,
+// not a bp grid, now that cells have variable width -- see build_cells).
+static Cell read_cell_idx(const std::string& prefix, int n_total, int n_snps,
+                          const std::vector<int>& keep, int i0, int i1) {
+    Cell cell; cell.i0 = -1;
+    int m = i1 - i0;
+    if (m <= 0) { cell.X = GenoMat(keep.size(), 0); return cell; }
+    int n_keep = (int) keep.size();
+    GenoMat X(n_keep, m);
+    IntegerMatrix block = readBedBlock(prefix + ".bed", n_total, n_snps, 0, n_total - 1, i0, i1 - 1);
+    for (int i = 0; i < n_keep; ++i)
+        for (int j = 0; j < m; ++j)
+            X(i, j) = (float) block(keep[i], j);
+    standardize_capture_maf(X, cell.maf);
+    cell.X = std::move(X);
+    cell.i0 = i0;
+    return cell;
+}
+
+// Read a cell by bp range [cell_start, cell_start + W) within chromosome index
+// range [lo, hi] of `bim`. Used for the COMMON fileset (matched to a WES cell's
+// bp span). Same routine as before.
 static Cell read_cell(const std::string& prefix, int n_total, int n_snps,
                       const BimInfo& bim, const std::vector<int>& keep,
                       int lo, int hi, long cell_start, long W) {
     Cell cell; cell.i0 = -1;
-    if (lo < 0 || hi < lo) { cell.X = GenoMat(keep.size(), 0); return cell; }
+    if (lo < 0 || hi < lo || W <= 0) { cell.X = GenoMat(keep.size(), 0); return cell; }
     int i0 = lower_index(bim.bp, lo, hi, cell_start);
     int i1 = lower_index(bim.bp, lo, hi, cell_start + W);
     int m = i1 - i0;
@@ -147,6 +177,34 @@ static Cell read_cell(const std::string& prefix, int n_total, int n_snps,
     cell.X = std::move(X);
     cell.i0 = i0;
     return cell;
+}
+
+// Partition a chromosome's WES SNP indices [c_lo, c_hi] into consecutive CELLS.
+// A cell grows from its start until BOTH (span >= W bp) AND (>= min_snps SNPs),
+// or the chromosome end is reached. A trailing remainder too small to form a
+// full cell on its own is absorbed into the last cell (so no tiny tail window).
+// Returns the [first,last] WES index of each cell.
+static std::vector< std::pair<int,int> > build_cells(const std::vector<long>& bp,
+        int c_lo, int c_hi, long W, int min_snps) {
+    std::vector< std::pair<int,int> > cells;
+    if (c_hi < c_lo) return cells;
+    int s = c_lo;
+    while (s <= c_hi) {
+        int e = s;
+        while (e < c_hi) {
+            long span = bp[e] - bp[s] + 1;          // inclusive bp span so far
+            int  cnt  = e - s + 1;
+            if (span >= W && cnt >= min_snps) break;
+            ++e;
+        }
+        // Absorb a trailing remainder that could not itself satisfy the rules.
+        int  rem_cnt  = c_hi - e;                    // SNPs after e
+        long rem_span = (e < c_hi) ? (bp[c_hi] - bp[e + 1] + 1) : 0;
+        if (rem_cnt > 0 && (rem_cnt < min_snps || rem_span < W)) e = c_hi;
+        cells.push_back(std::make_pair(s, e));
+        s = e + 1;
+    }
+    return cells;
 }
 
 // Build ONE variance-component matrix from a set of source columns: apply the
@@ -294,7 +352,7 @@ static void common_chr_range(const RunContext& ctx, const std::string& chr, int&
 // bookkeeping of which components are the recorded (middle-category) signal.
 // --------------------------------------------------------------------------
 struct PartWindow {
-    std::string chr; long w_start;
+    std::string chr; long w_start, w_end;
     int nL, nR, nC, nM;
     std::vector<GenoMat> X;        // all components (alpha-weighted, tr=n)
     std::vector<int> sig;          // indices in X that are signal (middle categories)
@@ -308,19 +366,23 @@ struct PartWindow {
 // readBedBlock + standardization are serial); the heavy per-window building is
 // done later in the parallel worker via build_part_window().
 struct RawWindow {
-    std::string chr; long w_start;
+    std::string chr; long w_start, w_end;
     int nL, nM, nR, nC;
     Cell wesL, wesM, wesR;         // standardized WES cells (left/middle/right)
     Cell com;                      // standardized, concatenated common cell (may be empty)
     int mid_i0;                    // .bim index of the middle cell's first SNP
 };
 
-// Rolling reader: caches L/M/R WES cells and L/M/R common cells (each read +
-// standardized once), shifts them, and hands each window its cells as a
-// RawWindow -- WITHOUT building components (that happens in the worker).
+// Rolling reader: partitions each chromosome into variable-width CELLS (>= W bp
+// AND >= min_snps SNPs; see build_cells), caches L/M/R WES cells and L/M/R
+// common cells, shifts them, and hands each window its cells as a RawWindow --
+// WITHOUT building components (that happens in the worker). Because middle and
+// flanks are all the SAME cells, each cell is read exactly once as it rolls
+// right -> middle -> left.
 class PartStream {
 public:
-    PartStream(const RunContext& ctx, long W) : ctx_(ctx), W_(W), ci_(0), have_(false) {}
+    PartStream(const RunContext& ctx, long W, int min_snps)
+        : ctx_(ctx), W_(W), min_snps_(min_snps), ci_(0), have_(false) {}
 
     bool next(RawWindow& rw) {
         while (true) {
@@ -333,27 +395,34 @@ public:
         }
     }
 private:
-    const RunContext& ctx_; long W_; size_t ci_; bool have_;
+    const RunContext& ctx_; long W_; int min_snps_; size_t ci_; bool have_;
     int c_lo_, c_hi_, cc_lo_, cc_hi_; long g_, glast_;
+    std::vector< std::pair<int,int> > cells_;    // WES SNP-index ranges for this chr
     Cell wesL_, wesM_, wesR_, comL_, comM_, comR_;
 
-    Cell wesCell(long cell) const {
-        return read_cell(ctx_.wes_prefix, ctx_.wes_n_total, ctx_.wes_n_snps,
-                         ctx_.wes_bim, ctx_.geno_keep, c_lo_, c_hi_, cell * W_, W_);
+    Cell empty_cell() const { Cell c; c.X = GenoMat(ctx_.n_inds, 0); c.i0 = -1; return c; }
+
+    Cell wesCell(long p) const {
+        if (p < 0 || p >= (long) cells_.size()) return empty_cell();
+        return read_cell_idx(ctx_.wes_prefix, ctx_.wes_n_total, ctx_.wes_n_snps,
+                             ctx_.geno_keep, cells_[p].first, cells_[p].second + 1);
     }
-    Cell comCell(long cell) const {
-        if (!ctx_.use_common) { Cell c; c.X = GenoMat(ctx_.n_inds, 0); c.i0 = -1; return c; }
+    Cell comCell(long p) const {
+        if (!ctx_.use_common || p < 0 || p >= (long) cells_.size()) return empty_cell();
+        long start = ctx_.wes_bim.bp[cells_[p].first];
+        long next  = (p + 1 < (long) cells_.size()) ? ctx_.wes_bim.bp[cells_[p + 1].first]
+                                                     : (ctx_.wes_bim.bp[c_hi_] + 1);
         return read_cell(ctx_.common_prefix, ctx_.common_n_total, ctx_.common_n_snps,
-                         ctx_.common_bim, ctx_.common_keep, cc_lo_, cc_hi_, cell * W_, W_);
+                         ctx_.common_bim, ctx_.common_keep, cc_lo_, cc_hi_, start, next - start);
     }
     void setup_chrom() {
         const std::string& chr = ctx_.chr_order[ci_];
         c_lo_ = ctx_.chr_lo[ci_]; c_hi_ = ctx_.chr_hi[ci_];
         common_chr_range(ctx_, chr, cc_lo_, cc_hi_);
-        long min_bp = ctx_.wes_bim.bp[c_lo_], max_bp = ctx_.wes_bim.bp[c_hi_];
-        g_ = min_bp / W_; glast_ = max_bp / W_;
-        wesL_ = wesCell(g_ - 1); wesM_ = wesCell(g_); wesR_ = wesCell(g_ + 1);
-        comL_ = comCell(g_ - 1); comM_ = comCell(g_); comR_ = comCell(g_ + 1);
+        cells_ = build_cells(ctx_.wes_bim.bp, c_lo_, c_hi_, W_, min_snps_);
+        g_ = 0; glast_ = (long) cells_.size() - 1;
+        wesL_ = wesCell(-1); wesM_ = wesCell(0); wesR_ = wesCell(1);
+        comL_ = comCell(-1); comM_ = comCell(0); comR_ = comCell(1);
     }
     void shift() {
         ++g_;
@@ -365,7 +434,8 @@ private:
     void assemble(RawWindow& rw) {
         rw = RawWindow();
         rw.chr = ctx_.chr_order[ci_];
-        rw.w_start = g_ * W_;
+        rw.w_start = ctx_.wes_bim.bp[cells_[g_].first];
+        rw.w_end   = ctx_.wes_bim.bp[cells_[g_].second];
         rw.mid_i0 = wesM_.i0;
         rw.nL = (int) wesL_.X.cols();
         rw.nM = (int) wesM_.X.cols();
@@ -399,7 +469,7 @@ private:
 // parallelize across cores.
 static void build_part_window(const RawWindow& rw, const RunContext& ctx, PartWindow& pw) {
     pw = PartWindow();
-    pw.chr = rw.chr; pw.w_start = rw.w_start;
+    pw.chr = rw.chr; pw.w_start = rw.w_start; pw.w_end = rw.w_end;
     pw.nL = rw.nL; pw.nR = rw.nR; pw.nC = rw.nC; pw.nM = rw.nM;
 
     // background components: left, right (WES flanks), common
@@ -586,7 +656,7 @@ struct PartResult {
     std::vector<double> fit;
     // window metadata (copied from the built PartWindow so the main-thread
     // driver can write output without re-touching the components)
-    std::string chr; long w_start; int nL, nR, nC, mid_total;
+    std::string chr; long w_start, w_end; int nL, nR, nC, mid_total;
     std::vector<int> sig_cat, sig_m;
 };
 
@@ -599,7 +669,7 @@ static void alloc_result(PartResult& res, const PartWindow& pw, int P) {
     res.conv.assign(nsig, std::vector<int>(P, 0));
     res.iters.assign(nsig, std::vector<int>(P, 0));
     res.fit.assign(P, NA_REAL);
-    res.chr = pw.chr; res.w_start = pw.w_start;
+    res.chr = pw.chr; res.w_start = pw.w_start; res.w_end = pw.w_end;
     res.nL = pw.nL; res.nR = pw.nR; res.nC = pw.nC; res.mid_total = pw.mid_total;
     res.sig_cat = pw.sig_cat; res.sig_m = pw.sig_m;
 }
@@ -736,20 +806,12 @@ static void reml_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
 // ===========================================================================
 // Progress bar (same throttled single-line style as he_sliding_window.cpp)
 // ===========================================================================
-// Count windows that will actually be processed (middle window has >=1 SNP),
-// without any genotype I/O, so we can show a percentage / ETA.
-static int count_total_windows(const RunContext& ctx, long W) {
+// Count windows (= cells) that will be processed, without genotype I/O, so we
+// can show a percentage / ETA. Uses the same variable-cell partition as the run.
+static int count_total_windows(const RunContext& ctx, long W, int min_snps) {
     int total = 0;
-    for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
-        int c_lo = ctx.chr_lo[ci], c_hi = ctx.chr_hi[ci];
-        long min_bp = ctx.wes_bim.bp[c_lo], max_bp = ctx.wes_bim.bp[c_hi];
-        long first = (min_bp / W) * W;
-        for (long w = first; w <= max_bp; w += W) {
-            int iM0 = lower_index(ctx.wes_bim.bp, c_lo, c_hi, w);
-            int iR0 = lower_index(ctx.wes_bim.bp, c_lo, c_hi, w + W);
-            if (iR0 - iM0 > 0) ++total;
-        }
-    }
+    for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci)
+        total += (int) build_cells(ctx.wes_bim.bp, ctx.chr_lo[ci], ctx.chr_hi[ci], W, min_snps).size();
     return total;
 }
 
@@ -808,7 +870,7 @@ struct Progress {
 // Driver (parallel over windows in batches; streams a long-format table)
 // ===========================================================================
 struct PartParams {
-    long W; int method;                 // 0 = HE, 1 = REML
+    long W; int min_snps; int method;   // method: 0 = HE, 1 = REML
     int nmcmc; int max_iter; double tol; bool se;
     std::string out_file; int batch_size; int n_threads; unsigned seed;
 };
@@ -846,7 +908,7 @@ struct RMLWorker : public RcppParallel::Worker {
 };
 
 static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
-    const long W = pr.W; const int P = ctx.n_pheno; const Eigen::MatrixXd& Y = ctx.Y;
+    const int P = ctx.n_pheno; const Eigen::MatrixXd& Y = ctx.Y;
     Eigen::setNbThreads(1);
     if (pr.n_threads > 0) {
         std::string nt = std::to_string(pr.n_threads);
@@ -881,10 +943,10 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
     std::vector< std::vector<double> > tot_var(NC, std::vector<double>(P, 0.0));
     std::vector<double> tot_fit(P, 0.0);        // summed fit / logL per trait
 
-    PartStream stream(ctx, W);
+    PartStream stream(ctx, pr.W, pr.min_snps);
     long processed = 0; int n_win = 0;
     Progress prog; prog.start(pr.method == 0 ? "HE-part" : "REML-part",
-                              count_total_windows(ctx, W));
+                              count_total_windows(ctx, pr.W, pr.min_snps));
 
     // -------- DEBUG timing/size checkpoints (set DEBUG_PART 1 to enable) ------
 #define DEBUG_PART 0
@@ -952,7 +1014,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                     double share = (mid_vg != 0.0 && !std::isnan(vg)) ? vg / mid_vg : NA_REAL;
                     double enr = (!std::isnan(share) && !std::isnan(expected) && expected > 0) ? share / expected : NA_REAL;
                     if (tofile) {
-                        fout << r.chr << '\t' << r.w_start << '\t' << (r.w_start + W) << '\t'
+                        fout << r.chr << '\t' << r.w_start << '\t' << r.w_end << '\t'
                              << r.nL << '\t' << r.nR << '\t' << r.nC << '\t' << ph << '\t'
                              << ctx.cat_names[cat] << '\t' << mc << '\t';
                         wr(fout, vg); fout << '\t'; wr(fout, r.se_vg[k][t]); fout << '\t';
@@ -1039,6 +1101,7 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   const IntegerMatrix snp_cat,
                                   const CharacterVector cat_names,
                                   double window_size = 1e6,
+                                  int min_snps = 1000,
                                   double alpha = -1.0,
                                   Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
                                   int nmcmc = 20,
@@ -1048,8 +1111,9 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   int n_threads = 0,
                                   int seed = 12345) {
     if (window_size <= 0) stop("window_size must be positive");
+    if (min_snps < 1) min_snps = 1;
     RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename);
-    PartParams pr; pr.W = (long) window_size; pr.method = 0;
+    PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 0;
     pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
     return part_driver(ctx, pr);
@@ -1061,6 +1125,7 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
                                     const IntegerMatrix snp_cat,
                                     const CharacterVector cat_names,
                                     double window_size = 1e6,
+                                    int min_snps = 1000,
                                     double alpha = -1.0,
                                     Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
                                     int max_iter = 100,
@@ -1071,8 +1136,9 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
                                     int n_threads = 0,
                                     int seed = 12345) {
     if (window_size <= 0) stop("window_size must be positive");
+    if (min_snps < 1) min_snps = 1;
     RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename);
-    PartParams pr; pr.W = (long) window_size; pr.method = 1;
+    PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 1;
     pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
     return part_driver(ctx, pr);
