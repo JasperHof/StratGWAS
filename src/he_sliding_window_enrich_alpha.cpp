@@ -651,8 +651,9 @@ struct PartResult {
     // per signal component (category), per trait
     std::vector< std::vector<double> > vg, se_vg, h2, se_h2;   // [sig][trait]
     std::vector< std::vector<int> > conv, iters;               // REML
-    // per trait (whole-window model fit): HE = sigma' q (Frobenius explained
-    // moment; higher = better), REML = converged restricted log-likelihood.
+    // per trait (whole-window model fit): HE = genetic part of sigma'q
+    // (sum_c sigma_c q_c, residual term excluded; higher = better),
+    // REML = converged restricted log-likelihood.
     std::vector<double> fit;
     // window metadata (copied from the built PartWindow so the main-thread
     // driver can write output without re-touching the components)
@@ -714,7 +715,16 @@ static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
         for (int c = 0; c < C; ++c) q[c] = XtY[c].col(t).cast<double>().squaredNorm() / M[c];
         q[env] = Y.col(t).squaredNorm();
         Eigen::VectorXd sigma = Tcod.solve(q);
-        res.fit[t] = sigma.dot(q);                       // sigma' q = Frobenius explained moment
+        // Model fit for choosing alpha: the GENETIC part of sigma'q only.
+        // The full sigma'q would add sigma[env] * y'y, and since y'y is identical
+        // for every alpha and huge (~n per window, summed over thousands of
+        // windows) it swamps the genetic signal -- maximizing it then just
+        // rewards whichever alpha leaves the most variance in the residual, which
+        // biases the selected alpha upward (validated in simulation). Dropping the
+        // residual term restores calibration.
+        double fit_gen = 0.0;
+        for (int c = 0; c < C; ++c) fit_gen += sigma[c] * q[c];
+        res.fit[t] = fit_gen;
 
         Eigen::MatrixXd Cov;
         if (se) {
@@ -933,7 +943,10 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
         fout << "\n";
     }
     // `fit` = whole-window model fit, repeated on each category row of a window:
-    //   HE   -> sigma' q  (Frobenius explained moment; larger = better)
+    //   HE   -> GENETIC part of sigma'q, i.e. sum_c sigma_c q_c over the genetic
+    //           components only (the residual term sigma_env * y'y is excluded --
+    //           it is alpha-independent and would swamp the signal; see the note
+    //           in he_part_compute). Larger = better.
     //   REML -> converged restricted log-likelihood (larger = better)
     // Summed over windows it is the per-trait score for choosing alpha.
 

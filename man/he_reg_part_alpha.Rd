@@ -17,7 +17,8 @@ he_reg_part_alpha(
   outfile,
   n_threads = 1,
   batch_size = 16,
-  genome_wide = FALSE
+  genome_wide = FALSE,
+  min_snps = 1000
 )
 }
 \description{
