@@ -20,7 +20,8 @@ he_reg_part_alpha(
   genome_wide = FALSE,
   min_snps = 1000,
   weights = NULL,
-  covariates = NULL
+  covariates = NULL,
+  coher = FALSE
 )
 }
 \description{
