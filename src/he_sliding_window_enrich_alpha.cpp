@@ -755,10 +755,18 @@ static void reml_fit(const RemlWindow& W, const Eigen::VectorXd& Zty, const Eige
 // ===========================================================================
 // Per-window results + compute kernels
 // ===========================================================================
+// Number of unordered trait pairs, and their canonical order: the pair index
+// runs s = 0..P-1, t = s+1..P-1, incrementing by one each time. The driver uses
+// the SAME order when naming and accumulating, so the two never disagree.
+static inline int n_trait_pairs(int P) { return (P * (P - 1)) / 2; }
+
 struct PartResult {
     // per signal component (category), per trait
     std::vector< std::vector<double> > vg, se_vg, h2, se_h2;   // [sig][trait]
     std::vector< std::vector<int> > conv, iters;               // REML
+    // per signal component, per TRAIT PAIR: genetic covariance (co-heritability)
+    // contributed by that category. Empty unless coher = TRUE. [sig][pair]
+    std::vector< std::vector<double> > cov12;
     // per trait (whole-window model fit): HE = genetic part of sigma'q
     // (sum_c sigma_c q_c, residual term excluded; higher = better),
     // REML = converged restricted log-likelihood.
@@ -769,7 +777,7 @@ struct PartResult {
     std::vector<int> sig_cat, sig_m;
 };
 
-static void alloc_result(PartResult& res, const PartWindow& pw, int P) {
+static void alloc_result(PartResult& res, const PartWindow& pw, int P, int n_pairs) {
     int nsig = (int) pw.sig.size();
     res.vg.assign(nsig, std::vector<double>(P, NA_REAL));
     res.se_vg.assign(nsig, std::vector<double>(P, NA_REAL));
@@ -777,6 +785,8 @@ static void alloc_result(PartResult& res, const PartWindow& pw, int P) {
     res.se_h2.assign(nsig, std::vector<double>(P, NA_REAL));
     res.conv.assign(nsig, std::vector<int>(P, 0));
     res.iters.assign(nsig, std::vector<int>(P, 0));
+    if (n_pairs > 0) res.cov12.assign(nsig, std::vector<double>(n_pairs, NA_REAL));
+    else             res.cov12.clear();
     res.fit.assign(P, NA_REAL);
     res.chr = pw.chr; res.w_start = pw.w_start; res.w_end = pw.w_end;
     res.nL = pw.nL; res.nR = pw.nR; res.nC = pw.nC; res.mid_total = pw.mid_total;
@@ -786,10 +796,11 @@ static void alloc_result(PartResult& res, const PartWindow& pw, int P) {
 // ---- HE (randomized MoM), records every signal component ----
 static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
                             const std::vector<double>& Vp, int nmcmc, unsigned seed,
-                            bool se, PartResult& res) {
+                            bool se, bool coher, PartResult& res) {
     int C = (int) pw.X.size(), env = C, n = (int) Y.rows(), P = (int) Y.cols();
     int nsig = (int) pw.sig.size();
-    alloc_result(res, pw, P);
+    int npair = coher ? n_trait_pairs(P) : 0;
+    alloc_result(res, pw, P, npair);
     if (C == 0) return;
 
     std::vector<double> M(C);
@@ -875,6 +886,24 @@ static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
             }
         }
     }
+
+    // ---- CO-HERITABILITY (genetic covariance) for every trait pair ----------
+    // The bivariate moment system shares the SAME T: taking cross-moments,
+    //     E[y_s' K_i y_t] = sum_c sigma_12,c tr(K_i K_c) + sigma_12,e tr(K_i),
+    // so only the right-hand side changes, from y'K y to y_s' K y_t. And since
+    // XtY[c] already holds X_c' y for EVERY trait, q_12 is just a dot product of
+    // two columns we have -- no genotype work, no extra factorization.
+    if (npair > 0) {
+        int p = 0;
+        for (int s = 0; s < P; ++s) for (int t = s + 1; t < P; ++t, ++p) {
+            Eigen::VectorXd q12(C + 1);
+            for (int c = 0; c < C; ++c)
+                q12[c] = XtY[c].col(s).cast<double>().dot(XtY[c].col(t).cast<double>()) / M[c];
+            q12[env] = Y.col(s).dot(Y.col(t));
+            Eigen::VectorXd s12 = Tcod.solve(q12);
+            for (int k = 0; k < nsig; ++k) res.cov12[k][p] = s12[pw.sig[k]];
+        }
+    }
 }
 
 // ---- REML (low-rank), records every signal component ----
@@ -883,7 +912,7 @@ static void reml_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
                               bool se, unsigned seed, PartResult& res) {
     int C = (int) pw.X.size(), n = (int) Y.rows(), P = (int) Y.cols();
     int nsig = (int) pw.sig.size();
-    alloc_result(res, pw, P);
+    alloc_result(res, pw, P, 0);        // co-heritability is HE-only
     if (C == 0) return;
 
     // Build concatenated RemlWindow (Gram via float rankUpdate -> double)
@@ -990,6 +1019,7 @@ struct Progress {
 struct PartParams {
     long W; int min_snps; int method;   // method: 0 = HE, 1 = REML
     int nmcmc; int max_iter; double tol; bool se;
+    bool coher;                         // also estimate co-heritability (HE only)
     std::string out_file; int batch_size; int n_threads; unsigned seed;
 };
 
@@ -1006,7 +1036,7 @@ struct HEWorker : public RcppParallel::Worker {
     void operator()(std::size_t begin, std::size_t end) {
         for (std::size_t w = begin; w < end; ++w) {
             PartWindow pw; build_part_window(batch[w], ctx, pw);
-            he_part_compute(pw, Y, Vp, pr.nmcmc, pr.seed + soff + (unsigned) w, pr.se, out[w]);
+            he_part_compute(pw, Y, Vp, pr.nmcmc, pr.seed + soff + (unsigned) w, pr.se, pr.coher, out[w]);
         }
     }
 };
@@ -1063,6 +1093,21 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
     std::vector< std::vector<double> > tot_vg(NC, std::vector<double>(P, 0.0));
     std::vector< std::vector<double> > tot_var(NC, std::vector<double>(P, 0.0));
     std::vector<double> tot_fit(P, 0.0);        // summed fit / logL per trait
+
+    // co-heritability: pair names (same s<t order as he_part_compute) + totals
+    const int NPAIR = (pr.method == 0 && pr.coher) ? n_trait_pairs(P) : 0;
+    std::vector<std::string> pair_name(NPAIR);
+    std::vector<int> pair_s(NPAIR), pair_t(NPAIR);   // explicit index -> (s,t) lookup
+    if (NPAIR > 0) {
+        int p = 0;
+        for (int s = 0; s < P; ++s) for (int t = s + 1; t < P; ++t, ++p) {
+            pair_s[p] = s; pair_t[p] = t;
+            pair_name[p] = as<std::string>(ctx.trait_names[s]) + "|" +
+                           as<std::string>(ctx.trait_names[t]);
+        }
+        Rcout << "Also estimating co-heritability for " << NPAIR << " trait pair(s)\n";
+    }
+    std::vector< std::vector<double> > tot_cov(NC, std::vector<double>(NPAIR > 0 ? NPAIR : 1, 0.0));
 
     PartStream stream(ctx, pr.W, pr.min_snps);
     long processed = 0; int n_win = 0;
@@ -1148,6 +1193,35 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                     if (!std::isnan(r.se_vg[k][t])) tot_var[cat][t] += r.se_vg[k][t] * r.se_vg[k][t];
                 }
             }
+            // ---- co-heritability rows: phenotype field is "traitA|traitB", and
+            // vg / h2 hold the genetic COVARIANCE and the covariance normalized by
+            // sqrt(Vp_s Vp_t). SEs are NA -- use a block jackknife for those.
+            if (NPAIR > 0 && !r.cov12.empty()) {
+                int p = 0;
+                for (int s = 0; s < P; ++s) for (int t = s + 1; t < P; ++t, ++p) {
+                    double den = std::sqrt(Vp[s] * Vp[t]);
+                    double mid_cov = 0.0;
+                    for (int k = 0; k < nsig; ++k)
+                        if (!std::isnan(r.cov12[k][p])) mid_cov += r.cov12[k][p];
+                    for (int k = 0; k < nsig; ++k) {
+                        int cat = r.sig_cat[k]; int mc = r.sig_m[k];
+                        double cv = r.cov12[k][p];
+                        double expected = (r.mid_total > 0) ? (double) mc / r.mid_total : NA_REAL;
+                        double share = (mid_cov != 0.0 && !std::isnan(cv)) ? cv / mid_cov : NA_REAL;
+                        double enr = (!std::isnan(share) && !std::isnan(expected) && expected > 0) ? share / expected : NA_REAL;
+                        if (tofile) {
+                            fout << r.chr << '\t' << r.w_start << '\t' << r.w_end << '\t'
+                                 << r.nL << '\t' << r.nR << '\t' << r.nC << '\t' << pair_name[p] << '\t'
+                                 << ctx.cat_names[cat] << '\t' << mc << '\t';
+                            wr(fout, cv);        fout << "\tNA\t";                  // vg, se_vg
+                            wr(fout, (den > 0) ? cv / den : NA_REAL); fout << "\tNA\t";  // h2, se_h2
+                            wr(fout, enr);       fout << "\tNA";                    // enrichment, fit
+                            fout << '\n';
+                        }
+                        if (!std::isnan(cv)) tot_cov[cat][p] += cv;
+                    }
+                }
+            }
             ++n_win;
             prog.tick(r.chr, r.mid_total);          // one tick per finished window
         }
@@ -1182,6 +1256,19 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                 fout << '\n';
             }
         }
+        // genome-wide TOTAL rows for each trait pair (co-heritability per category)
+        for (int p = 0; p < NPAIR; ++p) {
+            double den = std::sqrt(Vp[pair_s[p]] * Vp[pair_t[p]]);
+            for (int c = 0; c < NC; ++c) {
+                double cv = tot_cov[c][p];
+                fout << "TOTAL\tNA\tNA\tNA\tNA\tNA\t" << pair_name[p] << '\t'
+                     << ctx.cat_names[c] << "\tNA\t";
+                wr(fout, cv); fout << "\tNA\t";
+                wr(fout, (den > 0) ? cv / den : NA_REAL); fout << "\tNA\tNA\tNA";
+                if (pr.method == 1) fout << "\tNA\tNA";
+                fout << '\n';
+            }
+        }
         fout.close();
     }
     Rcout << "Windows estimated: " << n_win << "\n";
@@ -1204,7 +1291,17 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
     for (int t = 0; t < P; ++t) fit_out[t] = tot_fit[t];
     fit_out.names() = ctx.trait_names;
 
+    // genome-wide co-heritability per category x trait pair (empty if coher = FALSE)
+    Rcpp::NumericMatrix gcov(NC, NPAIR > 0 ? NPAIR : 0);
+    if (NPAIR > 0) {
+        for (int p = 0; p < NPAIR; ++p)
+            for (int c = 0; c < NC; ++c) gcov(c, p) = tot_cov[c][p];
+        rownames(gcov) = rn;
+        colnames(gcov) = wrap(pair_name);
+    }
+
     return List::create(_["genome_h2"] = gh2, _["genome_se"] = gse,
+                        _["genome_coher"] = gcov, _["pair_names"] = wrap(pair_name),
                         _["fit"] = fit_out,
                         _["categories"] = wrap(ctx.cat_names), _["trait_names"] = ctx.trait_names,
                         _["alpha"] = ctx.alpha, _["method"] = (pr.method == 0 ? "HE" : "REML"),
@@ -1232,12 +1329,14 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   int n_threads = 0,
                                   int seed = 12345,
                                   Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
-                                  Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue) {
+                                  Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
+                                  bool coher = false) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
     RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights, covariates);
+    if (coher && ctx.n_pheno < 2) stop("coher = TRUE needs at least two phenotype columns");
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 0;
-    pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se;
+    pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se; pr.coher = coher;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
     return part_driver(ctx, pr);
 }
@@ -1264,7 +1363,7 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
     if (min_snps < 1) min_snps = 1;
     RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights, covariates);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 1;
-    pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se;
+    pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se; pr.coher = false;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
     return part_driver(ctx, pr);
 }
