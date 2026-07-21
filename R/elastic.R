@@ -90,7 +90,8 @@ he_reg <- function(pheno, filename) {
 #' @export
 he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filename = NULL, alpha = -1,
                                window_size = 1e6, nmcmc = 20, outfile, n_threads = 1,
-                               batch_size = 16, genome_wide = FALSE, min_snps = 1000) {
+                               batch_size = 16, genome_wide = FALSE, min_snps = 1000,
+                               weights = NULL) {
 
 
   storage.mode(snp_cat) <- "integer"          # <- force integer
@@ -129,7 +130,8 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
     n_threads   = n_threads, 
     batch_size  = batch_size,
     seed        = 12345,
-    min_snps    = min_snps
+    min_snps    = min_snps,
+    weights     = weights
   )
   
   # hers$genome_h2 contains the genome estimates per alpha

@@ -208,21 +208,38 @@ static std::vector< std::pair<int,int> > build_cells(const std::vector<long>& bp
 }
 
 // Build ONE variance-component matrix from a set of source columns: apply the
-// alpha weight per column, then scale the whole block so tr(G) = n (so the
-// fitted variance component is directly the h2 contribution). Returns an empty
-// (0-col) matrix if the block is degenerate.
+// alpha weight per column (times the optional per-SNP LD weight), then scale the
+// whole block so tr(G) = n (so the fitted variance component is directly the h2
+// contribution). Returns an empty (0-col) matrix if the block is degenerate.
+//
+// LD WEIGHTS: `wts` (may be NULL) is the per-SNP weight vector aligned to the WES
+// .bim, and `i0` is the .bim index of column 0 of X, so the weight of local column
+// j is wts[i0 + j]. A SNP's variance contribution scales with its weight, so the
+// COLUMN multiplier is sqrt(weight). The trace normalization below is unchanged,
+// so the fitted component is still directly the h2 contribution.
 static GenoMat build_component(const GenoMat& X, const std::vector<float>& maf,
-                               const std::vector<int>& cols, double alpha, int n) {
+                               const std::vector<int>& cols, double alpha, int n,
+                               const std::vector<float>* wts = 0, int i0 = 0) {
     int m = (int) cols.size();
     if (m == 0) return GenoMat(X.rows(), 0);
     GenoMat W(X.rows(), m);
-    bool unit = (alpha == -1.0);                 // weight = 1 everywhere; skip pow
+    bool unit = (alpha == -1.0);                 // alpha weight = 1 everywhere; skip pow
     double e = (1.0 + alpha) / 2.0;
+    int nw = (wts != 0) ? (int) wts->size() : 0;
     for (int k = 0; k < m; ++k) {
         int j = cols[k];
-        if (unit) { W.col(k) = X.col(j); continue; }
-        double f = maf[j];
-        double w = (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), e) : 1.0;
+        double w = 1.0;
+        if (!unit) {
+            double f = maf[j];
+            w = (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), e) : 1.0;
+        }
+        if (nw > 0) {                            // per-SNP LD weight (sqrt on the column)
+            int g = i0 + j;
+            double lw = (g >= 0 && g < nw) ? (double) (*wts)[g] : 1.0;
+            if (lw < 0.0) lw = 0.0;
+            w *= std::sqrt(lw);
+        }
+        if (w == 1.0) { W.col(k) = X.col(j); continue; }
         W.col(k) = X.col(j) * (float) w;
     }
     double ss = W.colwise().squaredNorm().cast<double>().sum();   // ||W||_F^2, double
@@ -251,11 +268,16 @@ struct RunContext {
     std::vector<std::string> cat_names;      // length n_cat (+ "uncategorized" appended)
     std::vector< std::vector<int> > snp_cats; // per WES SNP: category ids it belongs to
     double alpha;
+    // Optional per-SNP LD weights, aligned to the WES .bim (empty = all weights 1).
+    // Applied to the WES components (flanks + middle categories) only; the
+    // common-SNP background is a different fileset so it stays unweighted.
+    std::vector<float> snp_weights;
 };
 
 static RunContext setup_context(const std::string& filename, const SEXP pheno_mat,
                                 const IntegerMatrix& snp_cat, const CharacterVector& cat_names,
-                                double alpha, Rcpp::Nullable<Rcpp::String> common_filename) {
+                                double alpha, Rcpp::Nullable<Rcpp::String> common_filename,
+                                Rcpp::Nullable<Rcpp::NumericVector> weights) {
     RunContext ctx;
     ctx.wes_prefix = filename;
     ctx.wes_n_snps = count_lines(filename + ".bim");
@@ -282,6 +304,21 @@ static RunContext setup_context(const std::string& filename, const SEXP pheno_ma
     for (int j = 0; j < ctx.wes_n_snps; ++j)
         for (int c = 0; c < ctx.n_cat; ++c)
             if (snp_cat(j, c) == 1) ctx.snp_cats[j].push_back(c);
+
+    // Optional per-SNP LD weights (one per WES .bim row). Stored as plain floats
+    // so the parallel workers can read them without touching the R API.
+    if (weights.isNotNull()) {
+        Rcpp::NumericVector wv(weights.get());
+        if (wv.size() != ctx.wes_n_snps)
+            stop("weights must have one entry per SNP in the WES .bim file");
+        ctx.snp_weights.resize(ctx.wes_n_snps);
+        for (int j = 0; j < ctx.wes_n_snps; ++j) {
+            double w = wv[j];
+            if (ISNAN(w) || w < 0.0) w = 0.0;      // NA / negative -> drop the SNP
+            ctx.snp_weights[j] = (float) w;
+        }
+        Rcout << "Using per-SNP LD weights (" << ctx.wes_n_snps << " values)\n";
+    }
 
     // Phenotype
     Rcpp::NumericMatrix pheno; CharacterVector pheno_ids;
@@ -472,14 +509,18 @@ static void build_part_window(const RawWindow& rw, const RunContext& ctx, PartWi
     pw.chr = rw.chr; pw.w_start = rw.w_start; pw.w_end = rw.w_end;
     pw.nL = rw.nL; pw.nR = rw.nR; pw.nC = rw.nC; pw.nM = rw.nM;
 
+    // per-SNP LD weights for the WES components (NULL if none were supplied)
+    const std::vector<float>* wp = ctx.snp_weights.empty() ? 0 : &ctx.snp_weights;
+
     // background components: left, right (WES flanks), common
     if (rw.nL > 0) { std::vector<int> cols(rw.nL); for (int j = 0; j < rw.nL; ++j) cols[j] = j;
-        GenoMat g = build_component(rw.wesL.X, rw.wesL.maf, cols, ctx.alpha, ctx.n_inds);
+        GenoMat g = build_component(rw.wesL.X, rw.wesL.maf, cols, ctx.alpha, ctx.n_inds, wp, rw.wesL.i0);
         if (g.cols() > 0) pw.X.push_back(std::move(g)); }
     if (rw.nR > 0) { std::vector<int> cols(rw.nR); for (int j = 0; j < rw.nR; ++j) cols[j] = j;
-        GenoMat g = build_component(rw.wesR.X, rw.wesR.maf, cols, ctx.alpha, ctx.n_inds);
+        GenoMat g = build_component(rw.wesR.X, rw.wesR.maf, cols, ctx.alpha, ctx.n_inds, wp, rw.wesR.i0);
         if (g.cols() > 0) pw.X.push_back(std::move(g)); }
     if (ctx.use_common && rw.nC > 0) { std::vector<int> cols(rw.nC); for (int j = 0; j < rw.nC; ++j) cols[j] = j;
+        // common fileset has its own .bim, so the WES-aligned weights don't apply
         GenoMat g = build_component(rw.com.X, rw.com.maf, cols, ctx.alpha, ctx.n_inds);
         if (g.cols() > 0) pw.X.push_back(std::move(g)); }
 
@@ -498,7 +539,7 @@ static void build_part_window(const RawWindow& rw, const RunContext& ctx, PartWi
     for (int c = 0; c <= ctx.n_cat; ++c) {
         int m = (int) cat_cols[c].size();
         if (m == 0) continue;
-        GenoMat g = build_component(rw.wesM.X, rw.wesM.maf, cat_cols[c], ctx.alpha, ctx.n_inds);
+        GenoMat g = build_component(rw.wesM.X, rw.wesM.maf, cat_cols[c], ctx.alpha, ctx.n_inds, wp, rw.wesM.i0);
         if (g.cols() == 0) continue;
         pw.sig.push_back((int) pw.X.size());
         pw.sig_cat.push_back(c);
@@ -1122,10 +1163,11 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   std::string out_file = "",
                                   int batch_size = 8,
                                   int n_threads = 0,
-                                  int seed = 12345) {
+                                  int seed = 12345,
+                                  Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
-    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename);
+    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 0;
     pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
@@ -1147,10 +1189,11 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
                                     std::string out_file = "",
                                     int batch_size = 4,
                                     int n_threads = 0,
-                                    int seed = 12345) {
+                                    int seed = 12345,
+                                    Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
-    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename);
+    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 1;
     pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
