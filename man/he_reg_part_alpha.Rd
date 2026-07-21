@@ -19,7 +19,8 @@ he_reg_part_alpha(
   batch_size = 16,
   genome_wide = FALSE,
   min_snps = 1000,
-  weights = NULL
+  weights = NULL,
+  covariates = NULL
 )
 }
 \description{

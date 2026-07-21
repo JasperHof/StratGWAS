@@ -249,6 +249,32 @@ static GenoMat build_component(const GenoMat& X, const std::vector<float>& maf,
     return W;
 }
 
+// Project covariates out of a standardized genotype block -> RESIDUAL GENOTYPES
+// (LDAK-KVIK Supplementary Note 3). Z is the (centred) n x q covariate matrix and
+// M = (Z'Z)^-1 Z' its q x n projector, both precomputed once in setup_context.
+//
+// Why residualize the GENOTYPES and not just the phenotype: if only y is
+// residualized, q_c is computed in the residual space but T still uses the
+// unprojected traces tr(K_a K_b) and tr(K_c), which are too large -- so
+// sigma = T^-1 q comes out systematically too small. Projecting the genotypes
+// makes numerator and denominator consistent (q is unchanged, since H y = y~
+// already, while T is now built from the projected GRMs).
+//
+// Columns are rescaled back to unit variance afterwards so the alpha weighting and
+// trace normalization behave exactly as before. MAF is captured BEFORE projection
+// (it is an allele frequency, not a property of the residual).
+static void project_covariates(GenoMat& X, const GenoMat& Z, const GenoMat& M) {
+    if (X.cols() == 0 || Z.cols() == 0) return;
+    X.noalias() -= Z * (M * X);                       // X <- (I - Z(Z'Z)^-1 Z') X
+    const int n = (int) X.rows();
+    for (int j = 0; j < X.cols(); ++j) {
+        double ss = X.col(j).cast<double>().squaredNorm();
+        double sd = std::sqrt(ss / (n - 1));
+        if (sd > 1e-10) X.col(j) /= (float) sd;
+        else X.col(j).setZero();
+    }
+}
+
 // --------------------------------------------------------------------------
 // Context
 // --------------------------------------------------------------------------
@@ -272,12 +298,16 @@ struct RunContext {
     // Applied to the WES components (flanks + middle categories) only; the
     // common-SNP background is a different fileset so it stays unweighted.
     std::vector<float> snp_weights;
+    // Optional covariates -> residual genotypes. covZ is the centred n x q matrix
+    // (analysis order), covM = (Z'Z)^-1 Z' is q x n. Empty = no projection.
+    GenoMat covZ, covM;
 };
 
 static RunContext setup_context(const std::string& filename, const SEXP pheno_mat,
                                 const IntegerMatrix& snp_cat, const CharacterVector& cat_names,
                                 double alpha, Rcpp::Nullable<Rcpp::String> common_filename,
-                                Rcpp::Nullable<Rcpp::NumericVector> weights) {
+                                Rcpp::Nullable<Rcpp::NumericVector> weights,
+                                Rcpp::Nullable<Rcpp::NumericMatrix> covariates) {
     RunContext ctx;
     ctx.wes_prefix = filename;
     ctx.wes_n_snps = count_lines(filename + ".bim");
@@ -346,6 +376,32 @@ static RunContext setup_context(const std::string& filename, const SEXP pheno_ma
     for (int i = 0; i < ctx.n_inds; ++i)
         for (int j = 0; j < ctx.n_pheno; ++j)
             ctx.Y(i, j) = pheno(pheno_keep[i], j);
+
+    // Optional covariates -> residual genotypes. Rows are assumed to follow the
+    // PHENOTYPE file (no FID/IID columns), so they are reordered with the same
+    // pheno_keep mapping used for Y above.
+    if (covariates.isNotNull()) {
+        Rcpp::NumericMatrix cv(covariates.get());
+        if (cv.nrow() != pheno.nrow())
+            stop("covariates must have one row per row of the phenotype matrix (no FID/IID columns)");
+        int qc = cv.ncol();
+        if (qc > 0) {
+            Eigen::MatrixXd Zd(ctx.n_inds, qc);
+            for (int i = 0; i < ctx.n_inds; ++i)
+                for (int j = 0; j < qc; ++j) {
+                    double v = cv(pheno_keep[i], j);
+                    Zd(i, j) = ISNAN(v) ? 0.0 : v;
+                }
+            for (int j = 0; j < qc; ++j) Zd.col(j).array() -= Zd.col(j).mean();  // centre
+            // COD pseudo-inverse: safe if covariates are collinear / rank deficient
+            Eigen::MatrixXd ZtZ = Zd.transpose() * Zd;
+            Eigen::MatrixXd Md  = ZtZ.completeOrthogonalDecomposition().pseudoInverse()
+                                  * Zd.transpose();
+            ctx.covZ = Zd.cast<float>();
+            ctx.covM = Md.cast<float>();
+            Rcout << "Regressing " << qc << " covariates out of genotypes (residual genotypes)\n";
+        }
+    }
 
     CharacterVector analysis_iid(ctx.n_inds);
     for (int i = 0; i < ctx.n_inds; ++i) analysis_iid[i] = geno_iid[ctx.geno_keep[i]];
@@ -439,18 +495,29 @@ private:
 
     Cell empty_cell() const { Cell c; c.X = GenoMat(ctx_.n_inds, 0); c.i0 = -1; return c; }
 
+    // Residualize a freshly-read cell on the covariates (no-op if none given).
+    // Applied to WES and common cells alike -- the projection is over individuals,
+    // so every component in the model must live in the same residual space.
+    void residualize(Cell& c) const {
+        if (ctx_.covZ.cols() > 0) project_covariates(c.X, ctx_.covZ, ctx_.covM);
+    }
+
     Cell wesCell(long p) const {
         if (p < 0 || p >= (long) cells_.size()) return empty_cell();
-        return read_cell_idx(ctx_.wes_prefix, ctx_.wes_n_total, ctx_.wes_n_snps,
-                             ctx_.geno_keep, cells_[p].first, cells_[p].second + 1);
+        Cell c = read_cell_idx(ctx_.wes_prefix, ctx_.wes_n_total, ctx_.wes_n_snps,
+                               ctx_.geno_keep, cells_[p].first, cells_[p].second + 1);
+        residualize(c);
+        return c;
     }
     Cell comCell(long p) const {
         if (!ctx_.use_common || p < 0 || p >= (long) cells_.size()) return empty_cell();
         long start = ctx_.wes_bim.bp[cells_[p].first];
         long next  = (p + 1 < (long) cells_.size()) ? ctx_.wes_bim.bp[cells_[p + 1].first]
                                                      : (ctx_.wes_bim.bp[c_hi_] + 1);
-        return read_cell(ctx_.common_prefix, ctx_.common_n_total, ctx_.common_n_snps,
-                         ctx_.common_bim, ctx_.common_keep, cc_lo_, cc_hi_, start, next - start);
+        Cell c = read_cell(ctx_.common_prefix, ctx_.common_n_total, ctx_.common_n_snps,
+                           ctx_.common_bim, ctx_.common_keep, cc_lo_, cc_hi_, start, next - start);
+        residualize(c);
+        return c;
     }
     void setup_chrom() {
         const std::string& chr = ctx_.chr_order[ci_];
@@ -1164,10 +1231,11 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   int batch_size = 8,
                                   int n_threads = 0,
                                   int seed = 12345,
-                                  Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue) {
+                                  Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
+                                  Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
-    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights);
+    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights, covariates);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 0;
     pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
@@ -1190,10 +1258,11 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
                                     int batch_size = 4,
                                     int n_threads = 0,
                                     int seed = 12345,
-                                    Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue) {
+                                    Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
+                                    Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
-    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights);
+    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights, covariates);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 1;
     pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
