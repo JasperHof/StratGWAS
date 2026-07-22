@@ -91,7 +91,8 @@ he_reg <- function(pheno, filename) {
 he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filename = NULL, alpha = -1,
                                window_size = 1e6, nmcmc = 20, outfile, n_threads = 1,
                                batch_size = 16, genome_wide = FALSE, min_snps = 1000,
-                               weights = NULL, covariates = NULL, coher = FALSE) {
+                               weights = NULL, covariates = NULL, coher = FALSE,
+                               se = FALSE) {
 
 
   storage.mode(snp_cat) <- "integer"          # <- force integer
@@ -125,7 +126,7 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
     alpha       = alpha,                  # heritability model; -1 = unweighted (default)
     common_filename = common_filename,    # optional common-SNP background GRM
     nmcmc       = nmcmc,
-    se          = FALSE,
+    se          = se,
     out_file    = outfile,
     n_threads   = n_threads, 
     batch_size  = batch_size,
