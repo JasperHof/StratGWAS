@@ -145,22 +145,6 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
-// he_multi_part_enrich
-Rcpp::List he_multi_part_enrich(const std::string& filename, const SEXP pheno_mat, const IntegerMatrix snp_cat, const CharacterVector cat_names, int block_size, const std::string& outfile);
-RcppExport SEXP _StratGWAS_he_multi_part_enrich(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP snp_catSEXP, SEXP cat_namesSEXP, SEXP block_sizeSEXP, SEXP outfileSEXP) {
-BEGIN_RCPP
-    Rcpp::RObject rcpp_result_gen;
-    Rcpp::RNGScope rcpp_rngScope_gen;
-    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
-    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
-    Rcpp::traits::input_parameter< const IntegerMatrix >::type snp_cat(snp_catSEXP);
-    Rcpp::traits::input_parameter< const CharacterVector >::type cat_names(cat_namesSEXP);
-    Rcpp::traits::input_parameter< int >::type block_size(block_sizeSEXP);
-    Rcpp::traits::input_parameter< const std::string& >::type outfile(outfileSEXP);
-    rcpp_result_gen = Rcpp::wrap(he_multi_part_enrich(filename, pheno_mat, snp_cat, cat_names, block_size, outfile));
-    return rcpp_result_gen;
-END_RCPP
-}
 // he_multi
 Rcpp::NumericMatrix he_multi(const Eigen::MatrixXd& genotypes, const Rcpp::NumericMatrix& pheno);
 RcppExport SEXP _StratGWAS_he_multi(SEXP genotypesSEXP, SEXP phenoSEXP) {
@@ -324,7 +308,6 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_read_fam_file", (DL_FUNC) &_StratGWAS_read_fam_file, 1},
     {"_StratGWAS_compute_maf_all", (DL_FUNC) &_StratGWAS_compute_maf_all, 1},
     {"_StratGWAS_he", (DL_FUNC) &_StratGWAS_he, 2},
-    {"_StratGWAS_he_multi_part_enrich", (DL_FUNC) &_StratGWAS_he_multi_part_enrich, 6},
     {"_StratGWAS_he_multi", (DL_FUNC) &_StratGWAS_he_multi, 2},
     {"_StratGWAS_he_multi_part", (DL_FUNC) &_StratGWAS_he_multi_part, 3},
     {"_StratGWAS_he_sliding_window_part", (DL_FUNC) &_StratGWAS_he_sliding_window_part, 18},
