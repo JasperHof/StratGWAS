@@ -45,12 +45,12 @@ he_multi_part <- function(filename, pheno_mat, block_size) {
     .Call(`_StratGWAS_he_multi_part`, filename, pheno_mat, block_size)
 }
 
-he_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, min_snps = 1000L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, nmcmc = 20L, se = TRUE, out_file = "", batch_size = 8L, n_threads = 0L, seed = 12345L, weights = NULL, covariates = NULL, coher = FALSE) {
-    .Call(`_StratGWAS_he_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, nmcmc, se, out_file, batch_size, n_threads, seed, weights, covariates, coher)
+he_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, min_snps = 1000L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, nmcmc = 20L, se = TRUE, out_file = "", batch_size = 8L, n_threads = 0L, seed = 12345L, weights = NULL, covariates = NULL, coher = FALSE, collapse_mac = 0L, collapse_n = 5L) {
+    .Call(`_StratGWAS_he_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, nmcmc, se, out_file, batch_size, n_threads, seed, weights, covariates, coher, collapse_mac, collapse_n)
 }
 
-reml_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, min_snps = 1000L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, max_iter = 100L, tol = 1e-4, se = TRUE, out_file = "", batch_size = 4L, n_threads = 0L, seed = 12345L, weights = NULL, covariates = NULL) {
-    .Call(`_StratGWAS_reml_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, max_iter, tol, se, out_file, batch_size, n_threads, seed, weights, covariates)
+reml_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, min_snps = 1000L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, max_iter = 100L, tol = 1e-4, se = TRUE, out_file = "", batch_size = 4L, n_threads = 0L, seed = 12345L, weights = NULL, covariates = NULL, collapse_mac = 0L, collapse_n = 5L) {
+    .Call(`_StratGWAS_reml_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, max_iter, tol, se, out_file, batch_size, n_threads, seed, weights, covariates, collapse_mac, collapse_n)
 }
 
 computeLDscoresFromBED <- function(file_prefix, geno_set) {

@@ -23,7 +23,9 @@ he_reg_part_alpha(
   covariates = NULL,
   coher = FALSE,
   se = FALSE,
-  alpha_common = -1
+  alpha_common = -1,
+  collapse_mac = 0,
+  collapse_n = 5
 )
 }
 \description{

@@ -112,8 +112,10 @@ static int lower_index(const std::vector<long>& bp, int lo, int hi, long value) 
 // (needed to look up categories for the middle window).
 struct Cell {
     GenoMat X;                     // n_keep x m, standardized (unweighted)
-    std::vector<float> maf;        // per-column folded MAF
+    std::vector<float> maf;        // per-column folded MAF (0 for collapsed pseudo-markers)
     int i0;                        // .bim index of column 0 (-1 if empty)
+    std::vector<int> cat;          // per-column category id (only set when collapsing;
+                                   // empty -> columns map 1:1 to .bim via i0)
 };
 
 // Standardize columns to unit variance (mean-impute missing == -1), capturing
@@ -139,18 +141,81 @@ static void standardize_capture_maf(GenoMat& X, std::vector<float>& maf) {
 // Read a WES cell by SNP-INDEX range [i0, i1) (a cell is defined by SNP indices,
 // not a bp grid, now that cells have variable width -- see build_cells).
 static Cell read_cell_idx(const std::string& prefix, int n_total, int n_snps,
-                          const std::vector<int>& keep, int i0, int i1) {
+                          const std::vector<int>& keep, int i0, int i1,
+                          const std::vector<int>* cat_id = 0,
+                          int collapse_mac = 0, int collapse_n = 5) {
     Cell cell; cell.i0 = -1;
     int m = i1 - i0;
     if (m <= 0) { cell.X = GenoMat(keep.size(), 0); return cell; }
     int n_keep = (int) keep.size();
-    GenoMat X(n_keep, m);
     IntegerMatrix block = readBedBlock(prefix + ".bed", n_total, n_snps, 0, n_total - 1, i0, i1 - 1);
-    for (int i = 0; i < n_keep; ++i)
-        for (int j = 0; j < m; ++j)
-            X(i, j) = (float) block(keep[i], j);
+
+    // -------- no collapsing: original path (columns map 1:1 to the .bim) --------
+    if (!(collapse_mac > 0 && cat_id != 0 && collapse_n >= 1)) {
+        GenoMat X(n_keep, m);
+        for (int i = 0; i < n_keep; ++i)
+            for (int j = 0; j < m; ++j)
+                X(i, j) = (float) block(keep[i], j);
+        standardize_capture_maf(X, cell.maf);
+        cell.X = std::move(X);
+        cell.i0 = i0;
+        return cell;
+    }
+
+    // -------- collapsing: variants with MAC < collapse_mac are grouped in runs --
+    // of up to collapse_n CONSECUTIVE ultra-rare variants sharing the same category,
+    // and additively collapsed (sum of MINOR-allele dosages) into one pseudo-marker.
+    // Variants with MAC >= collapse_mac stay individual. Pseudo-markers carry MAF 0
+    // so they are exempt from alpha weighting (their frequency is not well defined).
+    int ncat_all = (int) cat_id->size();
+    std::vector< std::vector<float> > out_cols;   // each length n_keep (raw scale)
+    std::vector<int>  out_cat;                     // per output column: category id
+    std::vector<char> out_pseudo;                  // per output column: 1 = collapsed
+
+    std::vector<float> grp; int grp_cat = -1, grp_cnt = 0; bool grp_open = false;
+    // flush the pending group into one pseudo-marker column
+    // (declared as a lambda capturing the accumulators)
+    // (kept inline below to avoid std::function overhead)
+
+    for (int j = 0; j < m; ++j) {
+        // fold to minor-allele dosage and compute MAC (missing excluded from MAC,
+        // treated as 0 dosage for the burden)
+        double s = 0.0; int nv = 0;
+        for (int i = 0; i < n_keep; ++i) { int g = block(keep[i], j); if (g >= 0) { s += g; ++nv; } }
+        int si = (int) (s + 0.5);
+        int mac = (nv > 0) ? std::min(si, 2 * nv - si) : 0;
+        bool flip = (nv > 0 && s > (double) nv);          // coded allele is major
+        int cid = (i0 + j >= 0 && i0 + j < ncat_all) ? (*cat_id)[i0 + j] : -1;
+
+        if (mac >= collapse_mac) {
+            if (grp_open) { out_cols.push_back(grp); out_cat.push_back(grp_cat); out_pseudo.push_back(1);
+                            grp_open = false; grp_cnt = 0; grp_cat = -1; }
+            std::vector<float> col(n_keep);
+            for (int i = 0; i < n_keep; ++i) { int g = block(keep[i], j); col[i] = (g < 0) ? -1.f : (float) g; }
+            out_cols.push_back(std::move(col)); out_cat.push_back(cid); out_pseudo.push_back(0);
+        } else {
+            if (grp_open && (grp_cat != cid || grp_cnt >= collapse_n)) {
+                out_cols.push_back(grp); out_cat.push_back(grp_cat); out_pseudo.push_back(1);
+                grp_open = false; grp_cnt = 0; grp_cat = -1;
+            }
+            if (!grp_open) { grp.assign(n_keep, 0.f); grp_open = true; grp_cat = cid; grp_cnt = 0; }
+            for (int i = 0; i < n_keep; ++i) {
+                int g = block(keep[i], j);
+                if (g >= 0) grp[i] += (flip ? (float)(2 - g) : (float) g);   // additive minor dosage
+            }
+            ++grp_cnt;
+        }
+    }
+    if (grp_open) { out_cols.push_back(grp); out_cat.push_back(grp_cat); out_pseudo.push_back(1); }
+
+    int nout = (int) out_cols.size();
+    GenoMat X(n_keep, nout);
+    for (int k = 0; k < nout; ++k)
+        for (int i = 0; i < n_keep; ++i) X(i, k) = out_cols[k][i];
     standardize_capture_maf(X, cell.maf);
+    for (int k = 0; k < nout; ++k) if (out_pseudo[k]) cell.maf[k] = 0.f;   // exempt from alpha
     cell.X = std::move(X);
+    cell.cat = out_cat;
     cell.i0 = i0;
     return cell;
 }
@@ -293,6 +358,9 @@ struct RunContext {
     int n_cat;
     std::vector<std::string> cat_names;      // length n_cat (+ "uncategorized" appended)
     std::vector< std::vector<int> > snp_cats; // per WES SNP: category ids it belongs to
+    std::vector<int> snp_cat_id;             // single category id per WES SNP (for collapsing)
+    int collapse_mac;                        // collapse variants with MAC < this (0 = off)
+    int collapse_n;                          // # consecutive ultra-rare SNPs per pseudo-marker
     double alpha;                            // heritability-model alpha for the WES components
     double alpha_common;                     // separate alpha for the common-SNP background GRM
     // Optional per-SNP LD weights, aligned to the WES .bim (empty = all weights 1).
@@ -309,7 +377,8 @@ static RunContext setup_context(const std::string& filename, const SEXP pheno_ma
                                 double alpha, double alpha_common,
                                 Rcpp::Nullable<Rcpp::String> common_filename,
                                 Rcpp::Nullable<Rcpp::NumericVector> weights,
-                                Rcpp::Nullable<Rcpp::NumericMatrix> covariates) {
+                                Rcpp::Nullable<Rcpp::NumericMatrix> covariates,
+                                int collapse_mac, int collapse_n) {
     RunContext ctx;
     ctx.wes_prefix = filename;
     ctx.wes_n_snps = count_lines(filename + ".bim");
@@ -337,6 +406,18 @@ static RunContext setup_context(const std::string& filename, const SEXP pheno_ma
     for (int j = 0; j < ctx.wes_n_snps; ++j)
         for (int c = 0; c < ctx.n_cat; ++c)
             if (snp_cat(j, c) == 1) ctx.snp_cats[j].push_back(c);
+
+    // Single category id per SNP, needed by collapsing (which produces pseudo-markers
+    // that need one category label). Categories are assumed disjoint (one per SNP);
+    // if a SNP is in several, the first is used; if none, it is 'uncategorized' (n_cat).
+    ctx.snp_cat_id.resize(ctx.wes_n_snps);
+    for (int j = 0; j < ctx.wes_n_snps; ++j)
+        ctx.snp_cat_id[j] = ctx.snp_cats[j].empty() ? ctx.n_cat : ctx.snp_cats[j][0];
+    ctx.collapse_mac = (collapse_mac > 0) ? collapse_mac : 0;
+    ctx.collapse_n   = (collapse_n   > 0) ? collapse_n   : 1;
+    if (ctx.collapse_mac > 0)
+        Rcout << "Collapsing ultra-rare WES variants (MAC < " << ctx.collapse_mac
+              << ") in groups of " << ctx.collapse_n << " consecutive SNPs (additive)\n";
 
     // Optional per-SNP LD weights (one per WES .bim row). Stored as plain floats
     // so the parallel workers can read them without touching the R API.
@@ -508,7 +589,8 @@ private:
     Cell wesCell(long p) const {
         if (p < 0 || p >= (long) cells_.size()) return empty_cell();
         Cell c = read_cell_idx(ctx_.wes_prefix, ctx_.wes_n_total, ctx_.wes_n_snps,
-                               ctx_.geno_keep, cells_[p].first, cells_[p].second + 1);
+                               ctx_.geno_keep, cells_[p].first, cells_[p].second + 1,
+                               &ctx_.snp_cat_id, ctx_.collapse_mac, ctx_.collapse_n);
         residualize(c);
         return c;
     }
@@ -580,7 +662,10 @@ static void build_part_window(const RawWindow& rw, const RunContext& ctx, PartWi
     pw.nL = rw.nL; pw.nR = rw.nR; pw.nC = rw.nC; pw.nM = rw.nM;
 
     // per-SNP LD weights for the WES components (NULL if none were supplied)
-    const std::vector<float>* wp = ctx.snp_weights.empty() ? 0 : &ctx.snp_weights;
+    // LD weights index by .bim position (i0 + column); collapsing breaks that 1:1
+    // mapping, so the two features don't compose -- weights are ignored when
+    // collapsing is active (pseudo-markers already get weight 1 via MAF 0).
+    const std::vector<float>* wp = (ctx.snp_weights.empty() || ctx.collapse_mac > 0) ? 0 : &ctx.snp_weights;
 
     // background components: left, right (WES flanks), common
     if (rw.nL > 0) { std::vector<int> cols(rw.nL); for (int j = 0; j < rw.nL; ++j) cols[j] = j;
@@ -598,13 +683,22 @@ static void build_part_window(const RawWindow& rw, const RunContext& ctx, PartWi
     // middle: partition columns by category
     int mid_i0 = rw.mid_i0;
     int ncat_snp = (int) ctx.snp_cats.size();
+    bool collapsed_mid = !rw.wesM.cat.empty();     // middle cell was collapsed
     std::vector< std::vector<int> > cat_cols(ctx.n_cat + 1);   // +1 = uncategorized
     for (int j = 0; j < rw.nM; ++j) {
-        int snp = mid_i0 + j;
-        if (snp < 0 || snp >= ncat_snp) continue;              // guard (no stop() in worker)
-        const std::vector<int>& cs = ctx.snp_cats[snp];
-        if (cs.empty()) cat_cols[ctx.n_cat].push_back(j);
-        else for (size_t k = 0; k < cs.size(); ++k) cat_cols[cs[k]].push_back(j);
+        if (collapsed_mid) {
+            // per-column category from the collapsed cell (pseudo-markers carry the
+            // category of their constituent SNPs)
+            int cid = rw.wesM.cat[j];
+            if (cid < 0 || cid > ctx.n_cat) cid = ctx.n_cat;
+            cat_cols[cid].push_back(j);
+        } else {
+            int snp = mid_i0 + j;
+            if (snp < 0 || snp >= ncat_snp) continue;          // guard (no stop() in worker)
+            const std::vector<int>& cs = ctx.snp_cats[snp];
+            if (cs.empty()) cat_cols[ctx.n_cat].push_back(j);
+            else for (size_t k = 0; k < cs.size(); ++k) cat_cols[cs[k]].push_back(j);
+        }
     }
     pw.mid_total = 0;
     for (int c = 0; c <= ctx.n_cat; ++c) {
@@ -1335,10 +1429,12 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   int seed = 12345,
                                   Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
                                   Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
-                                  bool coher = false) {
+                                  bool coher = false,
+                                  int collapse_mac = 0,
+                                  int collapse_n = 5) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
-    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates);
+    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates, collapse_mac, collapse_n);
     if (coher && ctx.n_pheno < 2) stop("coher = TRUE needs at least two phenotype columns");
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 0;
     pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se; pr.coher = coher;
@@ -1364,10 +1460,12 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
                                     int n_threads = 0,
                                     int seed = 12345,
                                     Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
-                                    Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue) {
+                                    Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
+                                    int collapse_mac = 0,
+                                    int collapse_n = 5) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
-    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates);
+    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates, collapse_mac, collapse_n);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 1;
     pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se; pr.coher = false;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
