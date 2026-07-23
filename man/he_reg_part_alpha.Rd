@@ -22,7 +22,8 @@ he_reg_part_alpha(
   weights = NULL,
   covariates = NULL,
   coher = FALSE,
-  se = FALSE
+  se = FALSE,
+  alpha_common = -1
 )
 }
 \description{

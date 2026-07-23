@@ -293,7 +293,8 @@ struct RunContext {
     int n_cat;
     std::vector<std::string> cat_names;      // length n_cat (+ "uncategorized" appended)
     std::vector< std::vector<int> > snp_cats; // per WES SNP: category ids it belongs to
-    double alpha;
+    double alpha;                            // heritability-model alpha for the WES components
+    double alpha_common;                     // separate alpha for the common-SNP background GRM
     // Optional per-SNP LD weights, aligned to the WES .bim (empty = all weights 1).
     // Applied to the WES components (flanks + middle categories) only; the
     // common-SNP background is a different fileset so it stays unweighted.
@@ -305,7 +306,8 @@ struct RunContext {
 
 static RunContext setup_context(const std::string& filename, const SEXP pheno_mat,
                                 const IntegerMatrix& snp_cat, const CharacterVector& cat_names,
-                                double alpha, Rcpp::Nullable<Rcpp::String> common_filename,
+                                double alpha, double alpha_common,
+                                Rcpp::Nullable<Rcpp::String> common_filename,
                                 Rcpp::Nullable<Rcpp::NumericVector> weights,
                                 Rcpp::Nullable<Rcpp::NumericMatrix> covariates) {
     RunContext ctx;
@@ -315,6 +317,7 @@ static RunContext setup_context(const std::string& filename, const SEXP pheno_ma
     CharacterVector geno_iid = fam["iid"];
     ctx.wes_n_total = geno_iid.size();
     ctx.alpha = alpha;
+    ctx.alpha_common = alpha_common;
     Rcout << "WES individuals (.fam): " << ctx.wes_n_total << "\n";
     Rcout << "WES SNPs (.bim): "        << ctx.wes_n_snps  << "\n";
 
@@ -587,8 +590,9 @@ static void build_part_window(const RawWindow& rw, const RunContext& ctx, PartWi
         GenoMat g = build_component(rw.wesR.X, rw.wesR.maf, cols, ctx.alpha, ctx.n_inds, wp, rw.wesR.i0);
         if (g.cols() > 0) pw.X.push_back(std::move(g)); }
     if (ctx.use_common && rw.nC > 0) { std::vector<int> cols(rw.nC); for (int j = 0; j < rw.nC; ++j) cols[j] = j;
-        // common fileset has its own .bim, so the WES-aligned weights don't apply
-        GenoMat g = build_component(rw.com.X, rw.com.maf, cols, ctx.alpha, ctx.n_inds);
+        // common fileset has its own .bim, so the WES-aligned weights don't apply;
+        // it also gets its OWN alpha (alpha_common), independent of the WES alpha.
+        GenoMat g = build_component(rw.com.X, rw.com.maf, cols, ctx.alpha_common, ctx.n_inds);
         if (g.cols() > 0) pw.X.push_back(std::move(g)); }
 
     // middle: partition columns by category
@@ -1321,6 +1325,7 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   double window_size = 1e6,
                                   int min_snps = 1000,
                                   double alpha = -1.0,
+                                  double alpha_common = -1.0,
                                   Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
                                   int nmcmc = 20,
                                   bool se = true,
@@ -1333,7 +1338,7 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   bool coher = false) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
-    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights, covariates);
+    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates);
     if (coher && ctx.n_pheno < 2) stop("coher = TRUE needs at least two phenotype columns");
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 0;
     pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se; pr.coher = coher;
@@ -1349,6 +1354,7 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
                                     double window_size = 1e6,
                                     int min_snps = 1000,
                                     double alpha = -1.0,
+                                    double alpha_common = -1.0,
                                     Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
                                     int max_iter = 100,
                                     double tol = 1e-4,
@@ -1361,7 +1367,7 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
                                     Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
-    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, common_filename, weights, covariates);
+    RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 1;
     pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se; pr.coher = false;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
