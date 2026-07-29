@@ -5,6 +5,10 @@ compute_gene_burden <- function(bed_prefix, gene_file, out_file, write_buffer_ge
     invisible(.Call(`_StratGWAS_compute_gene_burden`, bed_prefix, gene_file, out_file, write_buffer_genes))
 }
 
+burden_enrich_association <- function(bed_prefix, he_file, category_file, trait_name, pheno_mat, out_file, kb_size = -1, n_snps_per_window = -1L, target_mac_per_ind = -1, min_enrichment = 0.0, write_buffer_size = 500L, chunk_size = 5000L) {
+    invisible(.Call(`_StratGWAS_burden_enrich_association`, bed_prefix, he_file, category_file, trait_name, pheno_mat, out_file, kb_size, n_snps_per_window, target_mac_per_ind, min_enrichment, write_buffer_size, chunk_size))
+}
+
 compute_burden_windows <- function(bed_prefix, out_file, kb_size = -1, n_snps_per_window = -1L, target_mac_per_ind = -1, write_buffer_size = 500L, chunk_size = 5000L, effects_file = "", write_burden_scores = TRUE) {
     invisible(.Call(`_StratGWAS_compute_burden_windows`, bed_prefix, out_file, kb_size, n_snps_per_window, target_mac_per_ind, write_buffer_size, chunk_size, effects_file, write_burden_scores))
 }

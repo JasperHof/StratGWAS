@@ -48,3 +48,29 @@ burden_correlations <- function(burden_file,
 
   return(weights)
 }
+
+#' To a burden test
+#'
+#' @export
+burden_test <- function(bed_prefix, pheno_mat, he_file,
+                        category_file = NULL,
+                        trait_name = NULL, out_file = NULL,
+                        kb_size = 1, min_enrichment = 0.5,
+                        write_buffer_size = 500,
+                        chunk_size = 5000) {
+
+  burden_enrich_association(
+    bed_prefix          = bed_prefix,
+    pheno_mat           = pheno_mat,
+    he_file             = he_file,
+    category_file       = category_file,
+    trait_name          = trait_name,
+    out_file            = out_file,
+    kb_size             = kb_size,
+    min_enrichment      = min_enrichment,
+    write_buffer_size   = write_buffer_size,
+    chunk_size          = chunk_size
+  )
+
+  return(weights)
+}

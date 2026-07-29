@@ -2,6 +2,7 @@
 
 export(burden)
 export(burden_correlations)
+export(burden_test)
 export(compute_gencov)
 export(elastic)
 export(he_reg)

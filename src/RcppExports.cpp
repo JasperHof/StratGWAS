@@ -24,6 +24,27 @@ BEGIN_RCPP
     return R_NilValue;
 END_RCPP
 }
+// burden_enrich_association
+void burden_enrich_association(const std::string& bed_prefix, const std::string& he_file, const std::string& category_file, const std::string& trait_name, const SEXP pheno_mat, const std::string& out_file, double kb_size, int n_snps_per_window, double target_mac_per_ind, double min_enrichment, int write_buffer_size, int chunk_size);
+RcppExport SEXP _StratGWAS_burden_enrich_association(SEXP bed_prefixSEXP, SEXP he_fileSEXP, SEXP category_fileSEXP, SEXP trait_nameSEXP, SEXP pheno_matSEXP, SEXP out_fileSEXP, SEXP kb_sizeSEXP, SEXP n_snps_per_windowSEXP, SEXP target_mac_per_indSEXP, SEXP min_enrichmentSEXP, SEXP write_buffer_sizeSEXP, SEXP chunk_sizeSEXP) {
+BEGIN_RCPP
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type bed_prefix(bed_prefixSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type he_file(he_fileSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type category_file(category_fileSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type trait_name(trait_nameSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
+    Rcpp::traits::input_parameter< const std::string& >::type out_file(out_fileSEXP);
+    Rcpp::traits::input_parameter< double >::type kb_size(kb_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type n_snps_per_window(n_snps_per_windowSEXP);
+    Rcpp::traits::input_parameter< double >::type target_mac_per_ind(target_mac_per_indSEXP);
+    Rcpp::traits::input_parameter< double >::type min_enrichment(min_enrichmentSEXP);
+    Rcpp::traits::input_parameter< int >::type write_buffer_size(write_buffer_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type chunk_size(chunk_sizeSEXP);
+    burden_enrich_association(bed_prefix, he_file, category_file, trait_name, pheno_mat, out_file, kb_size, n_snps_per_window, target_mac_per_ind, min_enrichment, write_buffer_size, chunk_size);
+    return R_NilValue;
+END_RCPP
+}
 // compute_burden_windows
 void compute_burden_windows(const std::string& bed_prefix, const std::string& out_file, double kb_size, int n_snps_per_window, double target_mac_per_ind, int write_buffer_size, int chunk_size, std::string effects_file, bool write_burden_scores);
 RcppExport SEXP _StratGWAS_compute_burden_windows(SEXP bed_prefixSEXP, SEXP out_fileSEXP, SEXP kb_sizeSEXP, SEXP n_snps_per_windowSEXP, SEXP target_mac_per_indSEXP, SEXP write_buffer_sizeSEXP, SEXP chunk_sizeSEXP, SEXP effects_fileSEXP, SEXP write_burden_scoresSEXP) {
@@ -304,6 +325,7 @@ END_RCPP
 
 static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_compute_gene_burden", (DL_FUNC) &_StratGWAS_compute_gene_burden, 4},
+    {"_StratGWAS_burden_enrich_association", (DL_FUNC) &_StratGWAS_burden_enrich_association, 12},
     {"_StratGWAS_compute_burden_windows", (DL_FUNC) &_StratGWAS_compute_burden_windows, 9},
     {"_StratGWAS_compute_burden_weights_blockwise", (DL_FUNC) &_StratGWAS_compute_burden_weights_blockwise, 2},
     {"_StratGWAS_vb_elastic_net_prs", (DL_FUNC) &_StratGWAS_vb_elastic_net_prs, 13},
