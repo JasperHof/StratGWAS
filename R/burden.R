@@ -72,5 +72,4 @@ burden_test <- function(bed_prefix, pheno_mat, he_file,
     chunk_size          = chunk_size
   )
 
-  return(weights)
 }

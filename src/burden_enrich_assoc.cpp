@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <map>
 #include <unordered_map>
 
 using namespace Rcpp;
@@ -213,8 +214,19 @@ std::vector<Window> windows_by_variation(
 // (long format: chr, start, end, n_left, n_right, n_common, phenotype,
 // category, m_c, vg, se_vg, h2, se_h2, enrichment, fit, [converged, n_iter])
 // and compute genome-wide per-category heritability enrichment for ONE
-// phenotype:
-//     enrichment_c = h2_c(TOTAL row) / (sum_windows m_c / sum_windows mid_total)
+// phenotype, as the ratio of a category's SHARE OF HERITABILITY to its share
+// of SNPs:
+//     enrichment_c = [ h2_c / sum_c h2_c ] / [ sum_windows m_c / sum_all m_c ]
+// Both numerator and denominator are proportions summing to 1, so an
+// unenriched category gets enrichment 1.
+//
+// NOTE: h2_c must be normalized by the total h2 the model explains, NOT used
+// raw. Using raw h2_c silently rescales every enrichment by 1/h2_total, so for
+// a trait with h2_total ~ 0.5 all enrichments come out roughly halved; combined
+// with the min_enrichment floor that collapses several categories onto exactly
+// the floor value and leaves the rest in a narrow band, making the weighting
+// nearly uniform (and the results nearly identical to an unweighted run).
+//
 // Falls back to 1.0 (no reweighting) for a category whose TOTAL h2 or expected
 // proportion could not be determined. Negative / unstable enrichments (HE and
 // REML h2 estimates can go negative) are clamped to `min_enrichment` (default
@@ -302,20 +314,42 @@ std::unordered_map<std::string, double> compute_category_enrichment(
 
     auto fmt = [](double v) { return ISNAN(v) ? std::string("NA") : std::to_string(v); };
 
+    // Total h2 the model explains, summed over categories. Enrichment compares
+    // SHARE of h2 against SHARE of SNPs, so this is the correct denominator.
+    double h2_total = 0.0;
+    int n_h2 = 0;
+    for (const auto& c : cat_order) {
+        auto it = total_h2.find(c);
+        if (it != total_h2.end() && !ISNAN(it->second)) { h2_total += it->second; ++n_h2; }
+    }
+    if (n_h2 == 0)
+        Rcpp::stop("No TOTAL rows with a usable h2 found for phenotype '" + trait_name +
+                   "' in " + he_file);
+    if (h2_total <= 0.0)
+        Rcpp::stop("Total h2 across categories is not positive (" + std::to_string(h2_total) +
+                   ") for phenotype '" + trait_name + "' -- cannot form enrichment ratios");
+
     std::unordered_map<std::string, double> enrichment;
-    Rcout << "Category enrichment (phenotype = " << trait_name << "):\n";
+    Rcout << "Category enrichment (phenotype = " << trait_name
+          << ", total h2 = " << h2_total << "):\n";
     for (const auto& c : cat_order) {
         double h2c = total_h2.count(c) ? total_h2[c] : NA_REAL;
         double mc  = sum_mc.count(c) ? sum_mc[c] : 0.0;
         double expected = (mc > 0) ? mc / sum_mc_all : NA_REAL;
+        double share    = ISNAN(h2c) ? NA_REAL : h2c / h2_total;   // share of h2
         double enr = 1.0;
-        if (!ISNAN(h2c) && !ISNAN(expected) && expected > 0) {
-            enr = h2c / expected;
-            if (enr < min_enrichment) enr = min_enrichment;
+        bool clamped = false;
+        if (!ISNAN(share) && !ISNAN(expected) && expected > 0) {
+            enr = share / expected;
+            if (enr < min_enrichment) { enr = min_enrichment; clamped = true; }
         }
         enrichment[c] = enr;
         Rcout << "  " << c << ": h2=" << fmt(h2c)
-              << " expected_prop=" << fmt(expected) << " enrichment=" << enr << "\n";
+              << " h2_share=" << fmt(share)
+              << " expected_prop=" << fmt(expected)
+              << " enrichment=" << enr;
+        if (clamped) Rcout << "  (clamped at min_enrichment)";
+        Rcout << "\n";
     }
     return enrichment;
 }
@@ -337,24 +371,65 @@ std::vector<double> read_snp_weights(
     std::ifstream in(category_file);
     if (!in.is_open()) Rcpp::stop("Could not open category file: " + category_file);
     std::string snp, cat;
-    while (in >> snp >> cat) snp_cat[snp] = cat;
+    long n_lines = 0;
+    std::map<std::string, long> cnt_file;      // labels present in the category file
+    while (in >> snp >> cat) { snp_cat[snp] = cat; ++n_lines; cnt_file[cat]++; }
     in.close();
 
     double default_w = enrichment.count("uncategorized") ? enrichment.at("uncategorized") : 1.0;
 
     std::vector<double> w(n, default_w);
-    int n_matched = 0;
+    long n_listed = 0, n_unlisted = 0;
+    // Per-label tallies of the SNPs actually used, so that a silent label
+    // mismatch between the category file and the HE/REML output shows up in the
+    // log rather than quietly defaulting every SNP to the fallback weight.
+    std::map<std::string, long> cnt_known, cnt_unknown;
     for (int i = 0; i < n; ++i) {
         std::string s = as<std::string>(snp_ids[i]);
         auto it = snp_cat.find(s);
-        if (it != snp_cat.end()) {
-            auto eit = enrichment.find(it->second);
-            w[i] = (eit != enrichment.end()) ? eit->second : default_w;
-            ++n_matched;
-        }
+        if (it == snp_cat.end()) { ++n_unlisted; continue; }   // keeps default_w
+        ++n_listed;
+        auto eit = enrichment.find(it->second);
+        if (eit != enrichment.end()) { w[i] = eit->second; cnt_known[it->second]++; }
+        else                         { w[i] = default_w;   cnt_unknown[it->second]++; }
     }
-    Rcout << "Category file: matched " << n_matched << "/" << n
-          << " SNPs (unmatched SNPs use the 'uncategorized' weight = " << default_w << ")\n";
+
+    Rcout << "Category file: " << category_file << "\n";
+    Rcout << "  " << n_lines << " lines read, " << cnt_file.size() << " distinct labels: ";
+    { bool first = true;
+      for (const auto& kv : cnt_file) { if (!first) Rcout << ", "; Rcout << kv.first; first = false; } }
+    Rcout << "\n";
+    Rcout << "  " << n_listed << "/" << n << " .bim SNPs found in the category file";
+    if (n_unlisted > 0)
+        Rcout << ", " << n_unlisted << " not listed -> fallback weight " << default_w;
+    Rcout << "\n";
+
+    Rcout << "SNPs per category (weight applied to allele counts):\n";
+    for (const auto& kv : cnt_known)
+        Rcout << "  " << kv.first << ": " << kv.second << " SNPs, weight = "
+              << enrichment.at(kv.first) << "\n";
+    if (n_unlisted > 0)
+        Rcout << "  <not in category file>: " << n_unlisted << " SNPs, weight = " << default_w << "\n";
+
+    if (!cnt_unknown.empty()) {
+        Rcout << "WARNING: these labels appear in the category file but have NO matching\n"
+              << "         category in the HE/REML output -- their SNPs silently fell back\n"
+              << "         to weight " << default_w << ". Check that the category names match exactly\n"
+              << "         (whitespace, capitalisation) the cat_names used in the HE/REML run:\n";
+        for (const auto& kv : cnt_unknown)
+            Rcout << "  '" << kv.first << "': " << kv.second << " SNPs\n";
+    }
+
+    // Flag the degenerate case where every SNP ends up with the same weight --
+    // the burden is then just an unweighted allele count and the run carries no
+    // enrichment information at all.
+    double wmin = w.empty() ? 0.0 : w[0], wmax = wmin;
+    for (int i = 1; i < n; ++i) { if (w[i] < wmin) wmin = w[i]; if (w[i] > wmax) wmax = w[i]; }
+    Rcout << "Applied SNP weights: min = " << wmin << ", max = " << wmax << "\n";
+    if (wmax - wmin < 1e-12)
+        Rcout << "WARNING: every SNP received the SAME weight (" << wmin << ") -- the weighted\n"
+              << "         burden is proportional to an unweighted allele count, so results will\n"
+              << "         be identical to an unweighted/uncategorized run.\n";
     return w;
 }
 
