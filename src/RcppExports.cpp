@@ -192,8 +192,8 @@ BEGIN_RCPP
 END_RCPP
 }
 // he_sliding_window_part
-Rcpp::List he_sliding_window_part(const std::string& filename, const SEXP pheno_mat, const IntegerMatrix snp_cat, const CharacterVector cat_names, double window_size, int min_snps, double alpha, double alpha_common, Rcpp::Nullable<Rcpp::String> common_filename, int nmcmc, bool se, std::string out_file, int batch_size, int n_threads, int seed, Rcpp::Nullable<Rcpp::NumericVector> weights, Rcpp::Nullable<Rcpp::NumericMatrix> covariates, bool coher, int collapse_mac, int collapse_n);
-RcppExport SEXP _StratGWAS_he_sliding_window_part(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP snp_catSEXP, SEXP cat_namesSEXP, SEXP window_sizeSEXP, SEXP min_snpsSEXP, SEXP alphaSEXP, SEXP alpha_commonSEXP, SEXP common_filenameSEXP, SEXP nmcmcSEXP, SEXP seSEXP, SEXP out_fileSEXP, SEXP batch_sizeSEXP, SEXP n_threadsSEXP, SEXP seedSEXP, SEXP weightsSEXP, SEXP covariatesSEXP, SEXP coherSEXP, SEXP collapse_macSEXP, SEXP collapse_nSEXP) {
+Rcpp::List he_sliding_window_part(const std::string& filename, const SEXP pheno_mat, const IntegerMatrix snp_cat, const CharacterVector cat_names, double window_size, int min_snps, double alpha, double alpha_common, Rcpp::Nullable<Rcpp::String> common_filename, int nmcmc, bool se, std::string out_file, int batch_size, int n_threads, int seed, Rcpp::Nullable<Rcpp::NumericVector> weights, Rcpp::Nullable<Rcpp::NumericMatrix> covariates, bool coher, int collapse_mac, int collapse_n, bool SPA);
+RcppExport SEXP _StratGWAS_he_sliding_window_part(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP snp_catSEXP, SEXP cat_namesSEXP, SEXP window_sizeSEXP, SEXP min_snpsSEXP, SEXP alphaSEXP, SEXP alpha_commonSEXP, SEXP common_filenameSEXP, SEXP nmcmcSEXP, SEXP seSEXP, SEXP out_fileSEXP, SEXP batch_sizeSEXP, SEXP n_threadsSEXP, SEXP seedSEXP, SEXP weightsSEXP, SEXP covariatesSEXP, SEXP coherSEXP, SEXP collapse_macSEXP, SEXP collapse_nSEXP, SEXP SPASEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -217,7 +217,8 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< bool >::type coher(coherSEXP);
     Rcpp::traits::input_parameter< int >::type collapse_mac(collapse_macSEXP);
     Rcpp::traits::input_parameter< int >::type collapse_n(collapse_nSEXP);
-    rcpp_result_gen = Rcpp::wrap(he_sliding_window_part(filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, nmcmc, se, out_file, batch_size, n_threads, seed, weights, covariates, coher, collapse_mac, collapse_n));
+    Rcpp::traits::input_parameter< bool >::type SPA(SPASEXP);
+    rcpp_result_gen = Rcpp::wrap(he_sliding_window_part(filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, nmcmc, se, out_file, batch_size, n_threads, seed, weights, covariates, coher, collapse_mac, collapse_n, SPA));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -336,7 +337,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_he", (DL_FUNC) &_StratGWAS_he, 2},
     {"_StratGWAS_he_multi", (DL_FUNC) &_StratGWAS_he_multi, 2},
     {"_StratGWAS_he_multi_part", (DL_FUNC) &_StratGWAS_he_multi_part, 3},
-    {"_StratGWAS_he_sliding_window_part", (DL_FUNC) &_StratGWAS_he_sliding_window_part, 20},
+    {"_StratGWAS_he_sliding_window_part", (DL_FUNC) &_StratGWAS_he_sliding_window_part, 21},
     {"_StratGWAS_reml_sliding_window_part", (DL_FUNC) &_StratGWAS_reml_sliding_window_part, 20},
     {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 2},
     {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},

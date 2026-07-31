@@ -3,6 +3,7 @@
 #include <RcppEigen.h>
 #include <Rcpp.h>
 #include <RcppParallel.h>
+#include <Eigen/Eigenvalues>
 #include "readBedBlock.h"
 #include "geno_utils.h"
 #include <vector>
@@ -58,6 +59,17 @@ using namespace Rcpp;
 //   he_sliding_window_part()   - randomized Haseman-Elston (method of moments).
 //   reml_sliding_window_part()  - low-rank / Woodbury AI-REML.
 // Both parallelize over windows and stream a long-format per-category table.
+//
+// SPA (he_sliding_window_part only, SPA = TRUE): the HE estimator sigma_hat_c
+// is itself a quadratic form in y, sigma_hat_c = y' M_c y for a fixed matrix
+// M_c built from T^-1 (see the long comment above he_part_compute's SPA
+// block). Under H0: sigma_c = 0, this is a weighted chi-square-1 mixture, and
+// its saddlepoint-approximated p-value corrects the boundary-parameter
+// pathology of a naive Wald test (vg/se_vg) on a near-zero variance
+// component -- exactly the SPA analogue, for THIS estimator, of the
+// retrospective burden-score SPA in burden_enrich_assoc.cpp. See the
+// accompanying LaTeX note for the full derivation and a numerical
+// validation against direct Monte Carlo simulation of the null.
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
@@ -861,6 +873,9 @@ static inline int n_trait_pairs(int P) { return (P * (P - 1)) / 2; }
 struct PartResult {
     // per signal component (category), per trait
     std::vector< std::vector<double> > vg, se_vg, h2, se_h2;   // [sig][trait]
+    // saddlepoint-corrected p-value for H0: sigma_c = 0 (HE only, SPA = TRUE).
+    // NA unless he_part_compute() was asked to fill it in. [sig][trait]
+    std::vector< std::vector<double> > p_spa;
     std::vector< std::vector<int> > conv, iters;               // REML
     // per signal component, per TRAIT PAIR: genetic covariance (co-heritability)
     // contributed by that category. Empty unless coher = TRUE. [sig][pair]
@@ -881,6 +896,7 @@ static void alloc_result(PartResult& res, const PartWindow& pw, int P, int n_pai
     res.se_vg.assign(nsig, std::vector<double>(P, NA_REAL));
     res.h2.assign(nsig, std::vector<double>(P, NA_REAL));
     res.se_h2.assign(nsig, std::vector<double>(P, NA_REAL));
+    res.p_spa.assign(nsig, std::vector<double>(P, NA_REAL));
     res.conv.assign(nsig, std::vector<int>(P, 0));
     res.iters.assign(nsig, std::vector<int>(P, 0));
     if (n_pairs > 0) res.cov12.assign(nsig, std::vector<double>(n_pairs, NA_REAL));
@@ -891,10 +907,128 @@ static void alloc_result(PartResult& res, const PartWindow& pw, int P, int n_pai
     res.sig_cat = pw.sig_cat; res.sig_m = pw.sig_m;
 }
 
+// ---------------------------------------------------------------------------
+// Saddlepoint approximation for a quadratic-form test statistic: X = sum_k
+// lambda_k * chi^2_{1,k} (independent). Used to test H0: sigma_c = 0 for the
+// HE estimator sigma_hat_c = y' M_c y -- see the long comment above the SPA
+// block inside he_part_compute() for how {lambda_k} are obtained and the
+// accompanying LaTeX note for the full derivation.
+//
+// Unlike the burden's linear-statistic SPA (burden_enrich_assoc.cpp), this
+// CGF is only defined on a BOUNDED interval (t_lo, t_hi) set by the sign and
+// magnitude of the eigenvalues -- a weighted chi-square mixture's CGF blows
+// up at the point where any (1 - 2 lambda_k t) term hits zero. Root-finding
+// is therefore safeguarded to stay strictly inside that interval.
+//
+// The eigenvalue set is passed as m_tot explicit values (`eig_explicit`, from
+// the low-rank cross-component structure) plus ONE value (`eig_rep`) repeated
+// `n_rep` times (the contribution of the n - m_tot directions orthogonal to
+// every component's column space, i.e. the residual/environmental term in the
+// directions the genotypes don't span). Handling the repeated value in closed
+// form keeps K/K'/K'' evaluation O(m_tot) instead of O(n).
+// ---------------------------------------------------------------------------
+struct QuadSpaResult { double p; bool converged; };
+
+static void quad_cgf(double t, const std::vector<double>& eig_explicit,
+                     double eig_rep, long n_rep, double& K, double& K1, double& K2) {
+    K = 0.0; K1 = 0.0; K2 = 0.0;
+    for (size_t j = 0; j < eig_explicit.size(); ++j) {
+        double lam = eig_explicit[j];
+        double d = 1.0 - 2.0 * lam * t;
+        K  += -0.5 * std::log(d);
+        K1 += lam / d;
+        K2 += 2.0 * lam * lam / (d * d);
+    }
+    if (n_rep > 0) {
+        double d = 1.0 - 2.0 * eig_rep * t;
+        double nr = (double) n_rep;
+        K  += -0.5 * nr * std::log(d);
+        K1 += nr * eig_rep / d;
+        K2 += nr * 2.0 * eig_rep * eig_rep / (d * d);
+    }
+}
+
+static QuadSpaResult quad_spa_solve(
+    double s_obs, const std::vector<double>& eig_explicit, double eig_rep, long n_rep,
+    int max_iter = 100, double tol = 1e-8
+) {
+    QuadSpaResult res; res.p = NA_REAL; res.converged = false;
+
+    double lam_min = eig_rep, lam_max = eig_rep;
+    for (size_t j = 0; j < eig_explicit.size(); ++j) {
+        double lam = eig_explicit[j];
+        if (lam < lam_min) lam_min = lam;
+        if (lam > lam_max) lam_max = lam;
+    }
+    double t_hi = (lam_max > 1e-10) ? (1.0 / (2.0 * lam_max)) : 1e10;
+    double t_lo = (lam_min < -1e-10) ? (1.0 / (2.0 * lam_min)) : -1e10;
+    double margin = 1e-6;
+    double t_hi_safe = (lam_max > 1e-10) ? t_hi * (1.0 - margin) : t_hi;
+    double t_lo_safe = (lam_min < -1e-10) ? t_lo * (1.0 - margin) : t_lo;
+
+    double t = 0.0, K, K1, K2;
+    quad_cgf(0.0, eig_explicit, eig_rep, n_rep, K, K1, K2);
+    double mean0 = K1, var0 = K2;
+    if (var0 <= 1e-14) return res;   // degenerate (no informative variance under H0)
+
+    bool converged = false;
+    for (int it = 0; it < max_iter; ++it) {
+        quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2);
+        double diff = K1 - s_obs;
+        if (std::abs(diff) < tol * std::max(1.0, std::abs(s_obs - mean0))) { converged = true; break; }
+        if (K2 < 1e-14) break;
+        double step = diff / K2;
+        double t_new = t - step;
+        int halvings = 0;
+        while ((t_new <= t_lo_safe || t_new >= t_hi_safe) && halvings < 40) {
+            step *= 0.5; t_new = t - step; ++halvings;
+        }
+        if (t_new <= t_lo_safe || t_new >= t_hi_safe) break;   // safeguard exhausted
+        t = t_new;
+    }
+    if (!converged) return res;
+
+    quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2);
+    if (K2 <= 0) return res;
+
+    // Removable singularity at t ~ 0: the normal approximation is exact in
+    // that limit, so use it directly rather than divide by ~0.
+    if (std::abs(t) < 1e-7) {
+        double z = (s_obs - mean0) / std::sqrt(var0);
+        res.p = std::erfc(std::abs(z) / std::sqrt(2.0));
+        res.converged = true;
+        return res;
+    }
+
+    double w = ((t > 0) ? 1.0 : -1.0) * std::sqrt(std::max(0.0, 2.0 * (t * s_obs - K)));
+    double u = t * std::sqrt(K2);
+    double Phi_w = 0.5 * std::erfc(-w / std::sqrt(2.0));
+    double phi_w = std::exp(-0.5 * w * w) / std::sqrt(2.0 * M_PI);
+
+    double p_one = (w >= 0)
+        ? (1.0 - Phi_w) + phi_w * (1.0 / u - 1.0 / w)
+        : Phi_w - phi_w * (1.0 / u - 1.0 / w);
+    if (p_one < 0.0) p_one = 0.0;
+    if (p_one > 1.0) p_one = 1.0;
+
+    res.p = std::min(1.0, 2.0 * p_one);
+    res.converged = true;
+    return res;
+}
+
 // ---- HE (randomized MoM), records every signal component ----
+// `spa`: also compute a saddlepoint-corrected p-value per signal component
+// (see he_sliding_window_part()'s SPA argument). This is a genuinely separate,
+// more expensive computation than the rest of he_part_compute: whereas T's
+// off-diagonal entries are estimated via randomized (Hutchinson) trace
+// estimation for speed, the SPA correction needs the EXACT cross-component
+// Gram matrix (same computation reml_part_compute already pays for AI-REML),
+// because an approximated eigenvalue set would defeat the purpose of an
+// accurate tail probability. Gated behind `spa` and skipped whenever a window
+// has no signal components, so SPA = FALSE (the default) costs nothing extra.
 static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
                             const std::vector<double>& Vp, int nmcmc, unsigned seed,
-                            bool se, bool coher, PartResult& res) {
+                            bool se, bool coher, bool spa, PartResult& res) {
     int C = (int) pw.X.size(), env = C, n = (int) Y.rows(), P = (int) Y.cols();
     int nsig = (int) pw.sig.size();
     int npair = coher ? n_trait_pairs(P) : 0;
@@ -926,6 +1060,60 @@ static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
     }
     Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
     Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
+
+    // -----------------------------------------------------------------------
+    // SPA prep (once per window, shared across phenotypes and signal
+    // components): the exact cross-component Gram matrix Gmat = Zcat' Zcat,
+    // where Zcat horizontally concatenates every component's (already alpha-
+    // weighted, trace-normalized) columns rescaled by 1/sqrt(M_c) -- this is
+    // exactly the scaling that makes K_c = Zcat block_c * block_c'. Skipped
+    // when there is nothing to test (nsig == 0) or SPA wasn't requested.
+    //
+    // DERIVATION (see the accompanying LaTeX note for the full derivation and
+    // a numerical validation against direct Monte Carlo simulation of the
+    // null): the HE estimator for target component `target` is
+    //     sigma_hat_target = y' M_target y,
+    //     M_target = sum_a (T^-1)_{target,a} K_a + (T^-1)_{target,env} I.
+    // Under H0: sigma_target = 0, with y ~ N(0, Sigma_0) and Sigma_0 built
+    // from PLUG-IN null nuisance variances (every OTHER component's fitted
+    // sigma_hat, clipped >= 0; sigma_target forced to 0), sigma_hat_target is
+    // a weighted chi-square-1 mixture whose eigenvalues are obtained WITHOUT
+    // ever forming the n x n matrices Sigma_0 or M_target:
+    //     eig(Sigma_0^{1/2} M_target Sigma_0^{1/2}) = eig(M_target * Sigma_0)
+    // (similar matrices share eigenvalues), and since both M_target - c_env*I
+    // and Sigma_0 - sigma_env0*I live in the SAME m_tot-dimensional column
+    // space spanned by Zcat, writing D0 = diag of plug-in nuisance variances
+    // (0 on the target's own block) and DM = diag of (T^-1)_{target,*}
+    // coefficients (both broadcast over Zcat's columns), algebra gives
+    //     B = c_env*D0 + sigma_env0*DM + DM*Gmat*D0,
+    // and the nonzero eigenvalues of M_target*Sigma_0 are exactly the
+    // eigenvalues of the m_tot x m_tot matrix B*Gmat, PLUS the scalar
+    // c_env*sigma_env0 repeated (n - m_tot) times for the directions
+    // orthogonal to every component's column space.
+    // -----------------------------------------------------------------------
+    int Ktot = 0; std::vector<int> Moff;
+    Eigen::MatrixXd Gmat, Lmat; bool have_L = false;
+    if (spa && nsig > 0) {
+        Moff.resize(C);
+        for (int c = 0; c < C; ++c) { Moff[c] = Ktot; Ktot += (int) M[c]; }
+        GenoMat Zcat(n, Ktot);
+        for (int c = 0; c < C; ++c)
+            Zcat.middleCols(Moff[c], (int) M[c]) = pw.X[c] * (float)(1.0 / std::sqrt(M[c]));
+        GenoMat Gf = GenoMat::Zero(Ktot, Ktot);
+        Gf.selfadjointView<Eigen::Upper>().rankUpdate(Zcat.transpose());
+        Gmat = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
+
+        // Cholesky factor G = L L' -- computed ONCE per window and reused by
+        // every (phenotype, signal component) SPA solve below. A tiny relative
+        // ridge keeps this well defined when genotype columns are collinear
+        // (rank-deficient G), which does not bias the eigenvalues: the
+        // deficient directions carry eigenvalue c_env*sigma_env0 either way,
+        // exactly matching the repeated eigenvalue handled in closed form.
+        Eigen::MatrixXd Gj = Gmat;
+        Gj.diagonal().array() += 1e-10 * (Gmat.trace() / Ktot);
+        Eigen::LLT<Eigen::MatrixXd> lltG(Gj);
+        if (lltG.info() == Eigen::Success) { Lmat = lltG.matrixL(); have_L = true; }
+    }
 
     for (int t = 0; t < P; ++t) {
         Eigen::VectorXd q(C + 1);
@@ -981,6 +1169,76 @@ static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
                     res.se_vg[k][t] = sev;
                     res.se_h2[k][t] = (Vp[t] > 0) ? sev / Vp[t] : NA_REAL;
                 }
+            }
+        }
+
+        // ---- SPA: one quadratic-form saddlepoint solve per signal component ----
+        // have_L guards the (rare) case where even the ridged Gram matrix failed
+        // to factor; p_spa is then left NA rather than reporting a wrong p-value.
+        if (spa && nsig > 0 && have_L) {
+            for (int k = 0; k < nsig; ++k) {
+                int target = pw.sig[k];
+
+                // Plug-in null nuisance variances: every OTHER component keeps its
+                // fitted sigma_hat (clipped >= 0, since a null covariance needs
+                // PSD components); the target component is forced to exactly 0.
+                Eigen::VectorXd sigma0 = sigma;
+                for (int a = 0; a < C; ++a) if (sigma0[a] < 0.0) sigma0[a] = 0.0;
+                sigma0[target] = 0.0;
+                double floor_env = 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0);
+                double sigma_env0 = std::max(sigma[env], floor_env);
+
+                Eigen::VectorXd D0d(Ktot), DMd(Ktot);
+                for (int c = 0; c < C; ++c) {
+                    double c_a = Tinv(target, c);
+                    int mc = (int) M[c];
+                    for (int j = 0; j < mc; ++j) {
+                        D0d[Moff[c] + j] = sigma0[c];
+                        DMd[Moff[c] + j] = c_a;
+                    }
+                }
+                double c_env = Tinv(target, env);
+
+                // --- SYMMETRIC reduction (see the LaTeX note) -------------------
+                // Naively one would form B = c_env*D0 + sigma_env0*DM + DM*G*D0 and
+                // take eig(B*G), but B is NOT symmetric (DM*G*D0 != D0*G*DM), so
+                // that needs Eigen's general EigenSolver even though the
+                // eigenvalues are provably real. Substituting G = L L' and using
+                // eig(XY) = eig(YX),
+                //     eig(B G) = eig(L' B L),   L' B L = (Q + c_env I) S - c_env*sigma_env0 I,
+                // with P = L' D0 L, Q = L' DM L (both symmetric) and
+                // S = sigma_env0 I + P (symmetric POSITIVE DEFINITE, since D0 >= 0
+                // after clipping and sigma_env0 > 0 after flooring). The additive
+                // -c_env*sigma_env0 cancels exactly against the +c_env*sigma_env0
+                // shift that turns eig(BG) into the eigenvalues of M_target*Sigma_0,
+                // so the wanted eigenvalues are simply eig((Q + c_env I) S). Taking
+                // the Cholesky S = Cf Cf' and applying eig(XY)=eig(YX) once more
+                // gives the SYMMETRIC matrix Cf' (Q + c_env I) Cf, which
+                // SelfAdjointEigenSolver handles ~4x faster than EigenSolver and
+                // with better numerical stability (verified against brute-force
+                // n x n computation to ~1e-12, including rank-deficient G).
+                Eigen::MatrixXd Pm = Lmat.transpose() * (D0d.asDiagonal() * Lmat);
+                Eigen::MatrixXd Qm = Lmat.transpose() * (DMd.asDiagonal() * Lmat);
+                Pm = (0.5 * (Pm + Pm.transpose())).eval();
+                Qm = (0.5 * (Qm + Qm.transpose())).eval();
+                Eigen::MatrixXd Smat = Pm; Smat.diagonal().array() += sigma_env0;
+                Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
+                if (lltS.info() != Eigen::Success) continue;   // skip this component
+                Eigen::MatrixXd Cf = lltS.matrixL();
+                Qm.diagonal().array() += c_env;
+                Eigen::MatrixXd Asym = Cf.transpose() * Qm * Cf;
+                Asym = (0.5 * (Asym + Asym.transpose())).eval();
+
+                Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ses(Asym, Eigen::EigenvaluesOnly);
+                if (ses.info() != Eigen::Success) continue;
+                const Eigen::VectorXd& ev = ses.eigenvalues();
+                std::vector<double> eig_explicit(ev.data(), ev.data() + Ktot);
+
+                double eig_rep = c_env * sigma_env0;
+                long n_rep = (long) n - Ktot;
+
+                QuadSpaResult qr = quad_spa_solve(sigma[target], eig_explicit, eig_rep, n_rep);
+                if (qr.converged) res.p_spa[k][t] = qr.p;
             }
         }
     }
@@ -1118,6 +1376,7 @@ struct PartParams {
     long W; int min_snps; int method;   // method: 0 = HE, 1 = REML
     int nmcmc; int max_iter; double tol; bool se;
     bool coher;                         // also estimate co-heritability (HE only)
+    bool spa;                           // also estimate saddlepoint p-values (HE only)
     std::string out_file; int batch_size; int n_threads; unsigned seed;
 };
 
@@ -1134,7 +1393,7 @@ struct HEWorker : public RcppParallel::Worker {
     void operator()(std::size_t begin, std::size_t end) {
         for (std::size_t w = begin; w < end; ++w) {
             PartWindow pw; build_part_window(batch[w], ctx, pw);
-            he_part_compute(pw, Y, Vp, pr.nmcmc, pr.seed + soff + (unsigned) w, pr.se, pr.coher, out[w]);
+            he_part_compute(pw, Y, Vp, pr.nmcmc, pr.seed + soff + (unsigned) w, pr.se, pr.coher, pr.spa, out[w]);
         }
     }
 };
@@ -1175,6 +1434,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
         fout.open(pr.out_file.c_str());
         if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
         fout << "chr\tstart\tend\tn_left\tn_right\tn_common\tphenotype\tcategory\tm_c\tvg\tse_vg\th2\tse_h2\tenrichment\tfit";
+        if (pr.spa) fout << "\tp_spa";
         if (pr.method == 1) fout << "\tconverged\tn_iter";
         fout << "\n";
     }
@@ -1284,6 +1544,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                         wr(fout, vg); fout << '\t'; wr(fout, r.se_vg[k][t]); fout << '\t';
                         wr(fout, r.h2[k][t]); fout << '\t'; wr(fout, r.se_h2[k][t]); fout << '\t';
                         wr(fout, enr); fout << '\t'; wr(fout, r.fit[t]);
+                        if (pr.spa) { fout << '\t'; wr(fout, r.p_spa[k][t]); }
                         if (pr.method == 1) fout << '\t' << r.conv[k][t] << '\t' << r.iters[k][t];
                         fout << '\n';
                     }
@@ -1314,6 +1575,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                             wr(fout, cv);        fout << "\tNA\t";                  // vg, se_vg
                             wr(fout, (den > 0) ? cv / den : NA_REAL); fout << "\tNA\t";  // h2, se_h2
                             wr(fout, enr);       fout << "\tNA";                    // enrichment, fit
+                            if (pr.spa) fout << "\tNA";                             // p_spa (not defined for co-heritability)
                             fout << '\n';
                         }
                         if (!std::isnan(cv)) tot_cov[cat][p] += cv;
@@ -1350,6 +1612,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                 wr(fout, Vp[t] > 0 ? vg / Vp[t] : NA_REAL); fout << '\t';
                 wr(fout, Vp[t] > 0 ? sev / Vp[t] : NA_REAL); fout << "\tNA";     // enrichment
                 fout << '\t'; wr(fout, tot_fit[t]);                              // genome-wide fit / logL
+                if (pr.spa) fout << "\tNA";                                      // p_spa: no genome-wide aggregate defined
                 if (pr.method == 1) fout << "\tNA\tNA";
                 fout << '\n';
             }
@@ -1363,6 +1626,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                      << ctx.cat_names[c] << "\tNA\t";
                 wr(fout, cv); fout << "\tNA\t";
                 wr(fout, (den > 0) ? cv / den : NA_REAL); fout << "\tNA\tNA\tNA";
+                if (pr.spa) fout << "\tNA";
                 if (pr.method == 1) fout << "\tNA\tNA";
                 fout << '\n';
             }
@@ -1431,13 +1695,20 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                                   bool coher = false,
                                   int collapse_mac = 0,
-                                  int collapse_n = 5) {
+                                  int collapse_n = 5,
+                                  bool SPA = false) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
     RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates, collapse_mac, collapse_n);
     if (coher && ctx.n_pheno < 2) stop("coher = TRUE needs at least two phenotype columns");
+    if (SPA)
+        Rcout << "SPA enabled: saddlepoint p-values will be computed for every signal component.\n"
+              << "  This requires the EXACT cross-component Gram matrix per window (same cost\n"
+              << "  reml_sliding_window_part() already pays), so it is noticeably slower than a\n"
+              << "  default HE run -- expect roughly REML-like per-window runtime, scaling with\n"
+              << "  min_snps^2. Consider a smaller min_snps if this is prohibitive.\n";
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 0;
-    pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se; pr.coher = coher;
+    pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se; pr.coher = coher; pr.spa = SPA;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
     return part_driver(ctx, pr);
 }
@@ -1467,7 +1738,7 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
     if (min_snps < 1) min_snps = 1;
     RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates, collapse_mac, collapse_n);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 1;
-    pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se; pr.coher = false;
+    pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se; pr.coher = false; pr.spa = false;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
     return part_driver(ctx, pr);
 }
