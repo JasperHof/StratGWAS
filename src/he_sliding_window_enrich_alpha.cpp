@@ -955,10 +955,53 @@ static void quad_cgf(double t, const std::vector<double>& eig_explicit,
 }
 
 static QuadSpaResult quad_spa_solve(
-    double s_obs, const std::vector<double>& eig_explicit, double eig_rep, long n_rep,
+    double s_obs_in, const std::vector<double>& eig_in, double eig_rep_in, long n_rep,
     int max_iter = 100, double tol = 1e-8
 ) {
     QuadSpaResult res; res.p = NA_REAL; res.converged = false;
+
+    // -----------------------------------------------------------------------
+    // SCALE NORMALIZATION -- do not remove.
+    //
+    // The saddlepoint p-value is INVARIANT under a common positive rescaling
+    // of (lambda, s_obs): scaling both by k scales the statistic by k and
+    // leaves P(X >= s_obs) unchanged (K(t) simply becomes K(kt)). We exploit
+    // that to work internally in units where Var = 1.
+    //
+    // This matters enormously in practice. The eigenvalues here carry the
+    // units of a per-window variance component, whose magnitude depends on n
+    // and on the phenotype scaling: at biobank n a single 1 Mb window's
+    // sigma_hat has SE ~ 1e-7 or smaller, so var0 ~ 1e-14 and the individual
+    // lambda are ~1e-9. Every hard-coded tolerance below (convergence
+    // threshold, degeneracy floor, domain epsilon, the |t| ~ 0 test) would
+    // then be comparing against constants many orders of magnitude too large,
+    // and the solver would bail out on EVERY window -- returning NA
+    // everywhere, while working fine on smaller test data where the same
+    // quantities happen to be O(1e-3). That was a real bug.
+    //
+    // After normalizing, var0 == 1 exactly, mean0 ~ 0, s_obs is a z-score,
+    // |lambda| <= 1/sqrt(2), and t is O(1) -- so the dimensionless constants
+    // below are meaningful regardless of n or phenotype scaling.
+    // -----------------------------------------------------------------------
+    double mean_raw = 0.0, var_raw = 0.0;
+    for (size_t j = 0; j < eig_in.size(); ++j) {
+        double lam = eig_in[j];
+        mean_raw += lam; var_raw += 2.0 * lam * lam;
+    }
+    if (n_rep > 0) {
+        mean_raw += (double) n_rep * eig_rep_in;
+        var_raw  += (double) n_rep * 2.0 * eig_rep_in * eig_rep_in;
+    }
+    // Only a genuinely degenerate (zero / non-finite) variance is unusable.
+    if (!(var_raw > 0.0) || !std::isfinite(var_raw)) return res;
+
+    const double sd_raw = std::sqrt(var_raw);
+    const double scale  = 1.0 / sd_raw;
+
+    std::vector<double> eig_explicit(eig_in.size());
+    for (size_t j = 0; j < eig_in.size(); ++j) eig_explicit[j] = eig_in[j] * scale;
+    const double eig_rep = eig_rep_in * scale;
+    const double s_obs   = s_obs_in   * scale;
 
     double lam_min = eig_rep, lam_max = eig_rep;
     for (size_t j = 0; j < eig_explicit.size(); ++j) {
@@ -966,16 +1009,19 @@ static QuadSpaResult quad_spa_solve(
         if (lam < lam_min) lam_min = lam;
         if (lam > lam_max) lam_max = lam;
     }
-    double t_hi = (lam_max > 1e-10) ? (1.0 / (2.0 * lam_max)) : 1e10;
-    double t_lo = (lam_min < -1e-10) ? (1.0 / (2.0 * lam_min)) : -1e10;
+    // Dimensionless now: |lambda| <= 1/sqrt(2), so 1e-14 simply means
+    // "no positive (negative) eigenvalue, hence no bound on t in that direction".
+    const double lam_eps = 1e-14;
+    double t_hi = (lam_max >  lam_eps) ? (1.0 / (2.0 * lam_max)) :  1e12;
+    double t_lo = (lam_min < -lam_eps) ? (1.0 / (2.0 * lam_min)) : -1e12;
     double margin = 1e-6;
-    double t_hi_safe = (lam_max > 1e-10) ? t_hi * (1.0 - margin) : t_hi;
-    double t_lo_safe = (lam_min < -1e-10) ? t_lo * (1.0 - margin) : t_lo;
+    double t_hi_safe = (lam_max >  lam_eps) ? t_hi * (1.0 - margin) : t_hi;
+    double t_lo_safe = (lam_min < -lam_eps) ? t_lo * (1.0 - margin) : t_lo;
 
     double t = 0.0, K, K1, K2;
     quad_cgf(0.0, eig_explicit, eig_rep, n_rep, K, K1, K2);
-    double mean0 = K1, var0 = K2;
-    if (var0 <= 1e-14) return res;   // degenerate (no informative variance under H0)
+    double mean0 = K1, var0 = K2;          // var0 == 1 up to rounding
+    if (!(var0 > 0.0)) return res;
 
     bool converged = false;
     for (int it = 0; it < max_iter; ++it) {
@@ -1122,15 +1168,32 @@ static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
         GenoMat Gf = GenoMat::Zero(Ktot, Ktot);
         Gf.selfadjointView<Eigen::Upper>().rankUpdate(Zcat.transpose());
         Gmat = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
-        // A tiny relative ridge keeps the factorization well defined when
-        // genotype columns are collinear (rank-deficient G), which does not
-        // bias the eigenvalues: the deficient directions carry eigenvalue
-        // c_env*sigma_env0 either way, exactly matching the repeated
-        // eigenvalue handled in closed form.
-        Eigen::MatrixXd Gj = Gmat;
-        Gj.diagonal().array() += 1e-10 * (Gmat.trace() / Ktot);
-        Eigen::LLT<Eigen::MatrixXd> lltG(Gj);
-        if (lltG.info() == Eigen::Success) { Lmat = lltG.matrixL(); have_L = true; }
+        // RIDGE, WITH ESCALATION -- do not shrink the starting value.
+        //
+        // G is PSD in exact arithmetic, but it is accumulated in SINGLE
+        // precision (GenoMat = MatrixXf) from ultra-rare genotype columns
+        // (MAC 1-3), which are extremely spiky and near-collinear. The
+        // resulting Gram matrix is severely ill conditioned and its smallest
+        // eigenvalues come out NEGATIVE purely from float accumulation error,
+        // at a relative magnitude of order sqrt(n) * eps_float ~ 1e-5 -- five
+        // orders of magnitude larger than the 1e-10 ridge originally used
+        // here. The Cholesky then failed, have_L stayed false, and EVERY
+        // p_spa in the run came back NA. (It worked on small/common-variant
+        // test data, where the conditioning is far better -- which is exactly
+        // what made the bug so confusing.)
+        //
+        // G is additionally rank deficient by construction whenever
+        // K_tot > n. Escalating until the factorization succeeds handles both
+        // causes. The ridge does not bias the result: the affected directions
+        // carry eigenvalue c_env*sigma_env0 either way, matching the repeated
+        // eigenvalue already handled in closed form.
+        double gscale = Gmat.trace() / Ktot;
+        for (double r = 1e-6; r <= 1e-1; r *= 100.0) {
+            Eigen::MatrixXd Gj = Gmat;
+            Gj.diagonal().array() += r * gscale;
+            Eigen::LLT<Eigen::MatrixXd> lltG(Gj);
+            if (lltG.info() == Eigen::Success) { Lmat = lltG.matrixL(); have_L = true; break; }
+        }
         return have_L;
     };
 
