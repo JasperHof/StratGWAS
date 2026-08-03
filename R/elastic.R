@@ -153,10 +153,11 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
 #' SPA solved for randomized double-partitioned window-based Haseman-Elston regression
 #'
 #' @export
-he_reg_spa <- function (filename, pheno, window_size = 1e6, min_snps = 1000,
-                        sub_window_size = 1000, min_sub_snps = 2, 
-                        alpha = -1, alpha_common = -1, common_filename = NULL,
-                        outfile, batch_size = 16, n_threads = 1,
+he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
+                        min_chunk_snps = 5, alpha = -1, alpha_common = -1,
+                        common_filename = NULL,
+                        common_window = 1e6, max_common_snps = 400,
+                        outfile, batch_size = 4, n_threads = 1,
                         covariates = NULL, SPA = T, spa_pval_threshold = 0.1) {
 
   #storage.mode(snp_cat) <- "integer"          # <- force integer
@@ -182,21 +183,22 @@ he_reg_spa <- function (filename, pheno, window_size = 1e6, min_snps = 1000,
   #hers <- he_multi_part_enrich_alpha(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
 
   he_chunk_spa(
-    filename    = filename,               # PLINK prefix (WES)
+    filename    =  filename,               # PLINK prefix (WES)
     pheno_mat   = multi_he,
-    window_size = window_size,
-    min_snps    = min_snps,
-    flank_chunks = 1,
+    chunk_size  = chunk_size,
+    flank_chunks = flank_chunks,
+    min_chunk_snps = min_chunk_snps,
     alpha       = alpha,
     alpha_common = alpha_common,
     common_filename = common_filename,
-    out_file = outfile,
-    batch_size = batch_size,
-    n_threads = n_threads,
-    covariates = covariates,
-    SPA = SPA,
-    spa_pval_threshold = spa_pval_threshold,
-    background_rank = 0
+    common_window = common_window,
+    max_common_snps = max_common_snps,
+    out_file    = outfile,
+    batch_size  = batch_size,
+    n_threads   = n_threads,
+    covariates  = covariates,
+    SPA         = T,
+    spa_pval_threshold = 0.1
   )
 
   # hers$genome_h2 contains the genome estimates per alpha
