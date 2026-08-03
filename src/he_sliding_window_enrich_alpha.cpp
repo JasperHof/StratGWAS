@@ -881,6 +881,9 @@ struct PartResult {
     // 1 if p_spa holds a saddlepoint value, 0 if it holds the Wald value
     // (i.e. the window was screened out as clearly non-significant). [sig][trait]
     std::vector< std::vector<int> > spa_used;
+    // 1 if this window's SPA was skipped because K_tot exceeded spa_max_k
+    // (the O(K_tot^3) factorization would have been prohibitive)
+    int spa_big;
     std::vector< std::vector<int> > conv, iters;               // REML
     // per signal component, per TRAIT PAIR: genetic covariance (co-heritability)
     // contributed by that category. Empty unless coher = TRUE. [sig][pair]
@@ -903,6 +906,7 @@ static void alloc_result(PartResult& res, const PartWindow& pw, int P, int n_pai
     res.se_h2.assign(nsig, std::vector<double>(P, NA_REAL));
     res.p_spa.assign(nsig, std::vector<double>(P, NA_REAL));
     res.spa_used.assign(nsig, std::vector<int>(P, 0));
+    res.spa_big = 0;
     res.conv.assign(nsig, std::vector<int>(P, 0));
     res.iters.assign(nsig, std::vector<int>(P, 0));
     if (n_pairs > 0) res.cov12.assign(nsig, std::vector<double>(n_pairs, NA_REAL));
@@ -1081,7 +1085,7 @@ static QuadSpaResult quad_spa_solve(
 static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
                             const std::vector<double>& Vp, int nmcmc, unsigned seed,
                             bool se, bool coher, bool spa, double spa_thresh,
-                            PartResult& res) {
+                            int spa_max_k, PartResult& res) {
     int C = (int) pw.X.size(), env = C, n = (int) Y.rows(), P = (int) Y.cols();
     int nsig = (int) pw.sig.size();
     int npair = coher ? n_trait_pairs(P) : 0;
@@ -1162,6 +1166,13 @@ static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
     auto ensure_L = [&]() -> bool {
         if (L_tried) return have_L;
         L_tried = true;
+        // HARD SIZE GUARD. Cost here is O(K_tot^3) for the Cholesky and ~10x
+        // that for each component's symmetric eigensolve, with a K_tot^2
+        // matrix resident per thread. At K_tot ~ 20000 that is ~45 min per
+        // window per phenotype and ~3 GB per thread -- i.e. it would appear
+        // to hang. Refuse rather than stall; the driver reports how many
+        // windows were skipped so this is never silent.
+        if (spa_max_k > 0 && Ktot > spa_max_k) { res.spa_big = 1; return false; }
         GenoMat Zcat(n, Ktot);
         for (int c = 0; c < C; ++c)
             Zcat.middleCols(Moff[c], (int) M[c]) = pw.X[c] * (float)(1.0 / std::sqrt(M[c]));
@@ -1187,10 +1198,18 @@ static void he_part_compute(const PartWindow& pw, const Eigen::MatrixXd& Y,
         // causes. The ridge does not bias the result: the affected directions
         // carry eigenvalue c_env*sigma_env0 either way, matching the repeated
         // eigenvalue already handled in closed form.
+        // Start at 1e-4, which succeeded in every test case (K_tot both above
+        // and below n): at large K_tot each attempt is a full O(K_tot^3)
+        // Cholesky plus a K_tot^2 copy, so starting lower and escalating
+        // wasted an entire factorization per window. Escalate only if needed,
+        // reusing ONE buffer and adjusting the diagonal by the increment
+        // rather than re-copying Gmat.
         double gscale = Gmat.trace() / Ktot;
-        for (double r = 1e-6; r <= 1e-1; r *= 100.0) {
-            Eigen::MatrixXd Gj = Gmat;
-            Gj.diagonal().array() += r * gscale;
+        Eigen::MatrixXd Gj = Gmat;
+        double applied = 0.0;
+        for (double r = 1e-4; r <= 1e-1; r *= 10.0) {
+            Gj.diagonal().array() += (r - applied) * gscale;   // incremental
+            applied = r;
             Eigen::LLT<Eigen::MatrixXd> lltG(Gj);
             if (lltG.info() == Eigen::Success) { Lmat = lltG.matrixL(); have_L = true; break; }
         }
@@ -1506,6 +1525,7 @@ struct PartParams {
     bool coher;                         // also estimate co-heritability (HE only)
     bool spa;                           // also estimate saddlepoint p-values (HE only)
     double spa_thresh;                  // run the SPA only when Wald p < this
+    int spa_max_k;                      // skip SPA when K_tot exceeds this
     std::string out_file; int batch_size; int n_threads; unsigned seed;
 };
 
@@ -1523,7 +1543,7 @@ struct HEWorker : public RcppParallel::Worker {
         for (std::size_t w = begin; w < end; ++w) {
             PartWindow pw; build_part_window(batch[w], ctx, pw);
             he_part_compute(pw, Y, Vp, pr.nmcmc, pr.seed + soff + (unsigned) w, pr.se, pr.coher,
-                            pr.spa, pr.spa_thresh, out[w]);
+                            pr.spa, pr.spa_thresh, pr.spa_max_k, out[w]);
         }
     }
 };
@@ -1598,7 +1618,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
     std::vector< std::vector<double> > tot_cov(NC, std::vector<double>(NPAIR > 0 ? NPAIR : 1, 0.0));
 
     PartStream stream(ctx, pr.W, pr.min_snps);
-    long processed = 0; int n_win = 0;
+    long processed = 0; int n_win = 0; long n_spa_big = 0;
     Progress prog; prog.start(pr.method == 0 ? "HE-part" : "REML-part",
                               count_total_windows(ctx, pr.W, pr.min_snps));
 
@@ -1714,6 +1734,7 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
                 }
             }
             ++n_win;
+            if (r.spa_big) ++n_spa_big;
             prog.tick(r.chr, r.mid_total);          // one tick per finished window
         }
         processed += (long) batch.size();
@@ -1765,6 +1786,17 @@ static Rcpp::List part_driver(RunContext& ctx, const PartParams& pr) {
         fout.close();
     }
     Rcout << "Windows estimated: " << n_win << "\n";
+    if (pr.spa && n_spa_big > 0) {
+        Rcout << "WARNING: SPA skipped in " << n_spa_big << " of " << n_win
+              << " windows because the window had more than " << pr.spa_max_k
+              << " SNPs in total\n"
+              << "  (flanks + common + middle). The exact-Gram SPA costs O(K_tot^3) per\n"
+              << "  window, so this would have been prohibitively slow. Those rows report\n"
+              << "  the Wald p-value with spa_used = 0. To get SPA values there, reduce\n"
+              << "  K_tot -- collapse_mac/collapse_n is the most effective lever, and the\n"
+              << "  cubic scaling means halving K_tot is ~8x faster -- or raise spa_max_snps\n"
+              << "  if you are willing to pay the cost.\n";
+    }
 
     // return genome-wide category h2 matrix (category x trait) for convenience
     Rcpp::NumericMatrix gh2(NC, P), gse(NC, P);
@@ -1828,7 +1860,8 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
                                   int collapse_mac = 0,
                                   int collapse_n = 5,
                                   bool SPA = false,
-                                  double spa_pval_threshold = 0.1) {
+                                  double spa_pval_threshold = 0.1,
+                                  int spa_max_snps = 4000) {
     if (window_size <= 0) stop("window_size must be positive");
     if (min_snps < 1) min_snps = 1;
     RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates, collapse_mac, collapse_n);
@@ -1850,6 +1883,7 @@ Rcpp::List he_sliding_window_part(const std::string& filename,
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 0;
     pr.nmcmc = nmcmc; pr.max_iter = 0; pr.tol = 0.0; pr.se = se; pr.coher = coher; pr.spa = SPA;
     pr.spa_thresh = spa_pval_threshold;
+    pr.spa_max_k = spa_max_snps;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
     return part_driver(ctx, pr);
 }
@@ -1880,7 +1914,7 @@ Rcpp::List reml_sliding_window_part(const std::string& filename,
     RunContext ctx = setup_context(filename, pheno_mat, snp_cat, cat_names, alpha, alpha_common, common_filename, weights, covariates, collapse_mac, collapse_n);
     PartParams pr; pr.W = (long) window_size; pr.min_snps = min_snps; pr.method = 1;
     pr.nmcmc = 0; pr.max_iter = max_iter; pr.tol = tol; pr.se = se; pr.coher = false;
-    pr.spa = false; pr.spa_thresh = 1.0;
+    pr.spa = false; pr.spa_thresh = 1.0; pr.spa_max_k = 0;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads; pr.seed = (unsigned) seed;
     return part_driver(ctx, pr);
 }
