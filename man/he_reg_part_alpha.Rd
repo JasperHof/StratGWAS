@@ -25,8 +25,7 @@ he_reg_part_alpha(
   se = FALSE,
   alpha_common = -1,
   collapse_mac = 0,
-  collapse_n = 5,
-  SPA = F
+  collapse_n = 5
 )
 }
 \description{

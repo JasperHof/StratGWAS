@@ -93,7 +93,7 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
                                batch_size = 16, genome_wide = FALSE, min_snps = 1000,
                                weights = NULL, covariates = NULL, coher = FALSE,
                                se = FALSE, alpha_common = -1, collapse_mac = 0,
-                               collapse_n = 5, SPA = F) {
+                               collapse_n = 5) {
 
 
   storage.mode(snp_cat) <- "integer"          # <- force integer
@@ -138,8 +138,7 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
     covariates  = covariates,
     coher       = coher,
     collapse_mac = collapse_mac,
-    collapse_n  = collapse_n,
-    SPA         = SPA
+    collapse_n  = collapse_n
   )
   
   # hers$genome_h2 contains the genome estimates per alpha
@@ -187,7 +186,7 @@ he_reg_spa <- function (filename, pheno, window_size = 1e6, min_snps = 1000,
     pheno_mat   = multi_he,
     window_size = window_size,
     min_snps    = min_snps,
-    flank_chunks = 5,
+    flank_chunks = 1,
     alpha       = alpha,
     alpha_common = alpha_common,
     common_filename = common_filename,
@@ -199,7 +198,7 @@ he_reg_spa <- function (filename, pheno, window_size = 1e6, min_snps = 1000,
     spa_pval_threshold = spa_pval_threshold,
     background_rank = 0
   )
-  
+
   # hers$genome_h2 contains the genome estimates per alpha
   # hers$$best_alpha contains best alpha based on Frobenius norm
   
