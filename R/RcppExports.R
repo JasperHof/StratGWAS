@@ -57,6 +57,10 @@ reml_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, wi
     .Call(`_StratGWAS_reml_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, max_iter, tol, se, out_file, batch_size, n_threads, seed, weights, covariates, collapse_mac, collapse_n)
 }
 
+he_subwindow_spa <- function(filename, pheno_mat, window_size = 1e6, min_snps = 1000L, sub_window_size = 5e3, min_sub_snps = 2L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, out_file = "", batch_size = 4L, n_threads = 0L, weights = NULL, covariates = NULL, SPA = TRUE, spa_pval_threshold = 0.1, background_rank = 0L) {
+    .Call(`_StratGWAS_he_subwindow_spa`, filename, pheno_mat, window_size, min_snps, sub_window_size, min_sub_snps, alpha, alpha_common, common_filename, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold, background_rank)
+}
+
 computeLDscoresFromBED <- function(file_prefix, geno_set) {
     .Call(`_StratGWAS_computeLDscoresFromBED`, file_prefix, geno_set)
 }

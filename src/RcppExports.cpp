@@ -254,6 +254,33 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// he_subwindow_spa
+Rcpp::List he_subwindow_spa(const std::string& filename, const SEXP pheno_mat, double window_size, int min_snps, double sub_window_size, int min_sub_snps, double alpha, double alpha_common, Rcpp::Nullable<Rcpp::String> common_filename, std::string out_file, int batch_size, int n_threads, Rcpp::Nullable<Rcpp::NumericVector> weights, Rcpp::Nullable<Rcpp::NumericMatrix> covariates, bool SPA, double spa_pval_threshold, int background_rank);
+RcppExport SEXP _StratGWAS_he_subwindow_spa(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP window_sizeSEXP, SEXP min_snpsSEXP, SEXP sub_window_sizeSEXP, SEXP min_sub_snpsSEXP, SEXP alphaSEXP, SEXP alpha_commonSEXP, SEXP common_filenameSEXP, SEXP out_fileSEXP, SEXP batch_sizeSEXP, SEXP n_threadsSEXP, SEXP weightsSEXP, SEXP covariatesSEXP, SEXP SPASEXP, SEXP spa_pval_thresholdSEXP, SEXP background_rankSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
+    Rcpp::traits::input_parameter< double >::type window_size(window_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type min_snps(min_snpsSEXP);
+    Rcpp::traits::input_parameter< double >::type sub_window_size(sub_window_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type min_sub_snps(min_sub_snpsSEXP);
+    Rcpp::traits::input_parameter< double >::type alpha(alphaSEXP);
+    Rcpp::traits::input_parameter< double >::type alpha_common(alpha_commonSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::String> >::type common_filename(common_filenameSEXP);
+    Rcpp::traits::input_parameter< std::string >::type out_file(out_fileSEXP);
+    Rcpp::traits::input_parameter< int >::type batch_size(batch_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type n_threads(n_threadsSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::NumericVector> >::type weights(weightsSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::NumericMatrix> >::type covariates(covariatesSEXP);
+    Rcpp::traits::input_parameter< bool >::type SPA(SPASEXP);
+    Rcpp::traits::input_parameter< double >::type spa_pval_threshold(spa_pval_thresholdSEXP);
+    Rcpp::traits::input_parameter< int >::type background_rank(background_rankSEXP);
+    rcpp_result_gen = Rcpp::wrap(he_subwindow_spa(filename, pheno_mat, window_size, min_snps, sub_window_size, min_sub_snps, alpha, alpha_common, common_filename, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold, background_rank));
+    return rcpp_result_gen;
+END_RCPP
+}
 // computeLDscoresFromBED
 DataFrame computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set);
 RcppExport SEXP _StratGWAS_computeLDscoresFromBED(SEXP file_prefixSEXP, SEXP geno_setSEXP) {
@@ -341,6 +368,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_he_multi_part", (DL_FUNC) &_StratGWAS_he_multi_part, 3},
     {"_StratGWAS_he_sliding_window_part", (DL_FUNC) &_StratGWAS_he_sliding_window_part, 23},
     {"_StratGWAS_reml_sliding_window_part", (DL_FUNC) &_StratGWAS_reml_sliding_window_part, 20},
+    {"_StratGWAS_he_subwindow_spa", (DL_FUNC) &_StratGWAS_he_subwindow_spa, 17},
     {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 2},
     {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},
     {"_StratGWAS_linear_gwas_parallel", (DL_FUNC) &_StratGWAS_linear_gwas_parallel, 4},

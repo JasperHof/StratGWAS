@@ -150,3 +150,62 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
 
   return(res)
 }
+
+#' SPA solved for randomized double-partitioned window-based Haseman-Elston regression
+#'
+#' @export
+he_reg_spa <- function (filename, pheno, window_size = 1e6, min_snps = 1000,
+                        sub_window_size = 1000, min_sub_snps = 2, 
+                        alpha = -1, alpha_common = -1, common_filename = NULL,
+                        outfile, batch_size = 16, n_threads = 1,
+                        covariates = NULL, SPA = T, spa_pval_threshold = 0.1) {
+
+  #storage.mode(snp_cat) <- "integer"          # <- force integer
+  #snp_cat <- as.matrix(snp_cat)               # ensure it's a matrix, not df
+  #cat_names <- as.character(cat_names)
+
+  # Stadardize
+  for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
+  for (j in 3:ncol(pheno)) {
+    if (any(is.na(pheno[, j]))) {
+      pheno[which(is.na(pheno[, j])), j] <- mean(pheno[, j], na.rm = T)
+    }
+  }
+  # Create multivariate phenotype
+  multi <- pheno
+  colnames(multi) <- c("FID", "IID", "Pheno")
+
+  # HE regression on the phenotype
+  multi_he <- as.matrix(multi[, -c(1, 2), drop = FALSE])
+  rownames(multi_he) <- multi[, 2]
+
+  #hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
+  #hers <- he_multi_part_enrich_alpha(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
+
+  he_subwindow_spa(
+    filename    = filename,               # PLINK prefix (WES)
+    pheno_mat   = multi_he,
+    window_size = window_size,
+    min_snps    = min_snps,
+    sub_window_size = sub_window_size, # 5 kb
+    min_sub_snps = min_sub_snps,
+    alpha       = alpha,
+    alpha_common = alpha_common,
+    common_filename = common_filename,
+    out_file = outfile,
+    batch_size = batch_size,
+    n_threads = n_threads,
+    covariates = covariates,
+    SPA = SPA,
+    spa_pval_threshold = spa_pval_threshold,
+    background_rank = 0
+  )
+  
+  # hers$genome_h2 contains the genome estimates per alpha
+  # hers$$best_alpha contains best alpha based on Frobenius norm
+  
+  #info <- cbind(rownames(hers$genome_h2), hers$genome_h2, hers$genome_se, hers$fit_score, hers$best_alpha)
+  #rownames(info) <- colnames(info) <- NULL
+
+  return(NULL)
+}
