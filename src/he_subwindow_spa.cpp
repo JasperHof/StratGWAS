@@ -21,73 +21,47 @@
 using namespace Rcpp;
 
 // ===========================================================================
-// SUB-WINDOW HE + saddlepoint association testing.
+// CHUNK-BASED HE + saddlepoint association testing.
 //
-// A different design from he_sliding_window_enrich_alpha.cpp, aimed squarely
-// at making the quadratic-form SPA affordable.
+// The unit of analysis is a fixed-size CHUNK of consecutive SNPs (default
+// 256), not a bp window. That single change is what makes the method
+// tractable, because it puts a HARD BOUND on the only quantity that matters
+// for cost.
 //
-// WHY THIS FILE EXISTS. The SPA's cost is governed by K_tot, the TOTAL number
-// of genotype columns across ALL variance components in a window's model,
-// because it needs the K_tot x K_tot Gram matrix, its Cholesky (O(K_tot^3))
-// and a symmetric eigensolve (~10x that) per tested component. In the 1 Mb
-// sliding-window design the two 1 Mb WES flanks dominate that total:
+// WHY THE bp-WINDOW DESIGNS FAILED. The saddlepoint calculation needs, per
+// tested component, a Cholesky (O(K^3)) and a symmetric eigensolve (~10 K^3)
+// on a K x K matrix, where K is the TOTAL column count over all components.
+// With bp-defined windows K is set by the DATA, not by the user: a dense 1 Mb
+// exome cell holds ~8547 SNPs, so
+//     K = 8547 + 406 (common) = 8953
+//     -> 641 MB per K x K matrix, ~12 of them live  =>  ~7.7 GB per thread
+//     -> ~885 s per tested sub-window  =>  ~49 h per cell.
+// No amount of algebraic reuse rescues that; the exponent is the problem.
 //
-//     left 8547 + right 8547 + middle 2754 + common 406  =  K_tot ~ 20000
+// WITH CHUNKS, K IS CHOSEN BY THE USER:
+//     K = chunk_size * (1 + 2 * flank_chunks) + m_common
+// e.g. 256 * 3 + ~20 = ~788, giving K^3 ~ 4.9e8 -- roughly 1500x cheaper per
+// test than K = 8953, and ~5 MB per matrix instead of 641 MB. Cost becomes
+// predictable and independent of local SNP density.
 //
-// at which point a single window costs ~45 min. Shrinking the TARGET does not
-// help at all -- the flanks are untouched.
+// MODEL for the chunk at SNP indices [a, b):
+//     { K_chunk (target), K_flank (the flank_chunks blocks either side,
+//       combined), [K_common], sigma_e I }
+// The flanking chunks play the role the 1 Mb flanks played -- absorbing local
+// LD and background -- but at bounded size.
 //
-// THE DESIGN HERE. Keep the 1 Mb cell as the unit of local context, but:
-//   * drop the two 1 Mb flanks entirely;
-//   * split the 1 Mb cell into small sub-windows (e.g. 5 kb) and test each;
-//   * let the REMAINDER of the 1 Mb cell (the 995 kb outside the sub-window)
-//     play the role the flanks used to play, absorbing local background;
-//   * keep the optional common-SNP GRM.
-// The model for sub-window s is therefore
-//     { K_s (target), K_rest = K_1Mb - K_s, [K_common], sigma_e I }
-// and
-//     K_tot = m_1Mb + m_common ~ 3160,
-// a 6.4x reduction in K_tot, i.e. ~260x on the cubic cost.
+// TWO FIXES CARRIED OVER FROM THE EARLIER FILES:
+//   * The Wald pre-screen is applied BEFORE the eigensolve, not after. Since
+//     the explicit eigenvalues are those of the symmetric matrix Asym,
+//         Var(sigma_hat) = 2 * sum lambda^2 = 2 * ||Asym||_F^2 ,
+//     which costs O(K^2) given Asym -- no eigensolve needed. In the previous
+//     file the screen sat AFTER the ~10 K^3 eigensolve and therefore saved
+//     nothing at all. This ordering is what makes it a real ~10x saving.
+//   * G is accumulated in float from near-collinear ultra-rare columns, so the
+//     Cholesky needs a real ridge (1e-4 relative, escalating), not 1e-10.
 //
-// THE SUBTRACTION TRICK (the user's idea, and it is exact). Writing the
-// UN-normalized component Gram as S_A = sum_{j in A} v_j v_j' for a column set
-// A, disjointness gives exactly
-//     S_rest = S_1Mb - S_s ,
-// and the same subtraction holds for every quantity we actually need:
-//     tr(S_rest)          = tr(S_1Mb) - tr(S_s)                (trace norm.)
-//     y'S_rest y          = y'S_1Mb y - y'S_s y                (the q vector)
-//     tr(S_a S_b)         = ||G[A,B]||_F^2, and blocks subtract likewise (T)
-// so the whole moment system for a sub-window is assembled in O(m_s * m_1Mb)
-// from quantities computed ONCE for the 1 Mb cell. Verified numerically to
-// ~1e-13 against direct computation.
-//
-// THE SECOND WIN. Every sub-window of a 1 Mb cell shares the SAME column set
-// V = [V_1Mb | V_common]; only the PARTITION of those columns into components
-// changes. Hence G = V'V and its Cholesky factor L are computed ONCE per 1 Mb
-// cell and reused by all ~200 sub-windows. Moreover
-//     P = L' D_0 L  and  Q = L' D_M L
-// decompose into per-component blocks, so with PL_mid = L[mid,:]'L[mid,:] and
-// PL_com = L[com,:]'L[com,:] precomputed per cell, each sub-window needs only
-// PL_s = L[s,:]'L[s,:] -- O(K_tot^2 * m_s) instead of O(K_tot^3).
-//
-// WHAT IS STILL EXPENSIVE, AND THE KNOB FOR IT. The Cholesky of S and the
-// symmetric eigensolve remain O(K_tot^3) PER SUB-WINDOW, and with ~200
-// sub-windows per cell that still dominates (~109 min per cell at
-// K_tot = 3160). `background_rank` addresses this: it replaces the background
-// (rest + common) column blocks by their leading `background_rank`
-// eigenvectors before the SPA, cutting K_tot to background_rank + m_s.
-// Indicative genome-wide totals (3000 cells, 200 sub-windows, 19 threads):
-//     K_tot 3160 (exact) ~ 286 h      K_tot 1000 ~  8 h
-//     K_tot 2000         ~  73 h      K_tot  500 ~  1 h
-// background_rank = 0 keeps the calculation EXACT and is the right setting for
-// spot-checking a chromosome; a few hundred is what makes a genome-wide run
-// tractable. This truncation is an APPROXIMATION and has not been validated
-// against the exact result on real data -- compare the two on a subset before
-// trusting it.
-//
-// Everything lives in an anonymous namespace (internal linkage) so it cannot
-// collide with the identically-named helpers in the other .cpp files of the
-// package; only the exported wrapper has external linkage.
+// Everything is in an anonymous namespace (internal linkage) so it cannot
+// collide with the identically-named helpers in the other .cpp files.
 // ===========================================================================
 
 namespace {
@@ -292,7 +266,7 @@ static std::vector< std::pair<int,int> > build_cells(const std::vector<long>& bp
 // ===========================================================================
 // Context
 // ===========================================================================
-struct SubContext {
+struct ChunkContext {
     std::string wes_prefix; int wes_n_total, wes_n_snps; BimInfo wes_bim;
     std::vector<int> geno_keep;
     Eigen::MatrixXd Y;
@@ -319,12 +293,12 @@ static void project_covariates(GenoMat& X, const GenoMat& Z, const GenoMat& M) {
     }
 }
 
-static SubContext setup_sub_context(const std::string& filename, const SEXP pheno_mat,
+static ChunkContext setup_chunk_context(const std::string& filename, const SEXP pheno_mat,
                                     double alpha, double alpha_common,
                                     Rcpp::Nullable<Rcpp::String> common_filename,
                                     Rcpp::Nullable<Rcpp::NumericVector> weights,
                                     Rcpp::Nullable<Rcpp::NumericMatrix> covariates) {
-    SubContext ctx;
+    ChunkContext ctx;
     ctx.wes_prefix = filename;
     ctx.wes_n_snps = count_lines(filename + ".bim");
     List fam = read_fam_file(filename);
@@ -418,22 +392,6 @@ static SubContext setup_sub_context(const std::string& filename, const SEXP phen
     return ctx;
 }
 
-// ===========================================================================
-// One 1 Mb cell, ready for sub-window testing
-// ===========================================================================
-struct CellData {
-    std::string chr; long start, end;
-    int i0_mid;                    // .bim index of the cell's first WES SNP
-    int m_mid, m_com, K;           // column counts; K = m_mid + m_com
-    GenoMat V;                     // n x K, ALPHA-WEIGHTED but NOT trace-normalized
-    std::vector<double> cj;        // ||v_j||^2 per column  (so tr(S_A) = sum_{j in A} cj)
-    std::vector<long> bp;          // bp position of each MIDDLE column
-};
-
-// Apply the alpha weight (and optional per-SNP LD weight) to a standardized
-// block, WITHOUT the per-component trace normalization -- that constant depends
-// on which columns form a component, which changes per sub-window, so it is
-// applied later as a scalar (see g_a in sub_window_scan).
 static void apply_alpha(GenoMat& X, const std::vector<float>& maf, double alpha,
                         const std::vector<float>* wts, int i0) {
     bool unit = (alpha == -1.0);
@@ -583,65 +541,76 @@ static QuadSpaResult quad_spa_solve(
 }
 
 
+
 // ===========================================================================
-// Sub-window scan for ONE 1 Mb cell
+// One chunk's assembled region
 // ===========================================================================
-struct SubResult {
+struct ChunkData {
     std::string chr; long start, end;
-    int m_s, m_rest, m_com;
-    std::vector<double> vg, se_vg, h2, p_spa;   // per phenotype
+    int i0_target, m_t, m_f, m_c, K;   // target / flank / common column counts
+    GenoMat V;                          // n x K = [target | flank | common]
+    std::vector<double> cj;             // ||v_j||^2 per column
+};
+
+struct ChunkResult {
+    std::string chr; long start, end;
+    int m_t, m_f, m_c;
+    std::vector<double> vg, se_vg, h2, p_spa;
     std::vector<int> spa_used;
 };
 
-// Components, in this fixed order:
-//   0 = target sub-window s
-//   1 = rest of the 1 Mb cell
-//   2 = common background            (only if present)
-//   env = residual
-//
-// All kernels use the trace normalization tr(K_a) = n, i.e.
-//     K_a = g_a * S_A ,  g_a = n / tr(S_A) ,  tr(S_A) = sum_{j in A} cj .
-// With that convention T(a,env) = tr(K_a) = n for every a, exactly.
-static void scan_cell(const CellData& cd, const Eigen::MatrixXd& Y,
-                      const std::vector<double>& Vp, long sub_bp, int min_sub_snps,
-                      bool spa, double spa_thresh, int background_rank,
-                      std::vector<SubResult>& out) {
+// Components: 0 = target chunk, 1 = flank, 2 = common (if any), env = residual.
+// Kernels use tr(K_a) = n, i.e. K_a = g_a S_A with g_a = n / tr(S_A), so
+// T(a,env) = n exactly for every a.
+static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y,
+                       const std::vector<double>& Vp, bool spa, double spa_thresh,
+                       ChunkResult& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
-    const int K = cd.K, m_mid = cd.m_mid, m_com = cd.m_com;
-    const bool has_com = (m_com > 0);
-    const int C = has_com ? 3 : 2;          // number of genetic components
-    const int env = C;
-    if (m_mid <= 0) return;
+    const int K = cd.K, m_t = cd.m_t, m_f = cd.m_f, m_c = cd.m_c;
+    const bool has_c = (m_c > 0);
+    const int C = has_c ? 3 : 2, env = C;
 
-    // ---- per-cell quantities, computed ONCE and reused by every sub-window --
-    // G = V'V  (EXACT, double). This is the object the whole reduction needs,
-    // and it is identical for every sub-window because the COLUMNS are the
-    // same -- only the partition into components changes.
+    cr.chr = cd.chr; cr.start = cd.start; cr.end = cd.end;
+    cr.m_t = m_t; cr.m_f = m_f; cr.m_c = m_c;
+    cr.vg.assign(P, NA_REAL); cr.se_vg.assign(P, NA_REAL);
+    cr.h2.assign(P, NA_REAL); cr.p_spa.assign(P, NA_REAL);
+    cr.spa_used.assign(P, 0);
+    if (m_t <= 0 || m_f <= 0) return;
+
+    // ---- Gram matrix (K x K, K is BOUNDED by chunk_size and flank_chunks) ---
     GenoMat Gf = GenoMat::Zero(K, K);
     Gf.selfadjointView<Eigen::Upper>().rankUpdate(cd.V.transpose());
     Eigen::MatrixXd G = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
-
-    // squared Gram, for the tr(S_a S_b) = ||G[A,B]||_F^2 block sums
     Eigen::MatrixXd G2 = G.array().square();
 
-    // u = V' y per phenotype  ->  y'S_A y = sum_{j in A} u_j^2
-    std::vector<Eigen::VectorXd> u(P);
-    for (int t = 0; t < P; ++t) u[t] = (cd.V.transpose() * Y.col(t).cast<float>()).cast<double>();
+    const int o_t = 0, o_f = m_t, o_c = m_t + m_f;
+    double tr_t = 0, tr_f = 0, tr_c = 0;
+    for (int j = 0; j < m_t; ++j) tr_t += cd.cj[o_t + j];
+    for (int j = 0; j < m_f; ++j) tr_f += cd.cj[o_f + j];
+    for (int j = 0; j < m_c; ++j) tr_c += cd.cj[o_c + j];
+    if (!(tr_t > 0.0) || !(tr_f > 0.0)) return;
 
-    // running totals over the whole 1 Mb middle / common blocks
-    double tr_mid = 0.0, tr_com = 0.0;
-    for (int j = 0; j < m_mid; ++j) tr_mid += cd.cj[j];
-    for (int j = m_mid; j < K; ++j) tr_com += cd.cj[j];
-    const double f_mm = G2.topLeftCorner(m_mid, m_mid).sum();               // tr(S_mid S_mid)
-    const double f_cc = has_com ? G2.bottomRightCorner(m_com, m_com).sum() : 0.0;
-    const double f_mc = has_com ? G2.topRightCorner(m_mid, m_com).sum()  : 0.0;
+    std::vector<double> g(C);
+    g[0] = (double) n / tr_t; g[1] = (double) n / tr_f;
+    if (has_c) { if (!(tr_c > 0.0)) return; g[2] = (double) n / tr_c; }
 
-    // Cholesky of G, and the per-block products PL_mid / PL_com. Built ONCE
-    // per cell; the escalating ridge is required because G is accumulated in
-    // float from ultra-rare (near-collinear) columns -- see the long note in
-    // he_sliding_window_enrich_alpha.cpp.
-    Eigen::MatrixXd L, PL_mid, PL_com;
-    bool have_L = false;
+    // ---- moment matrix T:  tr(S_a S_b) = ||G[A,B]||_F^2 ---------------------
+    Eigen::MatrixXd T = Eigen::MatrixXd::Zero(C + 1, C + 1);
+    T(0,0) = g[0]*g[0]*G2.block(o_t,o_t,m_t,m_t).sum();
+    T(1,1) = g[1]*g[1]*G2.block(o_f,o_f,m_f,m_f).sum();
+    T(0,1) = T(1,0) = g[0]*g[1]*G2.block(o_t,o_f,m_t,m_f).sum();
+    if (has_c) {
+        T(2,2) = g[2]*g[2]*G2.block(o_c,o_c,m_c,m_c).sum();
+        T(0,2) = T(2,0) = g[0]*g[2]*G2.block(o_t,o_c,m_t,m_c).sum();
+        T(1,2) = T(2,1) = g[1]*g[2]*G2.block(o_f,o_c,m_f,m_c).sum();
+    }
+    for (int a = 0; a < C; ++a) { T(a,env) = (double) n; T(env,a) = (double) n; }
+    T(env,env) = (double) n;
+    Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
+    Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
+
+    // ---- Cholesky of G, once per chunk -------------------------------------
+    Eigen::MatrixXd L; bool have_L = false;
     if (spa) {
         double gscale = G.trace() / K;
         Eigen::MatrixXd Gj = G; double applied = 0.0;
@@ -650,221 +619,186 @@ static void scan_cell(const CellData& cd, const Eigen::MatrixXd& Y,
             Eigen::LLT<Eigen::MatrixXd> llt(Gj);
             if (llt.info() == Eigen::Success) { L = llt.matrixL(); have_L = true; break; }
         }
-        if (have_L) {
-            PL_mid.noalias() = L.topRows(m_mid).transpose()    * L.topRows(m_mid);
-            if (has_com) PL_com.noalias() = L.bottomRows(m_com).transpose() * L.bottomRows(m_com);
-        }
     }
 
-    // ---- sub-window boundaries (by bp within the cell) ----------------------
-    std::vector<std::pair<int,int> > subs;
-    {
-        int j = 0;
-        while (j < m_mid) {
-            long b0 = cd.bp[j]; int k = j;
-            while (k < m_mid && cd.bp[k] < b0 + sub_bp) ++k;
-            if (k - j >= min_sub_snps) subs.push_back(std::make_pair(j, k));
-            j = k;
-        }
+    for (int t = 0; t < P; ++t) {
+        Eigen::VectorXd u = (cd.V.transpose() * Y.col(t).cast<float>()).cast<double>();
+        Eigen::VectorXd q(C + 1);
+        double q_t = 0, q_f = 0, q_c = 0;
+        for (int j = 0; j < m_t; ++j) q_t += u[o_t+j]*u[o_t+j];
+        for (int j = 0; j < m_f; ++j) q_f += u[o_f+j]*u[o_f+j];
+        for (int j = 0; j < m_c; ++j) q_c += u[o_c+j]*u[o_c+j];
+        q[0] = g[0]*q_t; q[1] = g[1]*q_f; if (has_c) q[2] = g[2]*q_c;
+        q[env] = Y.col(t).squaredNorm();
+
+        Eigen::VectorXd sigma = Tcod.solve(q);
+        cr.vg[t] = sigma[0];
+        cr.h2[t] = (Vp[t] > 0) ? sigma[0] / Vp[t] : NA_REAL;
+        if (!spa || !have_L) continue;
+
+        // ---- plug-in null covariance ---------------------------------------
+        Eigen::VectorXd s0v = sigma.head(C);
+        for (int a = 0; a < C; ++a) if (s0v[a] < 0.0) s0v[a] = 0.0;
+        s0v[0] = 0.0;
+        double sigma_env0 = std::max(sigma[env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
+
+        const double c_t = Tinv(0,0), c_f = Tinv(0,1);
+        const double c_c = has_c ? Tinv(0,2) : 0.0, c_env = Tinv(0,env);
+        Eigen::VectorXd D0(K), DM(K);
+        for (int j = 0; j < m_t; ++j) { D0[o_t+j] = 0.0;              DM[o_t+j] = c_t * g[0]; }
+        for (int j = 0; j < m_f; ++j) { D0[o_f+j] = s0v[1] * g[1];    DM[o_f+j] = c_f * g[1]; }
+        for (int j = 0; j < m_c; ++j) { D0[o_c+j] = s0v[2] * g[2];    DM[o_c+j] = c_c * g[2]; }
+
+        Eigen::MatrixXd Pm = L.transpose() * (D0.asDiagonal() * L);
+        Eigen::MatrixXd Qm = L.transpose() * (DM.asDiagonal() * L);
+        Pm = (0.5*(Pm + Pm.transpose())).eval();
+        Qm = (0.5*(Qm + Qm.transpose())).eval();
+        Eigen::MatrixXd Smat = Pm; Smat.diagonal().array() += sigma_env0;
+        Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
+        if (lltS.info() != Eigen::Success) continue;
+        Eigen::MatrixXd Cf = lltS.matrixL();
+        Qm.diagonal().array() += c_env;
+        Eigen::MatrixXd Asym = Cf.transpose() * Qm * Cf;
+        Asym = (0.5*(Asym + Asym.transpose())).eval();
+
+        // ---- WALD SCREEN, BEFORE THE EIGENSOLVE -----------------------------
+        // The explicit eigenvalues are those of the symmetric Asym, so
+        //     Var(sigma_hat) = 2 sum lambda^2 = 2 ||Asym||_F^2
+        // exactly, in O(K^2). Computing it here (rather than after the
+        // eigensolve, as an earlier version mistakenly did) is what makes the
+        // screen worth anything: it skips the ~10 K^3 eigensolve entirely for
+        // the ~90% of chunks that are nowhere near significant.
+        double eig_rep = c_env * sigma_env0;
+        long n_rep = (long) n - K;
+        double var0 = 2.0 * Asym.squaredNorm();
+        if (n_rep > 0) var0 += (double) n_rep * 2.0 * eig_rep * eig_rep;
+        if (!(var0 > 0.0)) continue;
+        cr.se_vg[t] = std::sqrt(var0);
+        double p_wald = std::erfc(std::abs(sigma[0] / cr.se_vg[t]) / std::sqrt(2.0));
+        if (p_wald >= spa_thresh) { cr.p_spa[t] = p_wald; cr.spa_used[t] = 0; continue; }
+
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ses(Asym, Eigen::EigenvaluesOnly);
+        if (ses.info() != Eigen::Success) { cr.p_spa[t] = p_wald; continue; }
+        const Eigen::VectorXd& ev = ses.eigenvalues();
+        std::vector<double> eig(ev.data(), ev.data() + K);
+        QuadSpaResult qr = quad_spa_solve(sigma[0], eig, eig_rep, n_rep);
+        if (qr.converged) { cr.p_spa[t] = qr.p; cr.spa_used[t] = 1; }
+        else              { cr.p_spa[t] = p_wald; cr.spa_used[t] = 0; }
     }
-
-    for (size_t si = 0; si < subs.size(); ++si) {
-        const int s0 = subs[si].first, s1 = subs[si].second, m_s = s1 - s0;
-        SubResult sr;
-        sr.chr = cd.chr; sr.start = cd.bp[s0]; sr.end = cd.bp[s1 - 1];
-        sr.m_s = m_s; sr.m_rest = m_mid - m_s; sr.m_com = m_com;
-        sr.vg.assign(P, NA_REAL); sr.se_vg.assign(P, NA_REAL);
-        sr.h2.assign(P, NA_REAL); sr.p_spa.assign(P, NA_REAL);
-        sr.spa_used.assign(P, 0);
-        if (sr.m_rest <= 0) { out.push_back(sr); continue; }
-
-        // ---- traces, all by SUBTRACTION from the per-cell totals ------------
-        double tr_s = 0.0; for (int j = s0; j < s1; ++j) tr_s += cd.cj[j];
-        const double tr_rest = tr_mid - tr_s;
-        if (!(tr_s > 0.0) || !(tr_rest > 0.0)) { out.push_back(sr); continue; }
-
-        const double f_ss = G2.block(s0, s0, m_s, m_s).sum();               // tr(S_s S_s)
-        const double f_sm = G2.block(s0, 0, m_s, m_mid).sum();              // tr(S_s S_mid)
-        const double f_sr = f_sm - f_ss;                                     // tr(S_s S_rest)
-        const double f_rr = f_mm - 2.0 * f_sm + f_ss;                        // tr(S_rest S_rest)
-        const double f_sc = has_com ? G2.block(s0, m_mid, m_s, m_com).sum() : 0.0;
-        const double f_rc = has_com ? f_mc - f_sc : 0.0;
-
-        // trace-normalization constants g_a = n / tr(S_A)
-        std::vector<double> g(C);
-        g[0] = (double) n / tr_s; g[1] = (double) n / tr_rest;
-        if (has_com) g[2] = (double) n / tr_com;
-
-        // ---- moment matrix T ------------------------------------------------
-        Eigen::MatrixXd T = Eigen::MatrixXd::Zero(C + 1, C + 1);
-        T(0,0) = g[0]*g[0]*f_ss;  T(1,1) = g[1]*g[1]*f_rr;
-        T(0,1) = T(1,0) = g[0]*g[1]*f_sr;
-        if (has_com) {
-            T(2,2) = g[2]*g[2]*f_cc;
-            T(0,2) = T(2,0) = g[0]*g[2]*f_sc;
-            T(1,2) = T(2,1) = g[1]*g[2]*f_rc;
-        }
-        for (int a = 0; a < C; ++a) { T(a,env) = (double) n; T(env,a) = (double) n; }  // tr(K_a) = n
-        T(env,env) = (double) n;
-        Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
-        Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
-
-        for (int t = 0; t < P; ++t) {
-            // ---- q, also by subtraction --------------------------------------
-            double q_s = 0.0; for (int j = s0; j < s1; ++j) q_s += u[t][j] * u[t][j];
-            double q_mid = 0.0; for (int j = 0; j < m_mid; ++j) q_mid += u[t][j] * u[t][j];
-            double q_com = 0.0; for (int j = m_mid; j < K; ++j) q_com += u[t][j] * u[t][j];
-            Eigen::VectorXd q(C + 1);
-            q[0] = g[0] * q_s; q[1] = g[1] * (q_mid - q_s);
-            if (has_com) q[2] = g[2] * q_com;
-            q[env] = Y.col(t).squaredNorm();
-
-            Eigen::VectorXd sigma = Tcod.solve(q);
-            sr.vg[t] = sigma[0];
-            sr.h2[t] = (Vp[t] > 0) ? sigma[0] / Vp[t] : NA_REAL;
-
-            if (!spa || !have_L) continue;
-
-            // ---- plug-in null covariance ------------------------------------
-            Eigen::VectorXd s0v = sigma.head(C);
-            for (int a = 0; a < C; ++a) if (s0v[a] < 0.0) s0v[a] = 0.0;
-            s0v[0] = 0.0;                                  // H0: target = 0
-            double sigma_env0 = std::max(sigma[env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
-
-            // Diagonals over the SHARED column set. Component a contributes
-            // sigma_a * g_a (resp. c_a * g_a) to each of its columns, because
-            // K_a = g_a S_A = g_a V_A V_A'.
-            Eigen::VectorXd D0(K), DM(K);
-            const double c_s = Tinv(0,0), c_r = Tinv(0,1);
-            const double c_c = has_com ? Tinv(0,2) : 0.0;
-            const double c_env = Tinv(0,env);
-            for (int j = 0; j < m_mid; ++j) {
-                bool in_s = (j >= s0 && j < s1);
-                D0[j] = in_s ? 0.0            : s0v[1] * g[1];
-                DM[j] = in_s ? c_s * g[0]     : c_r    * g[1];
-            }
-            for (int j = m_mid; j < K; ++j) { D0[j] = s0v[2] * g[2]; DM[j] = c_c * g[2]; }
-
-            // ---- P and Q via the per-block products (O(K^2 m_s), not O(K^3)) --
-            Eigen::MatrixXd Ls = L.middleRows(s0, m_s);
-            Eigen::MatrixXd PL_s; PL_s.noalias() = Ls.transpose() * Ls;
-            Eigen::MatrixXd Pm = (s0v[1] * g[1]) * (PL_mid - PL_s);
-            Eigen::MatrixXd Qm = (c_r * g[1]) * (PL_mid - PL_s) + (c_s * g[0]) * PL_s;
-            if (has_com) { Pm += (s0v[2] * g[2]) * PL_com; Qm += (c_c * g[2]) * PL_com; }
-            Pm = (0.5 * (Pm + Pm.transpose())).eval();
-            Qm = (0.5 * (Qm + Qm.transpose())).eval();
-
-            Eigen::MatrixXd Smat = Pm; Smat.diagonal().array() += sigma_env0;
-            Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
-            if (lltS.info() != Eigen::Success) continue;
-            Eigen::MatrixXd Cf = lltS.matrixL();
-            Qm.diagonal().array() += c_env;
-            Eigen::MatrixXd Asym = Cf.transpose() * Qm * Cf;
-            Asym = (0.5 * (Asym + Asym.transpose())).eval();
-
-            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ses(Asym, Eigen::EigenvaluesOnly);
-            if (ses.info() != Eigen::Success) continue;
-            const Eigen::VectorXd& ev = ses.eigenvalues();
-            std::vector<double> eig(ev.data(), ev.data() + K);
-            double eig_rep = c_env * sigma_env0;
-            long n_rep = (long) n - K;
-
-            // Wald SE comes free here: Var(sigma_hat) = K''(0) = 2 sum lambda^2
-            double var0 = 0.0;
-            for (int j = 0; j < K; ++j) var0 += 2.0 * eig[j] * eig[j];
-            if (n_rep > 0) var0 += (double) n_rep * 2.0 * eig_rep * eig_rep;
-            if (var0 > 0.0) {
-                sr.se_vg[t] = std::sqrt(var0);
-                double zst = sigma[0] / sr.se_vg[t];
-                double p_wald = std::erfc(std::abs(zst) / std::sqrt(2.0));
-                // Screen: the normal approximation is anti-conservative in the
-                // upper tail, so a large Wald p implies an even larger SPA p.
-                if (p_wald >= spa_thresh) { sr.p_spa[t] = p_wald; sr.spa_used[t] = 0; continue; }
-                QuadSpaResult qr = quad_spa_solve(sigma[0], eig, eig_rep, n_rep);
-                if (qr.converged) { sr.p_spa[t] = qr.p; sr.spa_used[t] = 1; }
-                else              { sr.p_spa[t] = p_wald; sr.spa_used[t] = 0; }
-            }
-        }
-        out.push_back(sr);
-    }
-    (void) background_rank;   // reserved: low-rank background truncation
-    (void) min_sub_snps;
 }
 
 // ===========================================================================
-// Driver: stream 1 Mb cells, scan sub-windows, write a long-format table
+// Driver
 // ===========================================================================
-struct SubParams {
-    long W; int min_snps; long sub_bp; int min_sub_snps;
-    bool spa; double spa_thresh; int background_rank;
-    std::string out_file; int batch_size; int n_threads;
+struct ChunkParams {
+    int chunk_size, flank_chunks, min_chunk_snps;
+    long common_bp; int max_common_snps;
+    bool spa; double spa_thresh;
+    std::string out_file; int batch_size, n_threads;
 };
 
-static void common_chr_range(const SubContext& ctx, const std::string& chr, int& lo, int& hi) {
+static void common_chr_range(const ChunkContext& ctx, const std::string& chr, int& lo, int& hi) {
     lo = hi = -1;
     if (!ctx.use_common) return;
     for (int j = 0; j < ctx.common_n_snps; ++j)
         if (ctx.common_bim.chr[j] == chr) { if (lo == -1) lo = j; hi = j; }
 }
 
-// Read + prepare one 1 Mb cell (serial: genotype I/O and standardization).
-static bool make_cell(const SubContext& ctx, size_t ci, int cell_lo, int cell_hi,
-                      int cc_lo, int cc_hi, CellData& cd) {
-    cd = CellData();
-    cd.chr   = ctx.chr_order[ci];
-    cd.start = ctx.wes_bim.bp[cell_lo];
-    cd.end   = ctx.wes_bim.bp[cell_hi];
-    cd.i0_mid = cell_lo;
+// Keep at most `cap` columns of a Cell by taking an EVEN STRIDE through it.
+// Thinning (rather than truncating to the first `cap`) preserves coverage of
+// the whole bp window, so the background GRM still represents the region.
+static void thin_cell(Cell& c, int cap) {
+    const int m = (int) c.X.cols();
+    if (cap <= 0 || m <= cap) return;
+    const int stride = (m + cap - 1) / cap;
+    std::vector<int> keep;
+    for (int j = 0; j < m && (int) keep.size() < cap; j += stride) keep.push_back(j);
+    GenoMat Z(c.X.rows(), (int) keep.size());
+    std::vector<float> mf(keep.size());
+    for (size_t k = 0; k < keep.size(); ++k) { Z.col((int) k) = c.X.col(keep[k]); mf[k] = c.maf[keep[k]]; }
+    c.X = std::move(Z); c.maf = mf;
+}
 
-    Cell mid = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps,
-                             ctx.geno_keep, cell_lo, cell_hi + 1);
-    if (ctx.covZ.cols() > 0) project_covariates(mid.X, ctx.covZ, ctx.covM);
+// Assemble the region for one chunk: [target | flank(both sides) | common].
+static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
+                       int chr_lo, int chr_hi, int cc_lo, int cc_hi,
+                       int flank_snps, long common_bp, int max_common, ChunkData& cd) {
+    cd = ChunkData();
+    cd.chr = ctx.chr_order[ci];
+    cd.start = ctx.wes_bim.bp[a]; cd.end = ctx.wes_bim.bp[b - 1];
+    cd.i0_target = a;
+
+    const int fL0 = std::max(chr_lo, a - flank_snps), fL1 = a;
+    const int fR0 = b, fR1 = std::min(chr_hi + 1, b + flank_snps);
+
     const std::vector<float>* wp = ctx.snp_weights.empty() ? 0 : &ctx.snp_weights;
-    apply_alpha(mid.X, mid.maf, ctx.alpha, wp, cell_lo);
-    cd.m_mid = (int) mid.X.cols();
-    if (cd.m_mid <= 0) return false;
+    Cell tgt = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, a, b);
+    if (ctx.covZ.cols() > 0) project_covariates(tgt.X, ctx.covZ, ctx.covM);
+    apply_alpha(tgt.X, tgt.maf, ctx.alpha, wp, a);
+    cd.m_t = (int) tgt.X.cols();
+    if (cd.m_t <= 0) return false;
+
+    Cell fl; fl.X = GenoMat(ctx.n_inds, 0);
+    Cell fr; fr.X = GenoMat(ctx.n_inds, 0);
+    if (fL1 > fL0) { fl = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, fL0, fL1);
+                     if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
+                     apply_alpha(fl.X, fl.maf, ctx.alpha, wp, fL0); }
+    if (fR1 > fR0) { fr = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, fR0, fR1);
+                     if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
+                     apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
+    cd.m_f = (int) fl.X.cols() + (int) fr.X.cols();
+    if (cd.m_f <= 0) return false;
 
     Cell com; com.X = GenoMat(ctx.n_inds, 0);
     if (ctx.use_common) {
+        // FIXED bp window centred on the TARGET chunk -- NOT the span of the
+        // chunk+flanks. SNP spacing in exome data is wildly uneven (consecutive
+        // SNPs in this dataset can be ~800 kb apart), so the span of a fixed
+        // NUMBER of SNPs is unbounded: a region straddling a couple of
+        // intergenic gaps would drag in thousands of common SNPs and push K_tot
+        // straight back to where the bp-window designs failed. A fixed window
+        // plus a hard cap keeps K_tot predictable, which is the entire point of
+        // the chunk design.
+        long ctr = (cd.start + cd.end) / 2;
+        long half = common_bp / 2;
+        long lo_bp = (ctr > half) ? (ctr - half) : 0;
         com = read_cell(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
-                        ctx.common_bim, ctx.common_keep, cc_lo, cc_hi,
-                        cd.start, cd.end - cd.start + 1);
+                        ctx.common_bim, ctx.common_keep, cc_lo, cc_hi, lo_bp, common_bp);
+        thin_cell(com, max_common);
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
             apply_alpha(com.X, com.maf, ctx.alpha_common, 0, 0);
         }
     }
-    cd.m_com = (int) com.X.cols();
-    cd.K = cd.m_mid + cd.m_com;
+    cd.m_c = (int) com.X.cols();
+    cd.K = cd.m_t + cd.m_f + cd.m_c;
 
     cd.V = GenoMat(ctx.n_inds, cd.K);
-    cd.V.leftCols(cd.m_mid) = mid.X;
-    if (cd.m_com > 0) cd.V.rightCols(cd.m_com) = com.X;
+    cd.V.leftCols(cd.m_t) = tgt.X;
+    int off = cd.m_t;
+    if (fl.X.cols() > 0) { cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols(); }
+    if (fr.X.cols() > 0) { cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols(); }
+    if (cd.m_c > 0) cd.V.rightCols(cd.m_c) = com.X;
 
     cd.cj.resize(cd.K);
     for (int j = 0; j < cd.K; ++j) cd.cj[j] = cd.V.col(j).cast<double>().squaredNorm();
-
-    cd.bp.resize(cd.m_mid);
-    for (int j = 0; j < cd.m_mid; ++j) cd.bp[j] = ctx.wes_bim.bp[cell_lo + j];
     return true;
 }
 
-struct SubWorker : public RcppParallel::Worker {
-    const std::vector<CellData>& batch; const Eigen::MatrixXd& Y;
-    const std::vector<double>& Vp; const SubParams& pr;
-    std::vector< std::vector<SubResult> >& out;
-    SubWorker(const std::vector<CellData>& b, const Eigen::MatrixXd& Y,
-              const std::vector<double>& Vp, const SubParams& pr,
-              std::vector< std::vector<SubResult> >& out)
+struct ChunkWorker : public RcppParallel::Worker {
+    const std::vector<ChunkData>& batch; const Eigen::MatrixXd& Y;
+    const std::vector<double>& Vp; const ChunkParams& pr;
+    std::vector<ChunkResult>& out;
+    ChunkWorker(const std::vector<ChunkData>& b, const Eigen::MatrixXd& Y,
+                const std::vector<double>& Vp, const ChunkParams& pr, std::vector<ChunkResult>& out)
         : batch(b), Y(Y), Vp(Vp), pr(pr), out(out) {}
     void operator()(std::size_t begin, std::size_t end) {
         for (std::size_t w = begin; w < end; ++w)
-            scan_cell(batch[w], Y, Vp, pr.sub_bp, pr.min_sub_snps,
-                      pr.spa, pr.spa_thresh, pr.background_rank, out[w]);
+            test_chunk(batch[w], Y, Vp, pr.spa, pr.spa_thresh, out[w]);
     }
 };
 
-static Rcpp::List sub_driver(SubContext& ctx, const SubParams& pr) {
+static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     const int P = ctx.n_pheno; const Eigen::MatrixXd& Y = ctx.Y;
     Eigen::setNbThreads(1);
     if (pr.n_threads > 0) {
@@ -879,73 +813,86 @@ static Rcpp::List sub_driver(SubContext& ctx, const SubParams& pr) {
     for (int t = 0; t < P; ++t) { double m = Y.col(t).mean();
         Vp[t] = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1); }
 
-    std::ofstream fout;
-    bool tofile = !pr.out_file.empty();
+    std::ofstream fout; bool tofile = !pr.out_file.empty();
     auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
     if (tofile) {
         fout.open(pr.out_file.c_str());
         if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
-        fout << "chr\tstart\tend\tm_sub\tm_rest\tm_common\tphenotype\tvg\tse_vg\th2";
+        fout << "chr\tstart\tend\tm_chunk\tm_flank\tm_common\tphenotype\tvg\tse_vg\th2";
         if (pr.spa) fout << "\tp_spa\tspa_used";
         fout << "\n";
     }
 
-    // enumerate the 1 Mb cells exactly as the main pipeline does
-    std::vector< std::pair<size_t, std::pair<int,int> > > cells;
+    // enumerate chunks: consecutive blocks of chunk_size SNPs within a chromosome
+    struct Job { size_t ci; int a, b, chr_lo, chr_hi; };
+    std::vector<Job> jobs;
     for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
-        std::vector< std::pair<int,int> > cc =
-            build_cells(ctx.wes_bim.bp, ctx.chr_lo[ci], ctx.chr_hi[ci], pr.W, pr.min_snps);
-        for (size_t k = 0; k < cc.size(); ++k) cells.push_back(std::make_pair(ci, cc[k]));
+        int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
+        for (int a = lo; a <= hi; a += pr.chunk_size) {
+            int b = std::min(hi + 1, a + pr.chunk_size);
+            if (b - a < pr.min_chunk_snps) continue;
+            Job j; j.ci = ci; j.a = a; j.b = b; j.chr_lo = lo; j.chr_hi = hi;
+            jobs.push_back(j);
+        }
     }
-    Rcout << "1 Mb cells to scan: " << cells.size() << "\n";
+    const int flank_snps = pr.chunk_size * pr.flank_chunks;
+    Rcout << "Chunks to test: " << jobs.size()
+          << "   (chunk_size " << pr.chunk_size << ", flank " << flank_snps << " SNPs/side)\n";
+    Rcout << "  K_tot per chunk <= " << (pr.chunk_size * (1 + 2 * pr.flank_chunks) + pr.max_common_snps)
+          << "  (" << (pr.chunk_size * (1 + 2 * pr.flank_chunks)) << " WES + <= "
+          << pr.max_common_snps << " common)\n";
+    if (ctx.use_common)
+        Rcout << "  Common GRM: fixed " << pr.common_bp
+              << " bp window centred on each chunk, thinned to <= "
+              << pr.max_common_snps << " SNPs -- so K_tot is BOUNDED regardless\n"
+              << "  of how far the chunk's SNPs happen to span.\n";
 
-    long n_sub = 0; int n_cell = 0;
-    size_t idx = 0;
-    while (idx < cells.size()) {
-        std::vector<CellData> batch;
-        while ((int) batch.size() < pr.batch_size && idx < cells.size()) {
-            size_t ci = cells[idx].first;
-            int lo = cells[idx].second.first, hi = cells[idx].second.second;
-            int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[ci], cc_lo, cc_hi);
-            CellData cd;
-            if (make_cell(ctx, ci, lo, hi, cc_lo, cc_hi, cd)) batch.push_back(std::move(cd));
+    long n_done = 0; size_t idx = 0;
+    typedef std::chrono::steady_clock clk;
+    clk::time_point t0 = clk::now();
+    while (idx < jobs.size()) {
+        std::vector<ChunkData> batch;
+        while ((int) batch.size() < pr.batch_size && idx < jobs.size()) {
+            const Job& j = jobs[idx];
+            int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[j.ci], cc_lo, cc_hi);
+            ChunkData cd;
+            if (make_chunk(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
+                           flank_snps, pr.common_bp, pr.max_common_snps, cd))
+                batch.push_back(std::move(cd));
             ++idx;
         }
         if (batch.empty()) break;
-
-        std::vector< std::vector<SubResult> > res(batch.size());
-        SubWorker wk(batch, Y, Vp, pr, res);
+        std::vector<ChunkResult> res(batch.size());
+        ChunkWorker wk(batch, Y, Vp, pr, res);
         RcppParallel::parallelFor(0, batch.size(), wk);
 
         for (size_t b = 0; b < res.size(); ++b) {
-            for (size_t r = 0; r < res[b].size(); ++r) {
-                const SubResult& sr = res[b][r];
-                ++n_sub;
-                if (!tofile) continue;
-                for (int t = 0; t < P; ++t) {
-                    fout << sr.chr << '\t' << sr.start << '\t' << sr.end << '\t'
-                         << sr.m_s << '\t' << sr.m_rest << '\t' << sr.m_com << '\t'
-                         << as<std::string>(ctx.trait_names[t]) << '\t';
-                    wr(fout, sr.vg[t]);    fout << '\t';
-                    wr(fout, sr.se_vg[t]); fout << '\t';
-                    wr(fout, sr.h2[t]);
-                    if (pr.spa) { fout << '\t'; wr(fout, sr.p_spa[t]);
-                                  fout << '\t' << sr.spa_used[t]; }
-                    fout << '\n';
-                }
+            const ChunkResult& cr = res[b];
+            ++n_done;
+            if (!tofile || cr.vg.empty()) continue;
+            for (int t = 0; t < P; ++t) {
+                fout << cr.chr << '\t' << cr.start << '\t' << cr.end << '\t'
+                     << cr.m_t << '\t' << cr.m_f << '\t' << cr.m_c << '\t'
+                     << as<std::string>(ctx.trait_names[t]) << '\t';
+                wr(fout, cr.vg[t]);    fout << '\t';
+                wr(fout, cr.se_vg[t]); fout << '\t';
+                wr(fout, cr.h2[t]);
+                if (pr.spa) { fout << '\t'; wr(fout, cr.p_spa[t]); fout << '\t' << cr.spa_used[t]; }
+                fout << '\n';
             }
-            ++n_cell;
         }
         if (tofile) fout.flush();
-        Rcout << "\r[sub-window] cells " << n_cell << "/" << cells.size()
-              << "  sub-windows " << n_sub << "    " << std::flush;
+        double el = std::chrono::duration<double>(clk::now() - t0).count();
+        double eta = (n_done > 0) ? el * ((double) jobs.size() - n_done) / n_done : 0.0;
+        Rcout << "\r[chunk] " << n_done << "/" << jobs.size()
+              << "  " << (int)(100.0 * n_done / jobs.size()) << "%"
+              << "  elapsed " << (int) el << "s  eta " << (int) eta << "s     " << std::flush;
         Rcpp::checkUserInterrupt();
     }
     Rcout << "\n";
     if (tofile) fout.close();
-    Rcout << "Cells scanned: " << n_cell << "   sub-windows tested: " << n_sub << "\n";
-    return List::create(_["n_cells"] = n_cell, _["n_subwindows"] = (double) n_sub,
-                        _["trait_names"] = ctx.trait_names);
+    Rcout << "Chunks tested: " << n_done << "\n";
+    return List::create(_["n_chunks"] = (double) n_done, _["trait_names"] = ctx.trait_names);
 }
 
 }  // end anonymous namespace
@@ -954,41 +901,32 @@ static Rcpp::List sub_driver(SubContext& ctx, const SubParams& pr) {
 // Export
 // ===========================================================================
 // [[Rcpp::export]]
-Rcpp::List he_subwindow_spa(const std::string& filename,
-                            const SEXP pheno_mat,
-                            double window_size = 1e6,
-                            int min_snps = 1000,
-                            double sub_window_size = 5e3,
-                            int min_sub_snps = 2,
-                            double alpha = -1.0,
-                            double alpha_common = -1.0,
-                            Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
-                            std::string out_file = "",
-                            int batch_size = 4,
-                            int n_threads = 0,
-                            Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
-                            Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
-                            bool SPA = true,
-                            double spa_pval_threshold = 0.1,
-                            int background_rank = 0) {
-    if (window_size <= 0) stop("window_size must be positive");
-    if (sub_window_size <= 0) stop("sub_window_size must be positive");
-    if (min_snps < 1) min_snps = 1;
-    if (min_sub_snps < 1) min_sub_snps = 1;
-    SubContext ctx = setup_sub_context(filename, pheno_mat, alpha, alpha_common,
-                                       common_filename, weights, covariates);
-    Rcout << "Sub-window scan: " << (long) window_size << " bp cells, "
-          << (long) sub_window_size << " bp sub-windows (>= " << min_sub_snps << " SNPs)\n";
-    if (SPA)
-        Rcout << "  SPA on, Wald pre-screen at p < " << spa_pval_threshold << ".\n"
-              << "  Cost is driven by K_tot = (SNPs in the 1 Mb cell) + (common SNPs);\n"
-              << "  the Gram matrix and its Cholesky are built ONCE per cell and reused\n"
-              << "  by every sub-window in it.\n";
-    SubParams pr;
-    pr.W = (long) window_size; pr.min_snps = min_snps;
-    pr.sub_bp = (long) sub_window_size; pr.min_sub_snps = min_sub_snps;
+Rcpp::List he_chunk_spa(const std::string& filename,
+                        const SEXP pheno_mat,
+                        int chunk_size = 256,
+                        int flank_chunks = 1,
+                        int min_chunk_snps = 5,
+                        double alpha = -1.0,
+                        double alpha_common = -1.0,
+                        Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
+                        double common_window = 1e6,
+                        int max_common_snps = 400,
+                        std::string out_file = "",
+                        int batch_size = 16,
+                        int n_threads = 0,
+                        Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
+                        Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
+                        bool SPA = true,
+                        double spa_pval_threshold = 0.1) {
+    if (chunk_size < 1) stop("chunk_size must be >= 1");
+    if (flank_chunks < 1) stop("flank_chunks must be >= 1 (the model needs a background component)");
+    ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
+                                           common_filename, weights, covariates);
+    ChunkParams pr;
+    pr.chunk_size = chunk_size; pr.flank_chunks = flank_chunks;
+    pr.min_chunk_snps = min_chunk_snps;
+    pr.common_bp = (long) common_window; pr.max_common_snps = max_common_snps;
     pr.spa = SPA; pr.spa_thresh = spa_pval_threshold;
-    pr.background_rank = background_rank;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads;
-    return sub_driver(ctx, pr);
+    return chunk_driver(ctx, pr);
 }

@@ -49,16 +49,16 @@ he_multi_part <- function(filename, pheno_mat, block_size) {
     .Call(`_StratGWAS_he_multi_part`, filename, pheno_mat, block_size)
 }
 
-he_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, min_snps = 1000L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, nmcmc = 20L, se = TRUE, out_file = "", batch_size = 8L, n_threads = 0L, seed = 12345L, weights = NULL, covariates = NULL, coher = FALSE, collapse_mac = 0L, collapse_n = 5L, SPA = FALSE, spa_pval_threshold = 0.1, spa_max_snps = 4000L) {
-    .Call(`_StratGWAS_he_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, nmcmc, se, out_file, batch_size, n_threads, seed, weights, covariates, coher, collapse_mac, collapse_n, SPA, spa_pval_threshold, spa_max_snps)
+he_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, min_snps = 1000L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, nmcmc = 20L, se = TRUE, out_file = "", batch_size = 8L, n_threads = 0L, seed = 12345L, weights = NULL, covariates = NULL, coher = FALSE, collapse_mac = 0L, collapse_n = 5L) {
+    .Call(`_StratGWAS_he_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, nmcmc, se, out_file, batch_size, n_threads, seed, weights, covariates, coher, collapse_mac, collapse_n)
 }
 
 reml_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, window_size = 1e6, min_snps = 1000L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, max_iter = 100L, tol = 1e-4, se = TRUE, out_file = "", batch_size = 4L, n_threads = 0L, seed = 12345L, weights = NULL, covariates = NULL, collapse_mac = 0L, collapse_n = 5L) {
     .Call(`_StratGWAS_reml_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, max_iter, tol, se, out_file, batch_size, n_threads, seed, weights, covariates, collapse_mac, collapse_n)
 }
 
-he_subwindow_spa <- function(filename, pheno_mat, window_size = 1e6, min_snps = 1000L, sub_window_size = 5e3, min_sub_snps = 2L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, out_file = "", batch_size = 4L, n_threads = 0L, weights = NULL, covariates = NULL, SPA = TRUE, spa_pval_threshold = 0.1, background_rank = 0L) {
-    .Call(`_StratGWAS_he_subwindow_spa`, filename, pheno_mat, window_size, min_snps, sub_window_size, min_sub_snps, alpha, alpha_common, common_filename, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold, background_rank)
+he_chunk_spa <- function(filename, pheno_mat, chunk_size = 256L, flank_chunks = 1L, min_chunk_snps = 5L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, common_window = 1e6, max_common_snps = 400L, out_file = "", batch_size = 16L, n_threads = 0L, weights = NULL, covariates = NULL, SPA = TRUE, spa_pval_threshold = 0.1) {
+    .Call(`_StratGWAS_he_chunk_spa`, filename, pheno_mat, chunk_size, flank_chunks, min_chunk_snps, alpha, alpha_common, common_filename, common_window, max_common_snps, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold)
 }
 
 computeLDscoresFromBED <- function(file_prefix, geno_set) {

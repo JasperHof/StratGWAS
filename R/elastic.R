@@ -182,13 +182,12 @@ he_reg_spa <- function (filename, pheno, window_size = 1e6, min_snps = 1000,
   #hers <- he_multi_part_enrich(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
   #hers <- he_multi_part_enrich_alpha(filename, multi_he, snp_cat = snp_cat, cat_names = cat_names, block_size = 1000, outfile)
 
-  he_subwindow_spa(
+  he_chunk_spa(
     filename    = filename,               # PLINK prefix (WES)
     pheno_mat   = multi_he,
     window_size = window_size,
     min_snps    = min_snps,
-    sub_window_size = sub_window_size, # 5 kb
-    min_sub_snps = min_sub_snps,
+    flank_chunks = 5,
     alpha       = alpha,
     alpha_common = alpha_common,
     common_filename = common_filename,
