@@ -725,7 +725,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y,
 // ===========================================================================
 struct ChunkParams {
     int chunk_size, flank_chunks, min_chunk_snps;
-    long common_bp; int max_common_snps;
+    long common_bp; bool common_window_given; int max_common_snps;
     bool spa; double spa_thresh;
     std::string out_file; int batch_size, n_threads;
 };
@@ -735,6 +735,28 @@ static void common_chr_range(const ChunkContext& ctx, const std::string& chr, in
     if (!ctx.use_common) return;
     for (int j = 0; j < ctx.common_n_snps; ++j)
         if (ctx.common_bim.chr[j] == chr) { if (lo == -1) lo = j; hi = j; }
+}
+
+// Find the [i0, i1) index range (within chromosome index range [lo, hi] of a
+// BimInfo) of the `cap` SNPs whose bp is CLOSEST to `center`. Since bp is
+// sorted, the cap nearest points always form a contiguous run, so this is a
+// two-pointer expansion out from the insertion point -- O(log n) to locate it
+// plus O(cap) to walk outward. Used when common_window is left unspecified:
+// no bp window, no thinning, just the cap nearest common SNPs directly.
+static std::pair<int,int> nearest_snp_range(const std::vector<long>& bp, int lo, int hi,
+                                            long center, int cap) {
+    if (lo < 0 || hi < lo || cap <= 0) return std::make_pair(0, 0);
+    int ins = lower_index(bp, lo, hi, center);
+    int L = ins - 1, R = ins;
+    int i_lo = ins, i_hi = ins - 1;   // empty sentinel (i_hi < i_lo)
+    for (int k = 0; k < cap; ++k) {
+        bool haveL = (L >= lo), haveR = (R <= hi);
+        if (!haveL && !haveR) break;
+        bool takeL = haveL && (!haveR || (center - bp[L]) <= (bp[R] - center));
+        if (takeL) { i_lo = L; --L; } else { i_hi = R; ++R; }
+    }
+    if (i_hi < i_lo) return std::make_pair(0, 0);
+    return std::make_pair(i_lo, i_hi + 1);
 }
 
 // Keep at most `cap` columns of a Cell by taking an EVEN STRIDE through it.
@@ -755,7 +777,8 @@ static void thin_cell(Cell& c, int cap) {
 // Assemble the region for one chunk: [target | flank(both sides) | common].
 static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
                        int chr_lo, int chr_hi, int cc_lo, int cc_hi,
-                       int flank_snps, long common_bp, int max_common, ChunkData& cd) {
+                       int flank_snps, long common_bp, bool common_window_given,
+                       int max_common, ChunkData& cd) {
     cd = ChunkData();
     cd.chr = ctx.chr_order[ci];
     cd.start = ctx.wes_bim.bp[a]; cd.end = ctx.wes_bim.bp[b - 1];
@@ -784,20 +807,30 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
 
     Cell com; com.X = GenoMat(ctx.n_inds, 0);
     if (ctx.use_common) {
-        // FIXED bp window centred on the TARGET chunk -- NOT the span of the
-        // chunk+flanks. SNP spacing in exome data is wildly uneven (consecutive
-        // SNPs in this dataset can be ~800 kb apart), so the span of a fixed
-        // NUMBER of SNPs is unbounded: a region straddling a couple of
-        // intergenic gaps would drag in thousands of common SNPs and push K_tot
-        // straight back to where the bp-window designs failed. A fixed window
-        // plus a hard cap keeps K_tot predictable, which is the entire point of
-        // the chunk design.
         long ctr = (cd.start + cd.end) / 2;
-        long half = common_bp / 2;
-        long lo_bp = (ctr > half) ? (ctr - half) : 0;
-        com = read_cell(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
-                        ctx.common_bim, ctx.common_keep, cc_lo, cc_hi, lo_bp, common_bp);
-        thin_cell(com, max_common);
+        if (common_window_given) {
+            // FIXED bp window centred on the TARGET chunk -- NOT the span of the
+            // chunk+flanks. SNP spacing in exome data is wildly uneven (consecutive
+            // SNPs in this dataset can be ~800 kb apart), so the span of a fixed
+            // NUMBER of SNPs is unbounded: a region straddling a couple of
+            // intergenic gaps would drag in thousands of common SNPs and push K_tot
+            // straight back to where the bp-window designs failed. A fixed window
+            // plus a hard cap keeps K_tot predictable, which is the entire point of
+            // the chunk design.
+            long half = common_bp / 2;
+            long lo_bp = (ctr > half) ? (ctr - half) : 0;
+            com = read_cell(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
+                            ctx.common_bim, ctx.common_keep, cc_lo, cc_hi, lo_bp, common_bp);
+            thin_cell(com, max_common);
+        } else {
+            // No window specified: take the max_common nearest common SNPs to the
+            // chunk midpoint directly. K_tot is bounded by max_common exactly, so
+            // no thinning step is needed.
+            std::pair<int,int> rng = nearest_snp_range(ctx.common_bim.bp, cc_lo, cc_hi, ctr, max_common);
+            if (rng.second > rng.first)
+                com = read_cell_idx(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
+                                    ctx.common_keep, rng.first, rng.second);
+        }
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
             apply_alpha(com.X, com.maf, ctx.alpha_common, 0, 0);
@@ -874,11 +907,16 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     Rcout << "  K_tot per chunk <= " << (pr.chunk_size * (1 + 2 * pr.flank_chunks) + pr.max_common_snps)
           << "  (" << (pr.chunk_size * (1 + 2 * pr.flank_chunks)) << " WES + <= "
           << pr.max_common_snps << " common)\n";
-    if (ctx.use_common)
-        Rcout << "  Common GRM: fixed " << pr.common_bp
-              << " bp window centred on each chunk, thinned to <= "
-              << pr.max_common_snps << " SNPs -- so K_tot is BOUNDED regardless\n"
-              << "  of how far the chunk's SNPs happen to span.\n";
+    if (ctx.use_common) {
+        if (pr.common_window_given)
+            Rcout << "  Common GRM: fixed " << pr.common_bp
+                  << " bp window centred on each chunk, thinned to <= "
+                  << pr.max_common_snps << " SNPs -- so K_tot is BOUNDED regardless\n"
+                  << "  of how far the chunk's SNPs happen to span.\n";
+        else
+            Rcout << "  Common GRM: nearest " << pr.max_common_snps
+                  << " common SNPs to each chunk's midpoint (no bp window, no thinning).\n";
+    }
 
     long n_done = 0; size_t idx = 0;
     typedef std::chrono::steady_clock clk;
@@ -890,7 +928,7 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
             int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[j.ci], cc_lo, cc_hi);
             ChunkData cd;
             if (make_chunk(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
-                           flank_snps, pr.common_bp, pr.max_common_snps, cd))
+                           flank_snps, pr.common_bp, pr.common_window_given, pr.max_common_snps, cd))
                 batch.push_back(std::move(cd));
             ++idx;
         }
@@ -963,7 +1001,8 @@ struct ChunkResultA {
 // Assemble one chunk, partitioning the target's columns by annotation category.
 static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
                              int chr_lo, int chr_hi, int cc_lo, int cc_hi,
-                             int flank_snps, long common_bp, int max_common, ChunkDataA& cd) {
+                             int flank_snps, long common_bp, bool common_window_given,
+                             int max_common, ChunkDataA& cd) {
     cd = ChunkDataA();
     cd.chr = ctx.chr_order[ci];
     cd.start = ctx.wes_bim.bp[a]; cd.end = ctx.wes_bim.bp[b - 1];
@@ -1002,14 +1041,23 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
     int m_flank = (int) bg_cols.size() + (int) fl.X.cols() + (int) fr.X.cols();
     if (m_flank <= 0) return false;                // model needs a background component
 
-    // common GRM (fixed bp window centred on the chunk, thinned) -- as no-annot
+    // common GRM (fixed bp window centred on the chunk, thinned; or the nearest
+    // max_common SNPs directly if no window is given) -- as no-annot
     Cell com; com.X = GenoMat(ctx.n_inds, 0);
     if (ctx.use_common) {
-        long ctr = (cd.start + cd.end) / 2, half = common_bp / 2;
-        long lo_bp = (ctr > half) ? (ctr - half) : 0;
-        com = read_cell(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
-                        ctx.common_bim, ctx.common_keep, cc_lo, cc_hi, lo_bp, common_bp);
-        thin_cell(com, max_common);
+        long ctr = (cd.start + cd.end) / 2;
+        if (common_window_given) {
+            long half = common_bp / 2;
+            long lo_bp = (ctr > half) ? (ctr - half) : 0;
+            com = read_cell(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
+                            ctx.common_bim, ctx.common_keep, cc_lo, cc_hi, lo_bp, common_bp);
+            thin_cell(com, max_common);
+        } else {
+            std::pair<int,int> rng = nearest_snp_range(ctx.common_bim.bp, cc_lo, cc_hi, ctr, max_common);
+            if (rng.second > rng.first)
+                com = read_cell_idx(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
+                                    ctx.common_keep, rng.first, rng.second);
+        }
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
             apply_alpha(com.X, com.maf, ctx.alpha_common, 0, 0);
@@ -1224,7 +1272,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
             int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[j.ci], cc_lo, cc_hi);
             ChunkDataA cd;
             if (make_chunk_annot(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
-                                 flank_snps, pr.common_bp, pr.max_common_snps, cd))
+                                 flank_snps, pr.common_bp, pr.common_window_given, pr.max_common_snps, cd))
                 batch.push_back(std::move(cd));
             ++idx;
         }
@@ -1280,7 +1328,7 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         double alpha = -1.0,
                         double alpha_common = -1.0,
                         Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
-                        double common_window = 1e6,
+                        double common_window = NA_REAL,
                         int max_common_snps = 400,
                         std::string out_file = "",
                         int batch_size = 16,
@@ -1299,7 +1347,11 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     ChunkParams pr;
     pr.chunk_size = chunk_size; pr.flank_chunks = flank_chunks;
     pr.min_chunk_snps = min_chunk_snps;
-    pr.common_bp = (long) common_window; pr.max_common_snps = max_common_snps;
+    // common_window left unspecified (NA) -> take the max_common_snps nearest
+    // common SNPs to each chunk's midpoint directly, no bp window, no thinning.
+    pr.common_window_given = !ISNAN(common_window);
+    pr.common_bp = pr.common_window_given ? (long) common_window : 0;
+    pr.max_common_snps = max_common_snps;
     pr.spa = SPA; pr.spa_thresh = spa_pval_threshold;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads;
     // Annotation supplied -> per-category SPA path. There the flank/background

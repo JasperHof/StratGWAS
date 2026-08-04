@@ -156,7 +156,7 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
 he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
                         min_chunk_snps = 5, alpha = -1, alpha_common = -1,
                         common_filename = NULL,
-                        common_window = 1e6, max_common_snps = 400,
+                        common_window = NA, max_common_snps = 256,
                         outfile, batch_size = 4, n_threads = 1,
                         covariates = NULL, SPA = T, spa_pval_threshold = 0.1,
                         annotation = NULL, annot_names = NULL) {
