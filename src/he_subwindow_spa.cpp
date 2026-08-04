@@ -280,6 +280,11 @@ struct ChunkContext {
     double alpha, alpha_common;
     std::vector<float> snp_weights;
     GenoMat covZ, covM;
+    // Optional annotation: col 1 = flank flag, cols 2+ = middle categories.
+    // snp_cat[j] = 0..n_annot_cat-1 (a tested category) or -1 (flank/background).
+    bool use_annot; int n_annot_cat;
+    std::vector<std::string> annot_names;
+    std::vector<int> snp_cat;
 };
 
 static void project_covariates(GenoMat& X, const GenoMat& Z, const GenoMat& M) {
@@ -297,8 +302,11 @@ static ChunkContext setup_chunk_context(const std::string& filename, const SEXP 
                                     double alpha, double alpha_common,
                                     Rcpp::Nullable<Rcpp::String> common_filename,
                                     Rcpp::Nullable<Rcpp::NumericVector> weights,
-                                    Rcpp::Nullable<Rcpp::NumericMatrix> covariates) {
+                                    Rcpp::Nullable<Rcpp::NumericMatrix> covariates,
+                                    Rcpp::Nullable<Rcpp::IntegerMatrix> annotation,
+                                    Rcpp::Nullable<Rcpp::CharacterVector> annot_names) {
     ChunkContext ctx;
+    ctx.use_annot = false; ctx.n_annot_cat = 0;
     ctx.wes_prefix = filename;
     ctx.wes_n_snps = count_lines(filename + ".bim");
     List fam = read_fam_file(filename);
@@ -319,6 +327,31 @@ static ChunkContext setup_chunk_context(const std::string& filename, const SEXP 
             ctx.snp_weights[j] = (float) w;
         }
         Rcout << "Using per-SNP LD weights\n";
+    }
+
+    // Annotation: col 0 = flank flag, cols 1.. = middle functional categories.
+    if (annotation.isNotNull()) {
+        Rcpp::IntegerMatrix am(annotation.get());
+        if (am.nrow() != ctx.wes_n_snps)
+            stop("annotation must have one row per SNP in the WES .bim file");
+        int ncol = am.ncol();
+        if (ncol < 2) stop("annotation needs >= 2 columns: col 1 = flank flag, cols 2+ = middle categories");
+        ctx.n_annot_cat = ncol - 1;
+        ctx.snp_cat.assign(ctx.wes_n_snps, -1);
+        for (int j = 0; j < ctx.wes_n_snps; ++j) {
+            if (am(j, 0) == 1) { ctx.snp_cat[j] = -1; continue; }   // flank -> background
+            for (int c = 1; c < ncol; ++c) if (am(j, c) == 1) { ctx.snp_cat[j] = c - 1; break; }
+        }
+        if (annot_names.isNotNull()) {
+            Rcpp::CharacterVector nm(annot_names.get());
+            if (nm.size() != ctx.n_annot_cat) stop("annot_names length must equal the number of category columns");
+            for (int c = 0; c < ctx.n_annot_cat; ++c) ctx.annot_names.push_back(as<std::string>(nm[c]));
+        } else {
+            for (int c = 0; c < ctx.n_annot_cat; ++c) ctx.annot_names.push_back("cat" + std::to_string(c + 1));
+        }
+        ctx.use_annot = true;
+        Rcout << "Annotation: " << ctx.n_annot_cat
+              << " middle categories (+ flank column); an SPA p-value is reported per category\n";
     }
 
     Rcpp::NumericMatrix pheno; CharacterVector pheno_ids;
@@ -895,6 +928,344 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     return List::create(_["n_chunks"] = (double) n_done, _["trait_names"] = ctx.trait_names);
 }
 
+// ===========================================================================
+// ANNOTATION PATH (only used when an annotation matrix is supplied).
+//
+// Instead of one target = the whole chunk, the chunk's middle SNPs are split
+// by the annotation into functional CATEGORIES (annotation cols 2+). Column 1
+// of the annotation flags flank/background SNPs. The model per chunk is:
+//   { cat_0, cat_1, ..., cat_{A-1}  (each SPA-tested),
+//     flank (neighbour chunks + any middle SNP flagged flank or uncategorized),
+//     [common], sigma_e I }
+// and one SPA p-value is produced per category. The category matrices are laid
+// out as contiguous leading blocks of V so each is a single component, exactly
+// as the single target block was. Everything else (trace normalization, the
+// Wald pre-screen, the saddlepoint) is identical to test_chunk, just looped
+// over the categories.
+// ===========================================================================
+struct ChunkDataA {
+    std::string chr; long start, end;
+    std::vector<int> cat_m;            // columns per tested category (V leading blocks)
+    std::vector<std::string> cat_name;
+    int m_flank, m_common, K;
+    GenoMat V;                         // [cat_0 | ... | cat_{A-1} | flank | common]
+    std::vector<double> cj;
+};
+struct ChunkResultA {
+    std::string chr; long start, end;
+    int m_flank, m_common;
+    std::vector<std::string> cat_name;
+    std::vector<int> cat_m;
+    std::vector< std::vector<double> > vg, se_vg, h2, p_spa;   // [cat][trait]
+    std::vector< std::vector<int> > spa_used;                   // [cat][trait]
+};
+
+// Assemble one chunk, partitioning the target's columns by annotation category.
+static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
+                             int chr_lo, int chr_hi, int cc_lo, int cc_hi,
+                             int flank_snps, long common_bp, int max_common, ChunkDataA& cd) {
+    cd = ChunkDataA();
+    cd.chr = ctx.chr_order[ci];
+    cd.start = ctx.wes_bim.bp[a]; cd.end = ctx.wes_bim.bp[b - 1];
+    const std::vector<float>* wp = ctx.snp_weights.empty() ? 0 : &ctx.snp_weights;
+
+    Cell tgt = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, a, b);
+    if (ctx.covZ.cols() > 0) project_covariates(tgt.X, ctx.covZ, ctx.covM);
+    apply_alpha(tgt.X, tgt.maf, ctx.alpha, wp, a);
+    int m_t = (int) tgt.X.cols();
+    if (m_t <= 0) return false;
+
+    // partition the chunk's columns by category id (-1 = background -> flank)
+    int A = ctx.n_annot_cat;
+    std::vector< std::vector<int> > cat_cols(A);
+    std::vector<int> bg_cols;
+    for (int j = 0; j < m_t; ++j) {
+        int cid = (a + j >= 0 && a + j < (int) ctx.snp_cat.size()) ? ctx.snp_cat[a + j] : -1;
+        if (cid >= 0 && cid < A) cat_cols[cid].push_back(j);
+        else bg_cols.push_back(j);
+    }
+    std::vector<int> act;
+    for (int c = 0; c < A; ++c) if (!cat_cols[c].empty()) act.push_back(c);
+    if (act.empty()) return false;                 // no category SNPs in this chunk to test
+
+    // neighbouring flank chunks (same as the no-annotation path)
+    const int fL0 = std::max(chr_lo, a - flank_snps), fL1 = a;
+    const int fR0 = b, fR1 = std::min(chr_hi + 1, b + flank_snps);
+    Cell fl; fl.X = GenoMat(ctx.n_inds, 0);
+    Cell fr; fr.X = GenoMat(ctx.n_inds, 0);
+    if (fL1 > fL0) { fl = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, fL0, fL1);
+                     if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
+                     apply_alpha(fl.X, fl.maf, ctx.alpha, wp, fL0); }
+    if (fR1 > fR0) { fr = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, fR0, fR1);
+                     if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
+                     apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
+    int m_flank = (int) bg_cols.size() + (int) fl.X.cols() + (int) fr.X.cols();
+    if (m_flank <= 0) return false;                // model needs a background component
+
+    // common GRM (fixed bp window centred on the chunk, thinned) -- as no-annot
+    Cell com; com.X = GenoMat(ctx.n_inds, 0);
+    if (ctx.use_common) {
+        long ctr = (cd.start + cd.end) / 2, half = common_bp / 2;
+        long lo_bp = (ctr > half) ? (ctr - half) : 0;
+        com = read_cell(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
+                        ctx.common_bim, ctx.common_keep, cc_lo, cc_hi, lo_bp, common_bp);
+        thin_cell(com, max_common);
+        if (com.X.cols() > 0) {
+            if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
+            apply_alpha(com.X, com.maf, ctx.alpha_common, 0, 0);
+        }
+    }
+    int m_c = (int) com.X.cols();
+
+    int Kt = 0; for (size_t k = 0; k < act.size(); ++k) Kt += (int) cat_cols[act[k]].size();
+    cd.K = Kt + m_flank + m_c;
+    cd.V = GenoMat(ctx.n_inds, cd.K);
+    int off = 0;
+    for (size_t k = 0; k < act.size(); ++k) {
+        int c = act[k]; const std::vector<int>& cc = cat_cols[c];
+        for (size_t q = 0; q < cc.size(); ++q) cd.V.col(off + (int) q) = tgt.X.col(cc[q]);
+        off += (int) cc.size();
+        cd.cat_m.push_back((int) cc.size());
+        cd.cat_name.push_back(ctx.annot_names[c]);
+    }
+    for (size_t q = 0; q < bg_cols.size(); ++q) cd.V.col(off++) = tgt.X.col(bg_cols[q]);
+    if (fl.X.cols() > 0) { cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols(); }
+    if (fr.X.cols() > 0) { cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols(); }
+    if (m_c > 0) cd.V.rightCols(m_c) = com.X;
+    cd.m_flank = m_flank; cd.m_common = m_c;
+    cd.cj.resize(cd.K);
+    for (int j = 0; j < cd.K; ++j) cd.cj[j] = cd.V.col(j).cast<double>().squaredNorm();
+    return true;
+}
+
+// Multi-category SPA test. Components: 0..A-1 categories (tested), A flank,
+// A+1 common (if any), env residual. Mirrors test_chunk but loops the SPA over
+// the A categories, reusing the single per-chunk Cholesky.
+static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y,
+                             const std::vector<double>& Vp, bool spa, double spa_thresh,
+                             ChunkResultA& cr) {
+    const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
+    const int A = (int) cd.cat_m.size();
+    const bool has_c = (cd.m_common > 0);
+    const int C = A + 1 + (has_c ? 1 : 0), env = C;   // +1 flank, +1 common
+
+    cr.chr = cd.chr; cr.start = cd.start; cr.end = cd.end;
+    cr.m_flank = cd.m_flank; cr.m_common = cd.m_common;
+    cr.cat_name = cd.cat_name; cr.cat_m = cd.cat_m;
+    cr.vg.assign(A, std::vector<double>(P, NA_REAL));
+    cr.se_vg.assign(A, std::vector<double>(P, NA_REAL));
+    cr.h2.assign(A, std::vector<double>(P, NA_REAL));
+    cr.p_spa.assign(A, std::vector<double>(P, NA_REAL));
+    cr.spa_used.assign(A, std::vector<int>(P, 0));
+    if (A <= 0 || cd.m_flank <= 0) return;
+
+    // component column offsets in V: cats, then flank, then common
+    std::vector<int> off(C + 1, 0);
+    for (int c = 0; c < A; ++c) off[c + 1] = off[c] + cd.cat_m[c];
+    off[A + 1] = off[A] + cd.m_flank;
+    if (has_c) off[A + 2] = off[A + 1] + cd.m_common;
+
+    GenoMat Gf = GenoMat::Zero(K, K);
+    Gf.selfadjointView<Eigen::Upper>().rankUpdate(cd.V.transpose());
+    Eigen::MatrixXd G = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
+    Eigen::MatrixXd G2 = G.array().square();
+
+    std::vector<double> tr(C, 0.0), g(C, 0.0);
+    for (int c = 0; c < C; ++c) {
+        for (int j = off[c]; j < off[c + 1]; ++j) tr[c] += cd.cj[j];
+        if (!(tr[c] > 0.0)) return;
+        g[c] = (double) n / tr[c];
+    }
+
+    Eigen::MatrixXd T = Eigen::MatrixXd::Zero(C + 1, C + 1);
+    for (int a = 0; a < C; ++a)
+        for (int b = a; b < C; ++b) {
+            double v = g[a] * g[b] * G2.block(off[a], off[b], off[a+1]-off[a], off[b+1]-off[b]).sum();
+            T(a, b) = v; T(b, a) = v;
+        }
+    for (int a = 0; a < C; ++a) { T(a, env) = (double) n; T(env, a) = (double) n; }
+    T(env, env) = (double) n;
+    Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
+    Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
+
+    Eigen::MatrixXd L; bool have_L = false;
+    if (spa) {
+        double gscale = G.trace() / K;
+        Eigen::MatrixXd Gj = G; double applied = 0.0;
+        for (double r = 1e-4; r <= 1e-1; r *= 10.0) {
+            Gj.diagonal().array() += (r - applied) * gscale; applied = r;
+            Eigen::LLT<Eigen::MatrixXd> llt(Gj);
+            if (llt.info() == Eigen::Success) { L = llt.matrixL(); have_L = true; break; }
+        }
+    }
+
+    for (int t = 0; t < P; ++t) {
+        Eigen::VectorXd u = (cd.V.transpose() * Y.col(t).cast<float>()).cast<double>();
+        Eigen::VectorXd q(C + 1);
+        for (int c = 0; c < C; ++c) {
+            double qc = 0.0; for (int j = off[c]; j < off[c + 1]; ++j) qc += u[j] * u[j];
+            q[c] = g[c] * qc;
+        }
+        q[env] = Y.col(t).squaredNorm();
+        Eigen::VectorXd sigma = Tcod.solve(q);
+
+        for (int c = 0; c < A; ++c) {
+            cr.vg[c][t] = sigma[c];
+            cr.h2[c][t] = (Vp[t] > 0) ? sigma[c] / Vp[t] : NA_REAL;
+        }
+        if (!spa || !have_L) continue;
+
+        double sigma_env0 = std::max(sigma[env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
+        Eigen::VectorXd s0base = sigma.head(C);
+        for (int a = 0; a < C; ++a) if (s0base[a] < 0.0) s0base[a] = 0.0;
+
+        // ---- SPA-test each category component c ----
+        for (int c = 0; c < A; ++c) {
+            Eigen::VectorXd s0v = s0base; s0v[c] = 0.0;   // null the tested category
+            Eigen::VectorXd D0(K), DM(K);
+            const double c_env = Tinv(c, env);
+            for (int a = 0; a < C; ++a) {
+                double d0 = (a == c) ? 0.0 : s0v[a] * g[a];
+                double dm = Tinv(c, a) * g[a];
+                for (int j = off[a]; j < off[a + 1]; ++j) { D0[j] = d0; DM[j] = dm; }
+            }
+            Eigen::MatrixXd Pm = L.transpose() * (D0.asDiagonal() * L);
+            Eigen::MatrixXd Qm = L.transpose() * (DM.asDiagonal() * L);
+            Pm = (0.5 * (Pm + Pm.transpose())).eval();
+            Qm = (0.5 * (Qm + Qm.transpose())).eval();
+            Eigen::MatrixXd Smat = Pm; Smat.diagonal().array() += sigma_env0;
+            Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
+            if (lltS.info() != Eigen::Success) continue;
+            Eigen::MatrixXd Cf = lltS.matrixL();
+            Qm.diagonal().array() += c_env;
+            Eigen::MatrixXd Asym = Cf.transpose() * Qm * Cf;
+            Asym = (0.5 * (Asym + Asym.transpose())).eval();
+
+            double eig_rep = c_env * sigma_env0;
+            long n_rep = (long) n - K;
+            double var0 = 2.0 * Asym.squaredNorm();
+            if (n_rep > 0) var0 += (double) n_rep * 2.0 * eig_rep * eig_rep;
+            if (!(var0 > 0.0)) continue;
+            cr.se_vg[c][t] = std::sqrt(var0);
+            double p_wald = std::erfc(std::abs(sigma[c] / cr.se_vg[c][t]) / std::sqrt(2.0));
+            if (p_wald >= spa_thresh) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
+
+            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ses(Asym, Eigen::EigenvaluesOnly);
+            if (ses.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; continue; }
+            const Eigen::VectorXd& ev = ses.eigenvalues();
+            std::vector<double> eig(ev.data(), ev.data() + K);
+            QuadSpaResult qr = quad_spa_solve(sigma[c], eig, eig_rep, n_rep);
+            if (qr.converged) { cr.p_spa[c][t] = qr.p; cr.spa_used[c][t] = 1; }
+            else              { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; }
+        }
+    }
+}
+
+struct ChunkWorkerA : public RcppParallel::Worker {
+    const std::vector<ChunkDataA>& batch; const Eigen::MatrixXd& Y;
+    const std::vector<double>& Vp; const ChunkParams& pr;
+    std::vector<ChunkResultA>& out;
+    ChunkWorkerA(const std::vector<ChunkDataA>& b, const Eigen::MatrixXd& Y,
+                 const std::vector<double>& Vp, const ChunkParams& pr, std::vector<ChunkResultA>& out)
+        : batch(b), Y(Y), Vp(Vp), pr(pr), out(out) {}
+    void operator()(std::size_t begin, std::size_t end) {
+        for (std::size_t w = begin; w < end; ++w)
+            test_chunk_annot(batch[w], Y, Vp, pr.spa, pr.spa_thresh, out[w]);
+    }
+};
+
+static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
+    const int P = ctx.n_pheno; const Eigen::MatrixXd& Y = ctx.Y;
+    Eigen::setNbThreads(1);
+    if (pr.n_threads > 0) {
+        std::string nt = std::to_string(pr.n_threads);
+#ifdef _WIN32
+        _putenv_s("RCPP_PARALLEL_NUM_THREADS", nt.c_str());
+#else
+        setenv("RCPP_PARALLEL_NUM_THREADS", nt.c_str(), 1);
+#endif
+    }
+    std::vector<double> Vp(P);
+    for (int t = 0; t < P; ++t) { double m = Y.col(t).mean();
+        Vp[t] = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1); }
+
+    std::ofstream fout; bool tofile = !pr.out_file.empty();
+    auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
+    if (tofile) {
+        fout.open(pr.out_file.c_str());
+        if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
+        fout << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tm_common\tphenotype\tvg\tse_vg\th2";
+        if (pr.spa) fout << "\tp_spa\tspa_used";
+        fout << "\n";
+    }
+
+    struct Job { size_t ci; int a, b, chr_lo, chr_hi; };
+    std::vector<Job> jobs;
+    for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
+        int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
+        for (int a = lo; a <= hi; a += pr.chunk_size) {
+            int b = std::min(hi + 1, a + pr.chunk_size);
+            if (b - a < pr.min_chunk_snps) continue;
+            Job j; j.ci = ci; j.a = a; j.b = b; j.chr_lo = lo; j.chr_hi = hi;
+            jobs.push_back(j);
+        }
+    }
+    const int flank_snps = pr.chunk_size * pr.flank_chunks;
+    Rcout << "Chunks to test: " << jobs.size() << "   (chunk_size " << pr.chunk_size
+          << ", flank " << flank_snps << " SNPs/side, " << ctx.n_annot_cat << " categories)\n";
+
+    long n_done = 0; size_t idx = 0;
+    typedef std::chrono::steady_clock clk;
+    clk::time_point t0 = clk::now();
+    while (idx < jobs.size()) {
+        std::vector<ChunkDataA> batch;
+        while ((int) batch.size() < pr.batch_size && idx < jobs.size()) {
+            const Job& j = jobs[idx];
+            int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[j.ci], cc_lo, cc_hi);
+            ChunkDataA cd;
+            if (make_chunk_annot(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
+                                 flank_snps, pr.common_bp, pr.max_common_snps, cd))
+                batch.push_back(std::move(cd));
+            ++idx;
+        }
+        if (batch.empty()) break;
+        std::vector<ChunkResultA> res(batch.size());
+        ChunkWorkerA wk(batch, Y, Vp, pr, res);
+        RcppParallel::parallelFor(0, batch.size(), wk);
+
+        for (size_t bb = 0; bb < res.size(); ++bb) {
+            const ChunkResultA& cr = res[bb];
+            ++n_done;
+            if (!tofile || cr.cat_name.empty()) continue;
+            int A = (int) cr.cat_name.size();
+            for (int c = 0; c < A; ++c)
+                for (int t = 0; t < P; ++t) {
+                    fout << cr.chr << '\t' << cr.start << '\t' << cr.end << '\t'
+                         << cr.cat_name[c] << '\t' << cr.cat_m[c] << '\t'
+                         << cr.m_flank << '\t' << cr.m_common << '\t'
+                         << as<std::string>(ctx.trait_names[t]) << '\t';
+                    wr(fout, cr.vg[c][t]);    fout << '\t';
+                    wr(fout, cr.se_vg[c][t]); fout << '\t';
+                    wr(fout, cr.h2[c][t]);
+                    if (pr.spa) { fout << '\t'; wr(fout, cr.p_spa[c][t]); fout << '\t' << cr.spa_used[c][t]; }
+                    fout << '\n';
+                }
+        }
+        if (tofile) fout.flush();
+        double el = std::chrono::duration<double>(clk::now() - t0).count();
+        double eta = (n_done > 0) ? el * ((double) jobs.size() - n_done) / n_done : 0.0;
+        Rcout << "\r[chunk-annot] " << n_done << "/" << jobs.size()
+              << "  " << (int)(100.0 * n_done / jobs.size()) << "%"
+              << "  elapsed " << (int) el << "s  eta " << (int) eta << "s     " << std::flush;
+        Rcpp::checkUserInterrupt();
+    }
+    Rcout << "\n";
+    if (tofile) fout.close();
+    Rcout << "Chunks tested: " << n_done << "\n";
+    return List::create(_["n_chunks"] = (double) n_done, _["trait_names"] = ctx.trait_names,
+                        _["categories"] = wrap(ctx.annot_names));
+}
+
 }  // end anonymous namespace
 
 // ===========================================================================
@@ -917,16 +1288,26 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
                         Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                         bool SPA = true,
-                        double spa_pval_threshold = 0.1) {
+                        double spa_pval_threshold = 0.1,
+                        Rcpp::Nullable<Rcpp::IntegerMatrix> annotation = R_NilValue,
+                        Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
-    if (flank_chunks < 1) stop("flank_chunks must be >= 1 (the model needs a background component)");
+    if (flank_chunks < 0) stop("flank_chunks must be >= 0");
     ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
-                                           common_filename, weights, covariates);
+                                           common_filename, weights, covariates,
+                                           annotation, annot_names);
     ChunkParams pr;
     pr.chunk_size = chunk_size; pr.flank_chunks = flank_chunks;
     pr.min_chunk_snps = min_chunk_snps;
     pr.common_bp = (long) common_window; pr.max_common_snps = max_common_snps;
     pr.spa = SPA; pr.spa_thresh = spa_pval_threshold;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads;
+    // Annotation supplied -> per-category SPA path. There the flank/background
+    // comes from the annotation (column 1 + uncategorized middle SNPs), so
+    // flank_chunks = 0 is allowed (no neighbouring-chunk flank is read).
+    if (ctx.use_annot) return chunk_driver_annot(ctx, pr);
+    // No annotation: the neighbouring chunks are the ONLY background, so at
+    // least one flank chunk is required.
+    if (flank_chunks < 1) stop("flank_chunks must be >= 1 when no annotation is given (the model needs a background component)");
     return chunk_driver(ctx, pr);
 }
