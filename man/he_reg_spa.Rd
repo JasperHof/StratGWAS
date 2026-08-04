@@ -16,7 +16,7 @@ he_reg_spa(
   common_window = 1e+06,
   max_common_snps = 400,
   outfile,
-  batch_size = 16,
+  batch_size = 4,
   n_threads = 1,
   covariates = NULL,
   SPA = T,
