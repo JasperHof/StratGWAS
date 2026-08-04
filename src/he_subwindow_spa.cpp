@@ -17,6 +17,8 @@
 #include <random>
 #include <cmath>
 #include <utility>
+#include <cstdint>
+#include <map>
 
 using namespace Rcpp;
 
@@ -97,6 +99,130 @@ static int lower_index(const std::vector<long>& bp, int lo, int hi, long value) 
     return (int)(it - b);
 }
 
+// ===========================================================================
+// THREAD-SAFE .bed READER
+//
+// The previous design read genotypes through readBedBlock(), which returns an
+// Rcpp IntegerMatrix. That has two costs, and the second one is what forced the
+// whole assembly stage to be single-threaded:
+//   * an n_total x m block of int is allocated and filled (467 MB per chunk at
+//     n = 1e5, m = 1168) and then gathered into float through a strided index,
+//     so every genotype is written twice and read three times; and
+//   * it touches R's heap, which is NOT thread-safe, so make_chunk() could only
+//     ever run on the main thread while every worker sat idle.
+//
+// This reader decodes the 2-bit PLINK representation straight into the
+// destination float matrix, for the kept individuals only, using a private
+// ifstream per call. No R API, no intermediate, no gather -> assembly can move
+// into the parallel workers.
+//
+// DECODE TABLE. Rather than hard-code a genotype convention (which differs
+// between readers, and a silent mismatch would flip alleles), the 4-entry table
+// is CALIBRATED at start-up against readBedBlock() itself and then VERIFIED on
+// random blocks elsewhere in the file. If they disagree the run stops. So this
+// reader reproduces the old one bit-for-bit by construction.
+// ===========================================================================
+struct BedReader {
+    std::string path;
+    int  n_total;
+    int  n_snps;
+    long bytes_per_snp;
+    float code2val[4];
+    bool ready;
+    BedReader() : n_total(0), n_snps(0), bytes_per_snp(0), ready(false) {
+        // PLINK-1 defaults; overwritten by calibrate() before any real use.
+        code2val[0] = 0.f; code2val[1] = -1.f; code2val[2] = 1.f; code2val[3] = 2.f;
+    }
+    void init(const std::string& prefix, int ntot, int nsnp) {
+        path = prefix + ".bed"; n_total = ntot; n_snps = nsnp;
+        bytes_per_snp = ((long) ntot + 3) / 4; ready = true;
+    }
+    // Raw (undecoded-to-float) read of SNPs [i0,i1) for individuals `keep`.
+    // Returns false on any I/O problem -- callers must NOT stop() from a worker
+    // thread, so failure is propagated as a skipped chunk instead.
+    bool read_raw(const std::vector<int>& keep, int i0, int i1, GenoMat& X) const {
+        const int m = i1 - i0, nk = (int) keep.size();
+        X.resize(nk, m > 0 ? m : 0);
+        if (m <= 0) return true;
+        if (!ready || i0 < 0 || i1 > n_snps) return false;
+        std::ifstream in(path.c_str(), std::ios::binary);
+        if (!in.is_open()) return false;
+        std::vector<unsigned char> buf((size_t) m * (size_t) bytes_per_snp);
+        in.seekg((std::streamoff) 3 + (std::streamoff) i0 * bytes_per_snp, std::ios::beg);
+        in.read((char*) buf.data(), (std::streamsize) buf.size());
+        if (in.gcount() != (std::streamsize) buf.size()) return false;
+        for (int j = 0; j < m; ++j) {
+            const unsigned char* row = buf.data() + (size_t) j * (size_t) bytes_per_snp;
+            float* col = X.data() + (size_t) j * (size_t) nk;   // Eigen is column-major
+            for (int i = 0; i < nk; ++i) {
+                const int gi = keep[i];
+                col[i] = code2val[(row[gi >> 2] >> ((gi & 3) << 1)) & 3];
+            }
+        }
+        return true;
+    }
+};
+
+// Learn the 4-entry decode table from readBedBlock(), then verify it on blocks
+// scattered through the file. Main thread only (calls the R API).
+static void calibrate_bed_reader(BedReader& br, const std::string& prefix,
+                                 int n_total, int n_snps, const char* label) {
+    br.init(prefix, n_total, n_snps);
+    if (n_snps <= 0 || n_total <= 0) return;
+    const int probe = std::min(n_snps, 64);
+    std::vector<int> all(n_total);
+    for (int i = 0; i < n_total; ++i) all[i] = i;
+
+    // ---- calibrate on the first `probe` SNPs -------------------------------
+    IntegerMatrix ref = readBedBlock(prefix + ".bed", n_total, n_snps, 0, n_total - 1, 0, probe - 1);
+    std::ifstream in((prefix + ".bed").c_str(), std::ios::binary);
+    if (!in.is_open()) stop("Could not open .bed file: " + prefix + ".bed");
+    std::vector<unsigned char> buf((size_t) probe * (size_t) br.bytes_per_snp);
+    in.seekg(3, std::ios::beg);
+    in.read((char*) buf.data(), (std::streamsize) buf.size());
+    if (in.gcount() != (std::streamsize) buf.size())
+        stop("Short read while calibrating the .bed reader for " + prefix);
+
+    bool seen[4] = {false,false,false,false};
+    float val[4]  = {0.f,0.f,0.f,0.f};
+    for (int j = 0; j < probe; ++j) {
+        const unsigned char* row = buf.data() + (size_t) j * (size_t) br.bytes_per_snp;
+        for (int i = 0; i < n_total; ++i) {
+            int code = (row[i >> 2] >> ((i & 3) << 1)) & 3;
+            float v  = (float) ref(i, j);
+            if (!seen[code]) { seen[code] = true; val[code] = v; }
+            else if (val[code] != v)
+                stop("The .bed 2-bit code " + std::to_string(code) +
+                     " maps to two different values in " + prefix +
+                     " -- readBedBlock() is not a pure per-genotype decode, so the fast "
+                     "reader cannot replace it. Please share readBedBlock.h.");
+        }
+    }
+    for (int c = 0; c < 4; ++c) if (seen[c]) br.code2val[c] = val[c];
+
+    // ---- verify on blocks elsewhere in the file ----------------------------
+    int checks = 0;
+    for (int rep = 1; rep <= 3 && n_snps > probe; ++rep) {
+        long s = (long) n_snps * rep / 4;
+        int i0 = (int) std::min<long>(s, (long) n_snps - probe);
+        if (i0 <= 0) continue;
+        IntegerMatrix r2 = readBedBlock(prefix + ".bed", n_total, n_snps, 0, n_total - 1, i0, i0 + probe - 1);
+        GenoMat X;
+        if (!br.read_raw(all, i0, i0 + probe, X))
+            stop("Fast .bed reader failed a verification read on " + prefix);
+        for (int j = 0; j < probe; ++j)
+            for (int i = 0; i < n_total; ++i)
+                if (X(i, j) != (float) r2(i, j))
+                    stop("Fast .bed reader disagrees with readBedBlock() on " + prefix +
+                         " -- refusing to run. Please share readBedBlock.h.");
+        ++checks;
+    }
+    Rcout << "Fast .bed reader calibrated for " << label
+          << " (codes 0/1/2/3 -> " << br.code2val[0] << "/" << br.code2val[1]
+          << "/" << br.code2val[2] << "/" << br.code2val[3]
+          << "; verified on " << checks << " extra blocks)\n";
+}
+
 // A read + standardized genotype cell: the standardized columns PLUS the per-
 // column MAF (needed for alpha weighting) and the .bim index of its first SNP
 // (needed to look up categories for the middle window).
@@ -130,26 +256,24 @@ static void standardize_capture_maf(GenoMat& X, std::vector<float>& maf) {
 
 // Read a WES cell by SNP-INDEX range [i0, i1) (a cell is defined by SNP indices,
 // not a bp grid, now that cells have variable width -- see build_cells).
-static Cell read_cell_idx(const std::string& prefix, int n_total, int n_snps,
-                          const std::vector<int>& keep, int i0, int i1,
+// Thread-safe: returns false on I/O failure rather than calling stop().
+static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
+                          int i0, int i1, Cell& cell,
                           const std::vector<int>* cat_id = 0,
                           int collapse_mac = 0, int collapse_n = 5) {
-    Cell cell; cell.i0 = -1;
+    cell = Cell(); cell.i0 = -1;
     int m = i1 - i0;
-    if (m <= 0) { cell.X = GenoMat(keep.size(), 0); return cell; }
     int n_keep = (int) keep.size();
-    IntegerMatrix block = readBedBlock(prefix + ".bed", n_total, n_snps, 0, n_total - 1, i0, i1 - 1);
+    if (m <= 0) { cell.X = GenoMat(n_keep, 0); return true; }
+    GenoMat block;                                  // n_keep x m, RAW codes
+    if (!br.read_raw(keep, i0, i1, block)) return false;
 
     // -------- no collapsing: original path (columns map 1:1 to the .bim) --------
     if (!(collapse_mac > 0 && cat_id != 0 && collapse_n >= 1)) {
-        GenoMat X(n_keep, m);
-        for (int i = 0; i < n_keep; ++i)
-            for (int j = 0; j < m; ++j)
-                X(i, j) = (float) block(keep[i], j);
-        standardize_capture_maf(X, cell.maf);
-        cell.X = std::move(X);
+        standardize_capture_maf(block, cell.maf);   // standardize in place
+        cell.X = std::move(block);
         cell.i0 = i0;
-        return cell;
+        return true;
     }
 
     // -------- collapsing: variants with MAC < collapse_mac are grouped in runs --
@@ -171,7 +295,7 @@ static Cell read_cell_idx(const std::string& prefix, int n_total, int n_snps,
         // fold to minor-allele dosage and compute MAC (missing excluded from MAC,
         // treated as 0 dosage for the burden)
         double s = 0.0; int nv = 0;
-        for (int i = 0; i < n_keep; ++i) { int g = block(keep[i], j); if (g >= 0) { s += g; ++nv; } }
+        for (int i = 0; i < n_keep; ++i) { float g = block(i, j); if (g >= 0.f) { s += g; ++nv; } }
         int si = (int) (s + 0.5);
         int mac = (nv > 0) ? std::min(si, 2 * nv - si) : 0;
         bool flip = (nv > 0 && s > (double) nv);          // coded allele is major
@@ -181,7 +305,7 @@ static Cell read_cell_idx(const std::string& prefix, int n_total, int n_snps,
             if (grp_open) { out_cols.push_back(grp); out_cat.push_back(grp_cat); out_pseudo.push_back(1);
                             grp_open = false; grp_cnt = 0; grp_cat = -1; }
             std::vector<float> col(n_keep);
-            for (int i = 0; i < n_keep; ++i) { int g = block(keep[i], j); col[i] = (g < 0) ? -1.f : (float) g; }
+            for (int i = 0; i < n_keep; ++i) { float g = block(i, j); col[i] = (g < 0.f) ? -1.f : g; }
             out_cols.push_back(std::move(col)); out_cat.push_back(cid); out_pseudo.push_back(0);
         } else {
             if (grp_open && (grp_cat != cid || grp_cnt >= collapse_n)) {
@@ -190,8 +314,8 @@ static Cell read_cell_idx(const std::string& prefix, int n_total, int n_snps,
             }
             if (!grp_open) { grp.assign(n_keep, 0.f); grp_open = true; grp_cat = cid; grp_cnt = 0; }
             for (int i = 0; i < n_keep; ++i) {
-                int g = block(keep[i], j);
-                if (g >= 0) grp[i] += (flip ? (float)(2 - g) : (float) g);   // additive minor dosage
+                float g = block(i, j);
+                if (g >= 0.f) grp[i] += (flip ? (2.f - g) : g);   // additive minor dosage
             }
             ++grp_cnt;
         }
@@ -207,31 +331,27 @@ static Cell read_cell_idx(const std::string& prefix, int n_total, int n_snps,
     cell.X = std::move(X);
     cell.cat = out_cat;
     cell.i0 = i0;
-    return cell;
+    return true;
 }
 
 // Read a cell by bp range [cell_start, cell_start + W) within chromosome index
 // range [lo, hi] of `bim`. Used for the COMMON fileset (matched to a WES cell's
-// bp span). Same routine as before.
-static Cell read_cell(const std::string& prefix, int n_total, int n_snps,
-                      const BimInfo& bim, const std::vector<int>& keep,
-                      int lo, int hi, long cell_start, long W) {
-    Cell cell; cell.i0 = -1;
-    if (lo < 0 || hi < lo || W <= 0) { cell.X = GenoMat(keep.size(), 0); return cell; }
+// bp span). Thread-safe; false on I/O failure.
+static bool read_cell(const BedReader& br, const BimInfo& bim,
+                      const std::vector<int>& keep,
+                      int lo, int hi, long cell_start, long W, Cell& cell) {
+    cell = Cell(); cell.i0 = -1;
+    if (lo < 0 || hi < lo || W <= 0) { cell.X = GenoMat(keep.size(), 0); return true; }
     int i0 = lower_index(bim.bp, lo, hi, cell_start);
     int i1 = lower_index(bim.bp, lo, hi, cell_start + W);
     int m = i1 - i0;
-    if (m <= 0) { cell.X = GenoMat(keep.size(), 0); return cell; }
-    int n_keep = (int) keep.size();
-    GenoMat X(n_keep, m);
-    IntegerMatrix block = readBedBlock(prefix + ".bed", n_total, n_snps, 0, n_total - 1, i0, i1 - 1);
-    for (int i = 0; i < n_keep; ++i)
-        for (int j = 0; j < m; ++j)
-            X(i, j) = (float) block(keep[i], j);
+    if (m <= 0) { cell.X = GenoMat(keep.size(), 0); return true; }
+    GenoMat X;
+    if (!br.read_raw(keep, i0, i1, X)) return false;
     standardize_capture_maf(X, cell.maf);
     cell.X = std::move(X);
     cell.i0 = i0;
-    return cell;
+    return true;
 }
 
 // Partition a chromosome's WES SNP indices [c_lo, c_hi] into consecutive CELLS.
@@ -285,6 +405,13 @@ struct ChunkContext {
     bool use_annot; int n_annot_cat;
     std::vector<std::string> annot_names;
     std::vector<int> snp_cat;
+    // Thread-safe genotype readers (replace readBedBlock in the hot path).
+    BedReader wes, com;
+    // Precomputed per-chromosome index range in the COMMON .bim. The old code
+    // recomputed this with a full linear scan over every common SNP for every
+    // chunk (~1.2e10 string compares at 1M common SNPs x 11.7k chunks), inside
+    // the serial section.
+    std::map<std::string, std::pair<int,int> > common_range;
 };
 
 static void project_covariates(GenoMat& X, const GenoMat& Z, const GenoMat& M) {
@@ -317,6 +444,7 @@ static ChunkContext setup_chunk_context(const std::string& filename, const SEXP 
     Rcout << "WES SNPs (.bim): "        << ctx.wes_n_snps  << "\n";
     ctx.wes_bim = read_bim_positions(filename + ".bim");
     if (ctx.wes_bim.n_snps != ctx.wes_n_snps) stop("Mismatch between .bim line count and parsed positions");
+    calibrate_bed_reader(ctx.wes, filename, ctx.wes_n_total, ctx.wes_n_snps, "WES");
 
     if (weights.isNotNull()) {
         Rcpp::NumericVector wv(weights.get());
@@ -415,6 +543,13 @@ static ChunkContext setup_chunk_context(const std::string& filename, const SEXP 
         ctx.common_n_total = common_iid.size();
         ctx.common_bim = read_bim_positions(ctx.common_prefix + ".bim");
         Rcout << "Common SNPs (.bim): " << ctx.common_n_snps << "\n";
+        calibrate_bed_reader(ctx.com, ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps, "common");
+        for (int j = 0; j < ctx.common_n_snps; ++j) {
+            const std::string& c = ctx.common_bim.chr[j];
+            std::map<std::string, std::pair<int,int> >::iterator it = ctx.common_range.find(c);
+            if (it == ctx.common_range.end()) ctx.common_range[c] = std::make_pair(j, j);
+            else it->second.second = j;
+        }
         IntegerVector cmatch = match(analysis_iid, common_iid);
         ctx.common_keep.resize(ctx.n_inds);
         for (int i = 0; i < ctx.n_inds; ++i) {
@@ -595,8 +730,9 @@ struct ChunkResult {
 // Components: 0 = target chunk, 1 = flank, 2 = common (if any), env = residual.
 // Kernels use tr(K_a) = n, i.e. K_a = g_a S_A with g_a = n / tr(S_A), so
 // T(a,env) = n exactly for every a.
-static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y,
-                       const std::vector<double>& Vp, bool spa, double spa_thresh,
+static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
+                       const std::vector<double>& Vp, const std::vector<double>& yty,
+                       bool spa, double spa_thresh,
                        ChunkResult& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
     const int K = cd.K, m_t = cd.m_t, m_f = cd.m_f, m_c = cd.m_c;
@@ -654,15 +790,56 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y,
         }
     }
 
+    // ---- BLOCK OUTER PRODUCTS, once per chunk (see build_SA below) ---------
+    // D0 and DM are block-constant -- they take only C distinct values, one per
+    // component -- so  L^T D L = sum_a d_a * (L_a^T L_a)  with L_a the rows of L
+    // belonging to component a. The W_a depend only on the chunk, not on the
+    // trait, so hoisting them out of the trait loop turns two O(K^3) triple
+    // products PER TRAIT into O(C K^2) linear combinations. Benchmarked 3.86x
+    // at K=1168, C=3, P=20 (see the companion note).
+    const int off[4] = { 0, m_t, m_t + m_f, K };
+    std::vector<Eigen::MatrixXd> W;
+    bool use_wcache = spa && have_L && ((double) C * K * K * 8.0 <= 6e8);
+    if (use_wcache) {
+        W.resize(C);
+        for (int a = 0; a < C; ++a) {
+            const int ma = off[a + 1] - off[a];
+            W[a].noalias() = L.middleRows(off[a], ma).transpose() * L.middleRows(off[a], ma);
+        }
+    }
+    // Build S = sigma_env0 I + L^T D0 L  and  A = c_env I + L^T DM L.
+    std::vector<double> d0v(C), dmv(C);
+    Eigen::MatrixXd Smat, Amat;
+    auto build_SA = [&]() {
+        if (use_wcache) {
+            Smat.setZero(K, K); Amat.setZero(K, K);
+            for (int a = 0; a < C; ++a) {
+                if (d0v[a] != 0.0) Smat.noalias() += d0v[a] * W[a];
+                if (dmv[a] != 0.0) Amat.noalias() += dmv[a] * W[a];
+            }
+        } else {
+            Eigen::VectorXd D0(K), DM(K);
+            for (int a = 0; a < C; ++a)
+                for (int j = off[a]; j < off[a + 1]; ++j) { D0[j] = d0v[a]; DM[j] = dmv[a]; }
+            Smat.noalias() = L.transpose() * (D0.asDiagonal() * L);
+            Amat.noalias() = L.transpose() * (DM.asDiagonal() * L);
+        }
+    };
+
+    // ---- one GEMM for all traits, instead of a GEMV per trait --------------
+    // V is n x K (467 MB at n=1e5, K=1168); the old per-trait
+    // V.transpose()*Y.col(t) streamed all of it once PER TRAIT.
+    Eigen::MatrixXd U = (cd.V.transpose() * Yf).cast<double>();      // K x P
+
     for (int t = 0; t < P; ++t) {
-        Eigen::VectorXd u = (cd.V.transpose() * Y.col(t).cast<float>()).cast<double>();
+        const Eigen::VectorXd u = U.col(t);
         Eigen::VectorXd q(C + 1);
         double q_t = 0, q_f = 0, q_c = 0;
         for (int j = 0; j < m_t; ++j) q_t += u[o_t+j]*u[o_t+j];
         for (int j = 0; j < m_f; ++j) q_f += u[o_f+j]*u[o_f+j];
         for (int j = 0; j < m_c; ++j) q_c += u[o_c+j]*u[o_c+j];
         q[0] = g[0]*q_t; q[1] = g[1]*q_f; if (has_c) q[2] = g[2]*q_c;
-        q[env] = Y.col(t).squaredNorm();
+        q[env] = yty[t];                    // constant across chunks; hoisted
 
         Eigen::VectorXd sigma = Tcod.solve(q);
         cr.vg[t] = sigma[0];
@@ -675,41 +852,38 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y,
         s0v[0] = 0.0;
         double sigma_env0 = std::max(sigma[env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
 
-        const double c_t = Tinv(0,0), c_f = Tinv(0,1);
-        const double c_c = has_c ? Tinv(0,2) : 0.0, c_env = Tinv(0,env);
-        Eigen::VectorXd D0(K), DM(K);
-        for (int j = 0; j < m_t; ++j) { D0[o_t+j] = 0.0;              DM[o_t+j] = c_t * g[0]; }
-        for (int j = 0; j < m_f; ++j) { D0[o_f+j] = s0v[1] * g[1];    DM[o_f+j] = c_f * g[1]; }
-        for (int j = 0; j < m_c; ++j) { D0[o_c+j] = s0v[2] * g[2];    DM[o_c+j] = c_c * g[2]; }
+        const double c_env = Tinv(0,env);
+        for (int a = 0; a < C; ++a) { d0v[a] = s0v[a] * g[a]; dmv[a] = Tinv(0,a) * g[a]; }
+        d0v[0] = 0.0;                                    // null the tested component
+        build_SA();
+        Smat.diagonal().array() += sigma_env0;           // S
+        Amat.diagonal().array() += c_env;                // A = Q + c_env I
 
-        Eigen::MatrixXd Pm = L.transpose() * (D0.asDiagonal() * L);
-        Eigen::MatrixXd Qm = L.transpose() * (DM.asDiagonal() * L);
-        Pm = (0.5*(Pm + Pm.transpose())).eval();
-        Qm = (0.5*(Qm + Qm.transpose())).eval();
-        Eigen::MatrixXd Smat = Pm; Smat.diagonal().array() += sigma_env0;
-        Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
-        if (lltS.info() != Eigen::Success) continue;
-        Eigen::MatrixXd Cf = lltS.matrixL();
-        Qm.diagonal().array() += c_env;
-        Eigen::MatrixXd Asym = Cf.transpose() * Qm * Cf;
-        Asym = (0.5*(Asym + Asym.transpose())).eval();
-
-        // ---- WALD SCREEN, BEFORE THE EIGENSOLVE -----------------------------
-        // The explicit eigenvalues are those of the symmetric Asym, so
-        //     Var(sigma_hat) = 2 sum lambda^2 = 2 ||Asym||_F^2
-        // exactly, in O(K^2). Computing it here (rather than after the
-        // eigensolve, as an earlier version mistakenly did) is what makes the
-        // screen worth anything: it skips the ~10 K^3 eigensolve entirely for
-        // the ~90% of chunks that are nowhere near significant.
+        // ---- WALD SCREEN, WITHOUT BUILDING Asym -----------------------------
+        // The explicit eigenvalues are those of Asym = Cf^T A Cf with S = Cf Cf^T,
+        // so with N = A S,
+        //     Var(sigma_hat) = 2 ||Asym||_F^2 = 2 tr((A S)^2) = 2 sum_ij N_ij N_ji ,
+        // which needs ONE K^3 product and an O(K^2) contraction -- no Cholesky of
+        // S and no Cf products. The old code paid ~4.3 K^3 to build Asym before it
+        // could screen at all, so the screen only ever saved the eigensolve
+        // (~30%); now the expensive path is genuinely skipped for the ~90% of
+        // tests that are nowhere near significance.
         double eig_rep = c_env * sigma_env0;
         long n_rep = (long) n - K;
-        double var0 = 2.0 * Asym.squaredNorm();
+        Eigen::MatrixXd N; N.noalias() = Amat * Smat;
+        double var0 = 2.0 * (N.cwiseProduct(N.transpose())).sum();
         if (n_rep > 0) var0 += (double) n_rep * 2.0 * eig_rep * eig_rep;
         if (!(var0 > 0.0)) continue;
         cr.se_vg[t] = std::sqrt(var0);
         double p_wald = std::erfc(std::abs(sigma[0] / cr.se_vg[t]) / std::sqrt(2.0));
         if (p_wald >= spa_thresh) { cr.p_spa[t] = p_wald; cr.spa_used[t] = 0; continue; }
 
+        // ---- only now build Asym and solve the eigenproblem ------------------
+        Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
+        if (lltS.info() != Eigen::Success) { cr.p_spa[t] = p_wald; continue; }
+        Eigen::MatrixXd Cf = lltS.matrixL();
+        Eigen::MatrixXd Asym = Cf.transpose() * Amat * Cf;
+        Asym = (0.5*(Asym + Asym.transpose())).eval();
         Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ses(Asym, Eigen::EigenvaluesOnly);
         if (ses.info() != Eigen::Success) { cr.p_spa[t] = p_wald; continue; }
         const Eigen::VectorXd& ev = ses.eigenvalues();
@@ -733,8 +907,8 @@ struct ChunkParams {
 static void common_chr_range(const ChunkContext& ctx, const std::string& chr, int& lo, int& hi) {
     lo = hi = -1;
     if (!ctx.use_common) return;
-    for (int j = 0; j < ctx.common_n_snps; ++j)
-        if (ctx.common_bim.chr[j] == chr) { if (lo == -1) lo = j; hi = j; }
+    std::map<std::string, std::pair<int,int> >::const_iterator it = ctx.common_range.find(chr);
+    if (it != ctx.common_range.end()) { lo = it->second.first; hi = it->second.second; }
 }
 
 // Find the [i0, i1) index range (within chromosome index range [lo, hi] of a
@@ -788,7 +962,8 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     const int fR0 = b, fR1 = std::min(chr_hi + 1, b + flank_snps);
 
     const std::vector<float>* wp = ctx.snp_weights.empty() ? 0 : &ctx.snp_weights;
-    Cell tgt = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, a, b);
+    Cell tgt;
+    if (!read_cell_idx(ctx.wes, ctx.geno_keep, a, b, tgt)) return false;
     if (ctx.covZ.cols() > 0) project_covariates(tgt.X, ctx.covZ, ctx.covM);
     apply_alpha(tgt.X, tgt.maf, ctx.alpha, wp, a);
     cd.m_t = (int) tgt.X.cols();
@@ -796,10 +971,10 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
 
     Cell fl; fl.X = GenoMat(ctx.n_inds, 0);
     Cell fr; fr.X = GenoMat(ctx.n_inds, 0);
-    if (fL1 > fL0) { fl = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, fL0, fL1);
+    if (fL1 > fL0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fL0, fL1, fl)) return false;
                      if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
                      apply_alpha(fl.X, fl.maf, ctx.alpha, wp, fL0); }
-    if (fR1 > fR0) { fr = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, fR0, fR1);
+    if (fR1 > fR0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fR0, fR1, fr)) return false;
                      if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
                      apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
     cd.m_f = (int) fl.X.cols() + (int) fr.X.cols();
@@ -819,8 +994,8 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
             // the chunk design.
             long half = common_bp / 2;
             long lo_bp = (ctr > half) ? (ctr - half) : 0;
-            com = read_cell(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
-                            ctx.common_bim, ctx.common_keep, cc_lo, cc_hi, lo_bp, common_bp);
+            if (!read_cell(ctx.com, ctx.common_bim, ctx.common_keep, cc_lo, cc_hi,
+                           lo_bp, common_bp, com)) return false;
             thin_cell(com, max_common);
         } else {
             // No window specified: take the max_common nearest common SNPs to the
@@ -828,8 +1003,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
             // no thinning step is needed.
             std::pair<int,int> rng = nearest_snp_range(ctx.common_bim.bp, cc_lo, cc_hi, ctr, max_common);
             if (rng.second > rng.first)
-                com = read_cell_idx(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
-                                    ctx.common_keep, rng.first, rng.second);
+                if (!read_cell_idx(ctx.com, ctx.common_keep, rng.first, rng.second, com)) return false;
         }
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
@@ -851,18 +1025,84 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     return true;
 }
 
+// A unit of work: one chunk, identified by its SNP-index range on a chromosome.
+struct Job { size_t ci; int a, b, chr_lo, chr_hi; };
+
+// ===========================================================================
+// PARALLELIZATION
+//
+// Previously the driver built a batch of ChunkData SERIALLY on the main thread
+// and then ran only test_chunk() in parallel. That had three costs:
+//   * the whole read/decode/standardize stage (measured 0.39 s per chunk at
+//     n = 1e5, i.e. ~1.3 h over 11.7k chunks) was a hard Amdahl floor that no
+//     thread count could touch;
+//   * threads idled at a barrier during every assembly phase; and
+//   * peak memory was batch_size x sizeof(V) = 16 x 467 MB = 7.5 GB, because the
+//     whole batch was materialized before any of it was consumed.
+//
+// Now each worker assembles AND tests its own chunk, so assembly is parallel,
+// there is no mid-batch barrier, and only n_threads copies of V are ever live at
+// once (batch_size now controls output-flush granularity, not memory). This is
+// only possible because BedReader replaced readBedBlock's Rcpp allocation --
+// nothing in the worker touches the R API.
+// ===========================================================================
 struct ChunkWorker : public RcppParallel::Worker {
-    const std::vector<ChunkData>& batch; const Eigen::MatrixXd& Y;
-    const std::vector<double>& Vp; const ChunkParams& pr;
-    std::vector<ChunkResult>& out;
-    ChunkWorker(const std::vector<ChunkData>& b, const Eigen::MatrixXd& Y,
-                const std::vector<double>& Vp, const ChunkParams& pr, std::vector<ChunkResult>& out)
-        : batch(b), Y(Y), Vp(Vp), pr(pr), out(out) {}
+    const ChunkContext& ctx; const std::vector<Job>& jobs; size_t job0;
+    const Eigen::MatrixXd& Y; const GenoMat& Yf;
+    const std::vector<double>& Vp; const std::vector<double>& yty;
+    const ChunkParams& pr; int flank_snps;
+    std::vector<ChunkResult>& out; std::vector<char>& ok;
+    ChunkWorker(const ChunkContext& ctx, const std::vector<Job>& jobs, size_t job0,
+                const Eigen::MatrixXd& Y, const GenoMat& Yf,
+                const std::vector<double>& Vp, const std::vector<double>& yty,
+                const ChunkParams& pr, int flank_snps,
+                std::vector<ChunkResult>& out, std::vector<char>& ok)
+        : ctx(ctx), jobs(jobs), job0(job0), Y(Y), Yf(Yf), Vp(Vp), yty(yty),
+          pr(pr), flank_snps(flank_snps), out(out), ok(ok) {}
     void operator()(std::size_t begin, std::size_t end) {
-        for (std::size_t w = begin; w < end; ++w)
-            test_chunk(batch[w], Y, Vp, pr.spa, pr.spa_thresh, out[w]);
+        for (std::size_t w = begin; w < end; ++w) {
+            const Job& j = jobs[job0 + w];
+            int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[j.ci], cc_lo, cc_hi);
+            ChunkData cd;
+            if (!make_chunk(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
+                            flank_snps, pr.common_bp, pr.common_window_given,
+                            pr.max_common_snps, cd)) { ok[w] = 0; continue; }
+            test_chunk(cd, Y, Yf, Vp, yty, pr.spa, pr.spa_thresh, out[w]);
+            ok[w] = 1;
+        }
     }
 };
+
+// Peak memory is now n_threads x (V + the K x K working set), NOT
+// batch_size x V as before, because each worker builds and discards its own
+// chunk. Report it so the thread count can be chosen against available RAM.
+static void report_parallel_plan(const ChunkContext& ctx, const ChunkParams& pr,
+                                 int Kmax, int n_comp) {
+    int th = pr.n_threads;
+    if (th <= 0) {
+        const char* e = std::getenv("RCPP_PARALLEL_NUM_THREADS");
+        th = (e != 0) ? std::atoi(e) : 0;
+        if (th <= 0) th = 1;                      // unknown; report per-thread cost
+    }
+    const double V_mb  = (double) ctx.n_inds * Kmax * 4.0 / 1048576.0;
+    const double KK_mb = (double) Kmax * Kmax * 8.0 / 1048576.0;
+    const double per   = V_mb + KK_mb * (n_comp + 4);   // V + W cache + S,A,N,Asym
+    Rcout << "  Parallel plan: assembly AND testing now run inside the workers.\n"
+          << "  Approx peak memory ~ " << (int) per << " MB per thread"
+          << " (V " << (int) V_mb << " MB + " << (int) (KK_mb * (n_comp + 4)) << " MB working set).\n";
+    if (pr.n_threads > 0) {
+        Rcout << "  With n_threads = " << th << " that is ~" << (per * th / 1024.0)
+              << " GB total.\n";
+    } else {
+        // IMPORTANT: memory is now bounded by the THREAD COUNT, not by batch_size
+        // as it was before. Left unset, RcppParallel uses every core, so on a
+        // many-core node this can be a large multiple of the per-thread figure.
+        Rcout << "  WARNING: n_threads is unset, so all available cores will be used and\n"
+              << "  peak memory scales with the core count (~" << (per * 16.0 / 1024.0)
+              << " GB at 16 threads, ~" << (per * 64.0 / 1024.0) << " GB at 64).\n"
+              << "  Set n_threads explicitly to bound it.\n";
+    }
+}
 
 static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     const int P = ctx.n_pheno; const Eigen::MatrixXd& Y = ctx.Y;
@@ -875,9 +1115,11 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
         setenv("RCPP_PARALLEL_NUM_THREADS", nt.c_str(), 1);
 #endif
     }
-    std::vector<double> Vp(P);
+    std::vector<double> Vp(P), yty(P);
     for (int t = 0; t < P; ++t) { double m = Y.col(t).mean();
-        Vp[t] = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1); }
+        Vp[t]  = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1);
+        yty[t] = Y.col(t).squaredNorm(); }
+    const GenoMat Yf = Y.cast<float>();      // cast once, not per trait per chunk
 
     std::ofstream fout; bool tofile = !pr.out_file.empty();
     auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
@@ -890,7 +1132,6 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     }
 
     // enumerate chunks: consecutive blocks of chunk_size SNPs within a chromosome
-    struct Job { size_t ci; int a, b, chr_lo, chr_hi; };
     std::vector<Job> jobs;
     for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
         int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
@@ -904,9 +1145,11 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     const int flank_snps = pr.chunk_size * pr.flank_chunks;
     Rcout << "Chunks to test: " << jobs.size()
           << "   (chunk_size " << pr.chunk_size << ", flank " << flank_snps << " SNPs/side)\n";
-    Rcout << "  K_tot per chunk <= " << (pr.chunk_size * (1 + 2 * pr.flank_chunks) + pr.max_common_snps)
+    const int Kmax = pr.chunk_size * (1 + 2 * pr.flank_chunks) + pr.max_common_snps;
+    Rcout << "  K_tot per chunk <= " << Kmax
           << "  (" << (pr.chunk_size * (1 + 2 * pr.flank_chunks)) << " WES + <= "
           << pr.max_common_snps << " common)\n";
+    report_parallel_plan(ctx, pr, Kmax, 3);
     if (ctx.use_common) {
         if (pr.common_window_given)
             Rcout << "  Common GRM: fixed " << pr.common_bp
@@ -918,27 +1161,23 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
                   << " common SNPs to each chunk's midpoint (no bp window, no thinning).\n";
     }
 
-    long n_done = 0; size_t idx = 0;
+    long n_done = 0, n_skip = 0; size_t idx = 0;
     typedef std::chrono::steady_clock clk;
     clk::time_point t0 = clk::now();
     while (idx < jobs.size()) {
-        std::vector<ChunkData> batch;
-        while ((int) batch.size() < pr.batch_size && idx < jobs.size()) {
-            const Job& j = jobs[idx];
-            int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[j.ci], cc_lo, cc_hi);
-            ChunkData cd;
-            if (make_chunk(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
-                           flank_snps, pr.common_bp, pr.common_window_given, pr.max_common_snps, cd))
-                batch.push_back(std::move(cd));
-            ++idx;
-        }
-        if (batch.empty()) break;
-        std::vector<ChunkResult> res(batch.size());
-        ChunkWorker wk(batch, Y, Vp, pr, res);
-        RcppParallel::parallelFor(0, batch.size(), wk);
+        // Assembly now happens INSIDE the workers, so a "batch" is just the span
+        // of jobs handed to one parallelFor -- it controls output flushing and
+        // progress granularity, not peak memory.
+        const size_t nb = std::min((size_t) std::max(1, pr.batch_size), jobs.size() - idx);
+        std::vector<ChunkResult> res(nb);
+        std::vector<char> ok(nb, 0);
+        ChunkWorker wk(ctx, jobs, idx, Y, Yf, Vp, yty, pr, flank_snps, res, ok);
+        RcppParallel::parallelFor(0, nb, wk);
+        idx += nb;
 
         for (size_t b = 0; b < res.size(); ++b) {
             const ChunkResult& cr = res[b];
+            if (!ok[b]) { ++n_skip; continue; }
             ++n_done;
             if (!tofile || cr.vg.empty()) continue;
             for (int t = 0; t < P; ++t) {
@@ -954,15 +1193,17 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
         }
         if (tofile) fout.flush();
         double el = std::chrono::duration<double>(clk::now() - t0).count();
-        double eta = (n_done > 0) ? el * ((double) jobs.size() - n_done) / n_done : 0.0;
-        Rcout << "\r[chunk] " << n_done << "/" << jobs.size()
-              << "  " << (int)(100.0 * n_done / jobs.size()) << "%"
+        double seen = (double)(n_done + n_skip);
+        double eta = (seen > 0) ? el * ((double) jobs.size() - seen) / seen : 0.0;
+        Rcout << "\r[chunk] " << (long) seen << "/" << jobs.size()
+              << "  " << (int)(100.0 * seen / jobs.size()) << "%"
               << "  elapsed " << (int) el << "s  eta " << (int) eta << "s     " << std::flush;
         Rcpp::checkUserInterrupt();
     }
     Rcout << "\n";
     if (tofile) fout.close();
     Rcout << "Chunks tested: " << n_done << "\n";
+    if (n_skip > 0) Rcout << "Chunks skipped (too few SNPs, no background, or read error): " << n_skip << "\n";
     return List::create(_["n_chunks"] = (double) n_done, _["trait_names"] = ctx.trait_names);
 }
 
@@ -1008,7 +1249,8 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
     cd.start = ctx.wes_bim.bp[a]; cd.end = ctx.wes_bim.bp[b - 1];
     const std::vector<float>* wp = ctx.snp_weights.empty() ? 0 : &ctx.snp_weights;
 
-    Cell tgt = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, a, b);
+    Cell tgt;
+    if (!read_cell_idx(ctx.wes, ctx.geno_keep, a, b, tgt)) return false;
     if (ctx.covZ.cols() > 0) project_covariates(tgt.X, ctx.covZ, ctx.covM);
     apply_alpha(tgt.X, tgt.maf, ctx.alpha, wp, a);
     int m_t = (int) tgt.X.cols();
@@ -1032,10 +1274,10 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
     const int fR0 = b, fR1 = std::min(chr_hi + 1, b + flank_snps);
     Cell fl; fl.X = GenoMat(ctx.n_inds, 0);
     Cell fr; fr.X = GenoMat(ctx.n_inds, 0);
-    if (fL1 > fL0) { fl = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, fL0, fL1);
+    if (fL1 > fL0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fL0, fL1, fl)) return false;
                      if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
                      apply_alpha(fl.X, fl.maf, ctx.alpha, wp, fL0); }
-    if (fR1 > fR0) { fr = read_cell_idx(ctx.wes_prefix, ctx.wes_n_total, ctx.wes_n_snps, ctx.geno_keep, fR0, fR1);
+    if (fR1 > fR0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fR0, fR1, fr)) return false;
                      if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
                      apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
     int m_flank = (int) bg_cols.size() + (int) fl.X.cols() + (int) fr.X.cols();
@@ -1049,14 +1291,13 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
         if (common_window_given) {
             long half = common_bp / 2;
             long lo_bp = (ctr > half) ? (ctr - half) : 0;
-            com = read_cell(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
-                            ctx.common_bim, ctx.common_keep, cc_lo, cc_hi, lo_bp, common_bp);
+            if (!read_cell(ctx.com, ctx.common_bim, ctx.common_keep, cc_lo, cc_hi,
+                           lo_bp, common_bp, com)) return false;
             thin_cell(com, max_common);
         } else {
             std::pair<int,int> rng = nearest_snp_range(ctx.common_bim.bp, cc_lo, cc_hi, ctr, max_common);
             if (rng.second > rng.first)
-                com = read_cell_idx(ctx.common_prefix, ctx.common_n_total, ctx.common_n_snps,
-                                    ctx.common_keep, rng.first, rng.second);
+                if (!read_cell_idx(ctx.com, ctx.common_keep, rng.first, rng.second, com)) return false;
         }
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
@@ -1089,8 +1330,9 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
 // Multi-category SPA test. Components: 0..A-1 categories (tested), A flank,
 // A+1 common (if any), env residual. Mirrors test_chunk but loops the SPA over
 // the A categories, reusing the single per-chunk Cholesky.
-static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y,
-                             const std::vector<double>& Vp, bool spa, double spa_thresh,
+static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
+                             const std::vector<double>& Vp, const std::vector<double>& yty,
+                             bool spa, double spa_thresh,
                              ChunkResultA& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
     const int A = (int) cd.cat_m.size();
@@ -1147,14 +1389,45 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y,
         }
     }
 
+    // ---- block outer products, once per chunk (shared across traits AND
+    // categories -- the saving is A x P fold here, not just P fold) ----------
+    std::vector<Eigen::MatrixXd> W;
+    bool use_wcache = spa && have_L && ((double) C * K * K * 8.0 <= 6e8);
+    if (use_wcache) {
+        W.resize(C);
+        for (int a = 0; a < C; ++a) {
+            const int ma = off[a + 1] - off[a];
+            W[a].noalias() = L.middleRows(off[a], ma).transpose() * L.middleRows(off[a], ma);
+        }
+    }
+    std::vector<double> d0v(C), dmv(C);
+    Eigen::MatrixXd Smat, Amat;
+    auto build_SA = [&]() {
+        if (use_wcache) {
+            Smat.setZero(K, K); Amat.setZero(K, K);
+            for (int a = 0; a < C; ++a) {
+                if (d0v[a] != 0.0) Smat.noalias() += d0v[a] * W[a];
+                if (dmv[a] != 0.0) Amat.noalias() += dmv[a] * W[a];
+            }
+        } else {
+            Eigen::VectorXd D0(K), DM(K);
+            for (int a = 0; a < C; ++a)
+                for (int j = off[a]; j < off[a + 1]; ++j) { D0[j] = d0v[a]; DM[j] = dmv[a]; }
+            Smat.noalias() = L.transpose() * (D0.asDiagonal() * L);
+            Amat.noalias() = L.transpose() * (DM.asDiagonal() * L);
+        }
+    };
+
+    Eigen::MatrixXd U = (cd.V.transpose() * Yf).cast<double>();      // K x P, one GEMM
+
     for (int t = 0; t < P; ++t) {
-        Eigen::VectorXd u = (cd.V.transpose() * Y.col(t).cast<float>()).cast<double>();
+        const Eigen::VectorXd u = U.col(t);
         Eigen::VectorXd q(C + 1);
         for (int c = 0; c < C; ++c) {
             double qc = 0.0; for (int j = off[c]; j < off[c + 1]; ++j) qc += u[j] * u[j];
             q[c] = g[c] * qc;
         }
-        q[env] = Y.col(t).squaredNorm();
+        q[env] = yty[t];
         Eigen::VectorXd sigma = Tcod.solve(q);
 
         for (int c = 0; c < A; ++c) {
@@ -1169,35 +1442,31 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y,
 
         // ---- SPA-test each category component c ----
         for (int c = 0; c < A; ++c) {
-            Eigen::VectorXd s0v = s0base; s0v[c] = 0.0;   // null the tested category
-            Eigen::VectorXd D0(K), DM(K);
             const double c_env = Tinv(c, env);
             for (int a = 0; a < C; ++a) {
-                double d0 = (a == c) ? 0.0 : s0v[a] * g[a];
-                double dm = Tinv(c, a) * g[a];
-                for (int j = off[a]; j < off[a + 1]; ++j) { D0[j] = d0; DM[j] = dm; }
+                d0v[a] = (a == c) ? 0.0 : s0base[a] * g[a];   // null the tested category
+                dmv[a] = Tinv(c, a) * g[a];
             }
-            Eigen::MatrixXd Pm = L.transpose() * (D0.asDiagonal() * L);
-            Eigen::MatrixXd Qm = L.transpose() * (DM.asDiagonal() * L);
-            Pm = (0.5 * (Pm + Pm.transpose())).eval();
-            Qm = (0.5 * (Qm + Qm.transpose())).eval();
-            Eigen::MatrixXd Smat = Pm; Smat.diagonal().array() += sigma_env0;
-            Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
-            if (lltS.info() != Eigen::Success) continue;
-            Eigen::MatrixXd Cf = lltS.matrixL();
-            Qm.diagonal().array() += c_env;
-            Eigen::MatrixXd Asym = Cf.transpose() * Qm * Cf;
-            Asym = (0.5 * (Asym + Asym.transpose())).eval();
+            build_SA();
+            Smat.diagonal().array() += sigma_env0;
+            Amat.diagonal().array() += c_env;
 
+            // Cholesky-free Wald screen: 2 tr((A S)^2) = 2 ||Cf^T A Cf||_F^2
             double eig_rep = c_env * sigma_env0;
             long n_rep = (long) n - K;
-            double var0 = 2.0 * Asym.squaredNorm();
+            Eigen::MatrixXd N; N.noalias() = Amat * Smat;
+            double var0 = 2.0 * (N.cwiseProduct(N.transpose())).sum();
             if (n_rep > 0) var0 += (double) n_rep * 2.0 * eig_rep * eig_rep;
             if (!(var0 > 0.0)) continue;
             cr.se_vg[c][t] = std::sqrt(var0);
             double p_wald = std::erfc(std::abs(sigma[c] / cr.se_vg[c][t]) / std::sqrt(2.0));
             if (p_wald >= spa_thresh) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
 
+            Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
+            if (lltS.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; continue; }
+            Eigen::MatrixXd Cf = lltS.matrixL();
+            Eigen::MatrixXd Asym = Cf.transpose() * Amat * Cf;
+            Asym = (0.5 * (Asym + Asym.transpose())).eval();
             Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ses(Asym, Eigen::EigenvaluesOnly);
             if (ses.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; continue; }
             const Eigen::VectorXd& ev = ses.eigenvalues();
@@ -1210,15 +1479,29 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y,
 }
 
 struct ChunkWorkerA : public RcppParallel::Worker {
-    const std::vector<ChunkDataA>& batch; const Eigen::MatrixXd& Y;
-    const std::vector<double>& Vp; const ChunkParams& pr;
-    std::vector<ChunkResultA>& out;
-    ChunkWorkerA(const std::vector<ChunkDataA>& b, const Eigen::MatrixXd& Y,
-                 const std::vector<double>& Vp, const ChunkParams& pr, std::vector<ChunkResultA>& out)
-        : batch(b), Y(Y), Vp(Vp), pr(pr), out(out) {}
+    const ChunkContext& ctx; const std::vector<Job>& jobs; size_t job0;
+    const Eigen::MatrixXd& Y; const GenoMat& Yf;
+    const std::vector<double>& Vp; const std::vector<double>& yty;
+    const ChunkParams& pr; int flank_snps;
+    std::vector<ChunkResultA>& out; std::vector<char>& ok;
+    ChunkWorkerA(const ChunkContext& ctx, const std::vector<Job>& jobs, size_t job0,
+                 const Eigen::MatrixXd& Y, const GenoMat& Yf,
+                 const std::vector<double>& Vp, const std::vector<double>& yty,
+                 const ChunkParams& pr, int flank_snps,
+                 std::vector<ChunkResultA>& out, std::vector<char>& ok)
+        : ctx(ctx), jobs(jobs), job0(job0), Y(Y), Yf(Yf), Vp(Vp), yty(yty),
+          pr(pr), flank_snps(flank_snps), out(out), ok(ok) {}
     void operator()(std::size_t begin, std::size_t end) {
-        for (std::size_t w = begin; w < end; ++w)
-            test_chunk_annot(batch[w], Y, Vp, pr.spa, pr.spa_thresh, out[w]);
+        for (std::size_t w = begin; w < end; ++w) {
+            const Job& j = jobs[job0 + w];
+            int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[j.ci], cc_lo, cc_hi);
+            ChunkDataA cd;
+            if (!make_chunk_annot(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
+                                  flank_snps, pr.common_bp, pr.common_window_given,
+                                  pr.max_common_snps, cd)) { ok[w] = 0; continue; }
+            test_chunk_annot(cd, Y, Yf, Vp, yty, pr.spa, pr.spa_thresh, out[w]);
+            ok[w] = 1;
+        }
     }
 };
 
@@ -1233,9 +1516,11 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
         setenv("RCPP_PARALLEL_NUM_THREADS", nt.c_str(), 1);
 #endif
     }
-    std::vector<double> Vp(P);
+    std::vector<double> Vp(P), yty(P);
     for (int t = 0; t < P; ++t) { double m = Y.col(t).mean();
-        Vp[t] = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1); }
+        Vp[t]  = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1);
+        yty[t] = Y.col(t).squaredNorm(); }
+    const GenoMat Yf = Y.cast<float>();
 
     std::ofstream fout; bool tofile = !pr.out_file.empty();
     auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
@@ -1247,7 +1532,6 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
         fout << "\n";
     }
 
-    struct Job { size_t ci; int a, b, chr_lo, chr_hi; };
     std::vector<Job> jobs;
     for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
         int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
@@ -1261,28 +1545,23 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
     const int flank_snps = pr.chunk_size * pr.flank_chunks;
     Rcout << "Chunks to test: " << jobs.size() << "   (chunk_size " << pr.chunk_size
           << ", flank " << flank_snps << " SNPs/side, " << ctx.n_annot_cat << " categories)\n";
+    report_parallel_plan(ctx, pr, pr.chunk_size * (1 + 2 * pr.flank_chunks) + pr.max_common_snps,
+                         ctx.n_annot_cat + 2);
 
-    long n_done = 0; size_t idx = 0;
+    long n_done = 0, n_skip = 0; size_t idx = 0;
     typedef std::chrono::steady_clock clk;
     clk::time_point t0 = clk::now();
     while (idx < jobs.size()) {
-        std::vector<ChunkDataA> batch;
-        while ((int) batch.size() < pr.batch_size && idx < jobs.size()) {
-            const Job& j = jobs[idx];
-            int cc_lo, cc_hi; common_chr_range(ctx, ctx.chr_order[j.ci], cc_lo, cc_hi);
-            ChunkDataA cd;
-            if (make_chunk_annot(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
-                                 flank_snps, pr.common_bp, pr.common_window_given, pr.max_common_snps, cd))
-                batch.push_back(std::move(cd));
-            ++idx;
-        }
-        if (batch.empty()) break;
-        std::vector<ChunkResultA> res(batch.size());
-        ChunkWorkerA wk(batch, Y, Vp, pr, res);
-        RcppParallel::parallelFor(0, batch.size(), wk);
+        const size_t nb = std::min((size_t) std::max(1, pr.batch_size), jobs.size() - idx);
+        std::vector<ChunkResultA> res(nb);
+        std::vector<char> ok(nb, 0);
+        ChunkWorkerA wk(ctx, jobs, idx, Y, Yf, Vp, yty, pr, flank_snps, res, ok);
+        RcppParallel::parallelFor(0, nb, wk);
+        idx += nb;
 
         for (size_t bb = 0; bb < res.size(); ++bb) {
             const ChunkResultA& cr = res[bb];
+            if (!ok[bb]) { ++n_skip; continue; }
             ++n_done;
             if (!tofile || cr.cat_name.empty()) continue;
             int A = (int) cr.cat_name.size();
@@ -1301,15 +1580,17 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
         }
         if (tofile) fout.flush();
         double el = std::chrono::duration<double>(clk::now() - t0).count();
-        double eta = (n_done > 0) ? el * ((double) jobs.size() - n_done) / n_done : 0.0;
-        Rcout << "\r[chunk-annot] " << n_done << "/" << jobs.size()
-              << "  " << (int)(100.0 * n_done / jobs.size()) << "%"
+        double seen = (double)(n_done + n_skip);
+        double eta = (seen > 0) ? el * ((double) jobs.size() - seen) / seen : 0.0;
+        Rcout << "\r[chunk-annot] " << (long) seen << "/" << jobs.size()
+              << "  " << (int)(100.0 * seen / jobs.size()) << "%"
               << "  elapsed " << (int) el << "s  eta " << (int) eta << "s     " << std::flush;
         Rcpp::checkUserInterrupt();
     }
     Rcout << "\n";
     if (tofile) fout.close();
     Rcout << "Chunks tested: " << n_done << "\n";
+    if (n_skip > 0) Rcout << "Chunks skipped (no category SNPs, no background, or read error): " << n_skip << "\n";
     return List::create(_["n_chunks"] = (double) n_done, _["trait_names"] = ctx.trait_names,
                         _["categories"] = wrap(ctx.annot_names));
 }
@@ -1331,7 +1612,7 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         double common_window = NA_REAL,
                         int max_common_snps = 400,
                         std::string out_file = "",
-                        int batch_size = 16,
+                        int batch_size = 64,
                         int n_threads = 0,
                         Rcpp::Nullable<Rcpp::NumericVector> weights = R_NilValue,
                         Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
