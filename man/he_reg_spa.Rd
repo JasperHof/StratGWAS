@@ -20,7 +20,9 @@ he_reg_spa(
   n_threads = 1,
   covariates = NULL,
   SPA = T,
-  spa_pval_threshold = 0.1
+  spa_pval_threshold = 0.1,
+  annotation = NULL,
+  annot_names = NULL
 )
 }
 \description{

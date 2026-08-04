@@ -130,7 +130,7 @@ he_reg_part_alpha <- function (filename, pheno, snp_cat, cat_names, common_filen
     nmcmc       = nmcmc,
     se          = se,
     out_file    = outfile,
-    n_threads   = n_threads, 
+    n_threads   = n_threads,
     batch_size  = batch_size,
     seed        = 12345,
     min_snps    = min_snps,
@@ -158,7 +158,8 @@ he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
                         common_filename = NULL,
                         common_window = 1e6, max_common_snps = 400,
                         outfile, batch_size = 4, n_threads = 1,
-                        covariates = NULL, SPA = T, spa_pval_threshold = 0.1) {
+                        covariates = NULL, SPA = T, spa_pval_threshold = 0.1,
+                        annotation = NULL, annot_names = NULL) {
 
   #storage.mode(snp_cat) <- "integer"          # <- force integer
   #snp_cat <- as.matrix(snp_cat)               # ensure it's a matrix, not df
@@ -198,7 +199,9 @@ he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
     n_threads   = n_threads,
     covariates  = covariates,
     SPA         = T,
-    spa_pval_threshold = 0.1
+    spa_pval_threshold = 0.1,
+    annotation = annotation,
+    annot_names = annot_names
   )
 
   # hers$genome_h2 contains the genome estimates per alpha
