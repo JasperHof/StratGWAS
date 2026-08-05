@@ -400,7 +400,7 @@ struct ChunkContext {
     double alpha, alpha_common;
     std::vector<float> snp_weights;
     GenoMat covZ, covM;
-    // Optional annotation: col 1 = flank flag, cols 2+ = middle categories.
+    // Optional annotation: EVERY column is a tested functional category.
     // snp_cat[j] = 0..n_annot_cat-1 (a tested category) or -1 (flank/background).
     bool use_annot; int n_annot_cat;
     std::vector<std::string> annot_names;
@@ -457,29 +457,34 @@ static ChunkContext setup_chunk_context(const std::string& filename, const SEXP 
         Rcout << "Using per-SNP LD weights\n";
     }
 
-    // Annotation: col 0 = flank flag, cols 1.. = middle functional categories.
+    // Annotation: EVERY column is a tested functional category -- there is no
+    // flank-flag column any more. The background/flanking component is built
+    // purely from the ADJACENT CHUNKS (flank_chunks) plus, if supplied, the
+    // common SNPs. A SNP whose annotation row is all zero belongs to no category
+    // and simply joins that background, so no genotype is silently dropped.
     if (annotation.isNotNull()) {
         Rcpp::IntegerMatrix am(annotation.get());
         if (am.nrow() != ctx.wes_n_snps)
             stop("annotation must have one row per SNP in the WES .bim file");
         int ncol = am.ncol();
-        if (ncol < 2) stop("annotation needs >= 2 columns: col 1 = flank flag, cols 2+ = middle categories");
-        ctx.n_annot_cat = ncol - 1;
+        if (ncol < 1) stop("annotation needs at least one column; every column is a tested category");
+        ctx.n_annot_cat = ncol;
         ctx.snp_cat.assign(ctx.wes_n_snps, -1);
-        for (int j = 0; j < ctx.wes_n_snps; ++j) {
-            if (am(j, 0) == 1) { ctx.snp_cat[j] = -1; continue; }   // flank -> background
-            for (int c = 1; c < ncol; ++c) if (am(j, c) == 1) { ctx.snp_cat[j] = c - 1; break; }
-        }
+        for (int j = 0; j < ctx.wes_n_snps; ++j)
+            for (int c = 0; c < ncol; ++c) if (am(j, c) == 1) { ctx.snp_cat[j] = c; break; }
         if (annot_names.isNotNull()) {
             Rcpp::CharacterVector nm(annot_names.get());
-            if (nm.size() != ctx.n_annot_cat) stop("annot_names length must equal the number of category columns");
+            if (nm.size() != ctx.n_annot_cat)
+                stop("annot_names length must equal the number of annotation columns "
+                     "(every column is a category)");
             for (int c = 0; c < ctx.n_annot_cat; ++c) ctx.annot_names.push_back(as<std::string>(nm[c]));
         } else {
             for (int c = 0; c < ctx.n_annot_cat; ++c) ctx.annot_names.push_back("cat" + std::to_string(c + 1));
         }
         ctx.use_annot = true;
         Rcout << "Annotation: " << ctx.n_annot_cat
-              << " middle categories (+ flank column); an SPA p-value is reported per category\n";
+              << " categories (every column); an SPA p-value is reported per category.\n"
+              << "  Background = adjacent chunks + common SNPs (not taken from the annotation).\n";
     }
 
     Rcpp::NumericMatrix pheno; CharacterVector pheno_ids;
@@ -1243,11 +1248,15 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
 // ANNOTATION PATH (only used when an annotation matrix is supplied).
 //
 // Instead of one target = the whole chunk, the chunk's middle SNPs are split
-// by the annotation into functional CATEGORIES (annotation cols 2+). Column 1
-// of the annotation flags flank/background SNPs. The model per chunk is:
+// by the annotation into functional CATEGORIES -- EVERY annotation column is a
+// tested category. The background is NOT taken from the annotation: it is built
+// purely from the adjacent chunks (flank_chunks) and, if supplied, the common
+// SNPs. The model per chunk is:
 //   { cat_0, cat_1, ..., cat_{A-1}  (each SPA-tested),
-//     flank (neighbour chunks + any middle SNP flagged flank or uncategorized),
+//     flank (neighbouring chunks + any middle SNP in no category),
 //     [common], sigma_e I }
+// With flank_chunks = 0 and a complete annotation the flank block is empty, and
+// the common SNPs become the background component instead.
 // and one SPA p-value is produced per category. The category matrices are laid
 // out as contiguous leading blocks of V so each is a single component, exactly
 // as the single target block was. Everything else (trace normalization, the
@@ -1261,6 +1270,8 @@ struct ChunkDataA {
     int m_flank, m_common, K;
     GenoMat V;                         // [cat_0 | ... | cat_{A-1} | flank | common]
     std::vector<double> cj;
+    bool flank_is_common;              // flank_chunks = 0: common SNPs are the background
+    ChunkDataA() : m_flank(0), m_common(0), K(0), flank_is_common(false) {}
 };
 struct ChunkResultA {
     std::string chr; long start, end;
@@ -1312,8 +1323,12 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
     if (fR1 > fR0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fR0, fR1, fr)) return false;
                      if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
                      apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
+    // Background = adjacent chunks + any middle SNP in no category. The bail-out
+    // moved BELOW the common read: with flank_chunks = 0 and a complete annotation
+    // this count is legitimately zero, and the common SNPs take over as the
+    // background. (Previously that combination made every chunk return false, so
+    // the run wrote a header and then silently computed nothing.)
     int m_flank = (int) bg_cols.size() + (int) fl.X.cols() + (int) fr.X.cols();
-    if (m_flank <= 0) return false;                // model needs a background component
 
     // common GRM (fixed bp window centred on the chunk, thinned; or the nearest
     // max_common SNPs directly if no window is given) -- as no-annot
@@ -1338,6 +1353,14 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
     }
     int m_c = (int) com.X.cols();
 
+    // flank_chunks = 0 (or no uncategorized middle SNPs): the common set becomes
+    // the background component, exactly as in the no-annotation path.
+    if (m_flank <= 0) {
+        if (m_c <= 0) return false;                // no background at all
+        cd.flank_is_common = true;
+        m_flank = m_c; m_c = 0;
+    }
+
     int Kt = 0; for (size_t k = 0; k < act.size(); ++k) Kt += (int) cat_cols[act[k]].size();
     cd.K = Kt + m_flank + m_c;
     cd.V = GenoMat(ctx.n_inds, cd.K);
@@ -1349,10 +1372,14 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
         cd.cat_m.push_back((int) cc.size());
         cd.cat_name.push_back(ctx.annot_names[c]);
     }
-    for (size_t q = 0; q < bg_cols.size(); ++q) cd.V.col(off++) = tgt.X.col(bg_cols[q]);
-    if (fl.X.cols() > 0) { cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols(); }
-    if (fr.X.cols() > 0) { cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols(); }
-    if (m_c > 0) cd.V.rightCols(m_c) = com.X;
+    if (cd.flank_is_common) {
+        cd.V.middleCols(off, m_flank) = com.X; off += m_flank;
+    } else {
+        for (size_t q = 0; q < bg_cols.size(); ++q) cd.V.col(off++) = tgt.X.col(bg_cols[q]);
+        if (fl.X.cols() > 0) { cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols(); }
+        if (fr.X.cols() > 0) { cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols(); }
+        if (m_c > 0) cd.V.rightCols(m_c) = com.X;
+    }
     cd.m_flank = m_flank; cd.m_common = m_c;
     cd.cj.resize(cd.K);
     for (int j = 0; j < cd.K; ++j) cd.cj[j] = cd.V.col(j).cast<double>().squaredNorm();
@@ -1372,7 +1399,9 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     const int C = A + 1 + (has_c ? 1 : 0), env = C;   // +1 flank, +1 common
 
     cr.chr = cd.chr; cr.start = cd.start; cr.end = cd.end;
-    cr.m_flank = cd.m_flank; cr.m_common = cd.m_common;
+    // Report honestly when the common set is standing in as the background.
+    cr.m_flank  = cd.flank_is_common ? 0           : cd.m_flank;
+    cr.m_common = cd.flank_is_common ? cd.m_flank  : cd.m_common;
     cr.cat_name = cd.cat_name; cr.cat_m = cd.cat_m;
     cr.vg.assign(A, std::vector<double>(P, NA_REAL));
     cr.se_vg.assign(A, std::vector<double>(P, NA_REAL));
@@ -1667,10 +1696,16 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     pr.max_common_snps = max_common_snps;
     pr.spa = SPA; pr.spa_thresh = spa_pval_threshold;
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads;
-    // Annotation supplied -> per-category SPA path. There the flank/background
-    // comes from the annotation (column 1 + uncategorized middle SNPs), so
-    // flank_chunks = 0 is allowed (no neighbouring-chunk flank is read).
-    if (ctx.use_annot) return chunk_driver_annot(ctx, pr);
+    // Annotation supplied -> per-category SPA path. Every annotation column is a
+    // tested category; the background comes from the adjacent chunks and/or the
+    // common SNPs, so with flank_chunks = 0 a common fileset is required.
+    if (ctx.use_annot) {
+        if (flank_chunks < 1 && !ctx.use_common)
+            stop("flank_chunks = 0 requires common_filename: every annotation column is a "
+                 "tested category, so with no flanking chunks there would be no background "
+                 "component and every chunk would be skipped");
+        return chunk_driver_annot(ctx, pr);
+    }
     // No annotation: the model still needs SOME background component, but that can
     // come either from the neighbouring chunks (flank_chunks >= 1) or, when
     // flank_chunks = 0, from the common-SNP set. One of the two must be present.
