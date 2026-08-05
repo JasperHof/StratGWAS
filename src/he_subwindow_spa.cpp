@@ -746,7 +746,14 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     const int n = (int) Y.rows(), P = (int) Y.cols();
     const int K = cd.K, m_t = cd.m_t, m_f = cd.m_f, m_c = cd.m_c;
     const bool has_c = (m_c > 0);
-    const int C = has_c ? 3 : 2, env = C;
+    // Components present, in V-column order: target (always), flank (if any),
+    // common (if any). Built dynamically so the model degrades gracefully when
+    // there is no background at all -- flank_chunks = 0 with no common fileset
+    // leaves { target, sigma_e I }, which is unconditioned but still estimable.
+    std::vector<int> off;  off.push_back(0);  off.push_back(m_t);
+    if (m_f > 0) off.push_back(m_t + m_f);
+    if (m_c > 0) off.push_back(m_t + m_f + m_c);
+    const int C = (int) off.size() - 1, env = C;
 
     cr.chr = cd.chr; cr.start = cd.start; cr.end = cd.end;
     // Report honestly: when flank_chunks = 0 the flank block holds the common SNPs.
@@ -756,7 +763,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     cr.vg.assign(P, NA_REAL); cr.se_vg.assign(P, NA_REAL);
     cr.h2.assign(P, NA_REAL); cr.p_spa.assign(P, NA_REAL);
     cr.spa_used.assign(P, 0);
-    if (m_t <= 0 || m_f <= 0) return;
+    if (m_t <= 0) return;
 
     // ---- Gram matrix (K x K, K is BOUNDED by chunk_size and flank_chunks) ---
     GenoMat Gf = GenoMat::Zero(K, K);
@@ -764,27 +771,22 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     Eigen::MatrixXd G = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
     Eigen::MatrixXd G2 = G.array().square();
 
-    const int o_t = 0, o_f = m_t, o_c = m_t + m_f;
-    double tr_t = 0, tr_f = 0, tr_c = 0;
-    for (int j = 0; j < m_t; ++j) tr_t += cd.cj[o_t + j];
-    for (int j = 0; j < m_f; ++j) tr_f += cd.cj[o_f + j];
-    for (int j = 0; j < m_c; ++j) tr_c += cd.cj[o_c + j];
-    if (!(tr_t > 0.0) || !(tr_f > 0.0)) return;
-
     std::vector<double> g(C);
-    g[0] = (double) n / tr_t; g[1] = (double) n / tr_f;
-    if (has_c) { if (!(tr_c > 0.0)) return; g[2] = (double) n / tr_c; }
+    for (int a = 0; a < C; ++a) {
+        double tr = 0.0;
+        for (int j = off[a]; j < off[a + 1]; ++j) tr += cd.cj[j];
+        if (!(tr > 0.0)) return;
+        g[a] = (double) n / tr;
+    }
 
     // ---- moment matrix T:  tr(S_a S_b) = ||G[A,B]||_F^2 ---------------------
     Eigen::MatrixXd T = Eigen::MatrixXd::Zero(C + 1, C + 1);
-    T(0,0) = g[0]*g[0]*G2.block(o_t,o_t,m_t,m_t).sum();
-    T(1,1) = g[1]*g[1]*G2.block(o_f,o_f,m_f,m_f).sum();
-    T(0,1) = T(1,0) = g[0]*g[1]*G2.block(o_t,o_f,m_t,m_f).sum();
-    if (has_c) {
-        T(2,2) = g[2]*g[2]*G2.block(o_c,o_c,m_c,m_c).sum();
-        T(0,2) = T(2,0) = g[0]*g[2]*G2.block(o_t,o_c,m_t,m_c).sum();
-        T(1,2) = T(2,1) = g[1]*g[2]*G2.block(o_f,o_c,m_f,m_c).sum();
-    }
+    for (int a = 0; a < C; ++a)
+        for (int b = a; b < C; ++b) {
+            double v = g[a] * g[b] *
+                G2.block(off[a], off[b], off[a+1]-off[a], off[b+1]-off[b]).sum();
+            T(a,b) = v; T(b,a) = v;
+        }
     for (int a = 0; a < C; ++a) { T(a,env) = (double) n; T(env,a) = (double) n; }
     T(env,env) = (double) n;
     Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
@@ -809,7 +811,6 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     // trait, so hoisting them out of the trait loop turns two O(K^3) triple
     // products PER TRAIT into O(C K^2) linear combinations. Benchmarked 3.86x
     // at K=1168, C=3, P=20 (see the companion note).
-    const int off[4] = { 0, m_t, m_t + m_f, K };
     std::vector<Eigen::MatrixXd> W;
     bool use_wcache = spa && have_L && ((double) C * K * K * 8.0 <= 6e8);
     if (use_wcache) {
@@ -846,11 +847,11 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     for (int t = 0; t < P; ++t) {
         const Eigen::VectorXd u = U.col(t);
         Eigen::VectorXd q(C + 1);
-        double q_t = 0, q_f = 0, q_c = 0;
-        for (int j = 0; j < m_t; ++j) q_t += u[o_t+j]*u[o_t+j];
-        for (int j = 0; j < m_f; ++j) q_f += u[o_f+j]*u[o_f+j];
-        for (int j = 0; j < m_c; ++j) q_c += u[o_c+j]*u[o_c+j];
-        q[0] = g[0]*q_t; q[1] = g[1]*q_f; if (has_c) q[2] = g[2]*q_c;
+        for (int a = 0; a < C; ++a) {
+            double qa = 0.0;
+            for (int j = off[a]; j < off[a + 1]; ++j) qa += u[j] * u[j];
+            q[a] = g[a] * qa;
+        }
         q[env] = yty[t];                    // constant across chunks; hoisted
 
         Eigen::VectorXd sigma = Tcod.solve(q);
@@ -1033,11 +1034,12 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     // background does not. It halves K, and the Gram is O(n K^2), so it is close to
     // a 4x saving on the dominant cost. Do NOT use this for common-variant targets,
     // where local LD is real and the flank is doing genuine work.
-    if (cd.m_f <= 0) {
-        if (cd.m_c <= 0) return false;                 // no background at all
+    if (cd.m_f <= 0 && cd.m_c > 0) {
         cd.flank_is_common = true;
         cd.m_f = cd.m_c; cd.m_c = 0;                   // common occupies the flank block
     }
+    // If both are zero the model is just { target, sigma_e I }: unconditioned, but
+    // still estimable, so the chunk is kept rather than skipped.
     cd.K = cd.m_t + cd.m_f + cd.m_c;
 
     cd.V = GenoMat(ctx.n_inds, cd.K);
@@ -1701,16 +1703,20 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     // common SNPs, so with flank_chunks = 0 a common fileset is required.
     if (ctx.use_annot) {
         if (flank_chunks < 1 && !ctx.use_common)
-            stop("flank_chunks = 0 requires common_filename: every annotation column is a "
-                 "tested category, so with no flanking chunks there would be no background "
-                 "component and every chunk would be skipped");
+            Rcpp::warning("flank_chunks = 0 with no common_filename: the only background "
+                          "left is middle SNPs belonging to no annotation category. If the "
+                          "annotation covers every SNP, each category is conditioned only on "
+                          "the other categories -- estimates will absorb regional background "
+                          "and are expected to be inflated.");
         return chunk_driver_annot(ctx, pr);
     }
     // No annotation: the model still needs SOME background component, but that can
     // come either from the neighbouring chunks (flank_chunks >= 1) or, when
     // flank_chunks = 0, from the common-SNP set. One of the two must be present.
     if (flank_chunks < 1 && !ctx.use_common)
-        stop("flank_chunks = 0 requires common_filename: with no annotation and no "
-             "flanking chunks, the common SNPs are the only possible background component");
+        Rcpp::warning("flank_chunks = 0 with no common_filename: there is NO background "
+                      "component, so the model is just { target, sigma_e I }. Each chunk's "
+                      "variance is unconditioned on its neighbours or on regional structure, "
+                      "so vg is expected to be inflated. Intended for testing only.");
     return chunk_driver(ctx, pr);
 }
