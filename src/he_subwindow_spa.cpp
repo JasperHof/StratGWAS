@@ -718,6 +718,10 @@ struct ChunkData {
     int i0_target, m_t, m_f, m_c, K;   // target / flank / common column counts
     GenoMat V;                          // n x K = [target | flank | common]
     std::vector<double> cj;             // ||v_j||^2 per column
+    // When flank_chunks = 0 the common SNPs ARE the background component, so they
+    // occupy the flank block of V. Only affects how the columns are reported.
+    bool flank_is_common;
+    ChunkData() : i0_target(0), m_t(0), m_f(0), m_c(0), K(0), flank_is_common(false) {}
 };
 
 struct ChunkResult {
@@ -740,7 +744,10 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     const int C = has_c ? 3 : 2, env = C;
 
     cr.chr = cd.chr; cr.start = cd.start; cr.end = cd.end;
-    cr.m_t = m_t; cr.m_f = m_f; cr.m_c = m_c;
+    // Report honestly: when flank_chunks = 0 the flank block holds the common SNPs.
+    cr.m_t = m_t;
+    cr.m_f = cd.flank_is_common ? 0   : m_f;
+    cr.m_c = cd.flank_is_common ? m_f : m_c;
     cr.vg.assign(P, NA_REAL); cr.se_vg.assign(P, NA_REAL);
     cr.h2.assign(P, NA_REAL); cr.p_spa.assign(P, NA_REAL);
     cr.spa_used.assign(P, 0);
@@ -978,7 +985,8 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
                      if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
                      apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
     cd.m_f = (int) fl.X.cols() + (int) fr.X.cols();
-    if (cd.m_f <= 0) return false;
+    // NOTE: the "no background" bail-out now happens AFTER the common set is read,
+    // because with flank_chunks = 0 the common SNPs take over as the background.
 
     Cell com; com.X = GenoMat(ctx.n_inds, 0);
     if (ctx.use_common) {
@@ -1011,14 +1019,31 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
         }
     }
     cd.m_c = (int) com.X.cols();
+
+    // ---- flank_chunks = 0: the common SNPs BECOME the background component ----
+    // The model is then { target, common, sigma_e I } rather than
+    // { target, flank, common, sigma_e I }. For rare variants this costs nothing:
+    // cross-chunk LD between rare variants is negligible (mean |r| ~ 0.013 in
+    // simulation, flat with distance), so the flank absorbs no signal the common
+    // background does not. It halves K, and the Gram is O(n K^2), so it is close to
+    // a 4x saving on the dominant cost. Do NOT use this for common-variant targets,
+    // where local LD is real and the flank is doing genuine work.
+    if (cd.m_f <= 0) {
+        if (cd.m_c <= 0) return false;                 // no background at all
+        cd.flank_is_common = true;
+        cd.m_f = cd.m_c; cd.m_c = 0;                   // common occupies the flank block
+    }
     cd.K = cd.m_t + cd.m_f + cd.m_c;
 
     cd.V = GenoMat(ctx.n_inds, cd.K);
     cd.V.leftCols(cd.m_t) = tgt.X;
     int off = cd.m_t;
-    if (fl.X.cols() > 0) { cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols(); }
-    if (fr.X.cols() > 0) { cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols(); }
-    if (cd.m_c > 0) cd.V.rightCols(cd.m_c) = com.X;
+    if (cd.flank_is_common) { cd.V.middleCols(off, cd.m_f) = com.X; off += cd.m_f; }
+    else {
+        if (fl.X.cols() > 0) { cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols(); }
+        if (fr.X.cols() > 0) { cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols(); }
+        if (cd.m_c > 0) cd.V.rightCols(cd.m_c) = com.X;
+    }
 
     cd.cj.resize(cd.K);
     for (int j = 0; j < cd.K; ++j) cd.cj[j] = cd.V.col(j).cast<double>().squaredNorm();
@@ -1149,6 +1174,13 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     Rcout << "  K_tot per chunk <= " << Kmax
           << "  (" << (pr.chunk_size * (1 + 2 * pr.flank_chunks)) << " WES + <= "
           << pr.max_common_snps << " common)\n";
+    if (pr.flank_chunks == 0)
+        Rcout << "  flank_chunks = 0: the common SNPs are the background component.\n"
+              << "  Model is { target, common, sigma_e I }. Since the Gram is O(n K^2),\n"
+              << "  this is ~" << (double)(pr.chunk_size*3 + pr.max_common_snps)
+                                  *(pr.chunk_size*3 + pr.max_common_snps)
+                                  /((double)Kmax*Kmax)
+              << "x cheaper than flank_chunks = 1. Appropriate for RARE targets only.\n";
     report_parallel_plan(ctx, pr, Kmax, 3);
     if (ctx.use_common) {
         if (pr.common_window_given)
@@ -1610,7 +1642,7 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         double alpha_common = -1.0,
                         Rcpp::Nullable<Rcpp::String> common_filename = R_NilValue,
                         double common_window = NA_REAL,
-                        int max_common_snps = 400,
+                        int max_common_snps = 256,
                         std::string out_file = "",
                         int batch_size = 64,
                         int n_threads = 0,
@@ -1639,8 +1671,11 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     // comes from the annotation (column 1 + uncategorized middle SNPs), so
     // flank_chunks = 0 is allowed (no neighbouring-chunk flank is read).
     if (ctx.use_annot) return chunk_driver_annot(ctx, pr);
-    // No annotation: the neighbouring chunks are the ONLY background, so at
-    // least one flank chunk is required.
-    if (flank_chunks < 1) stop("flank_chunks must be >= 1 when no annotation is given (the model needs a background component)");
+    // No annotation: the model still needs SOME background component, but that can
+    // come either from the neighbouring chunks (flank_chunks >= 1) or, when
+    // flank_chunks = 0, from the common-SNP set. One of the two must be present.
+    if (flank_chunks < 1 && !ctx.use_common)
+        stop("flank_chunks = 0 requires common_filename: with no annotation and no "
+             "flanking chunks, the common SNPs are the only possible background component");
     return chunk_driver(ctx, pr);
 }
