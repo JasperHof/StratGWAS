@@ -1357,11 +1357,13 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
 
     // flank_chunks = 0 (or no uncategorized middle SNPs): the common set becomes
     // the background component, exactly as in the no-annotation path.
-    if (m_flank <= 0) {
-        if (m_c <= 0) return false;                // no background at all
+    if (m_flank <= 0 && m_c > 0) {
         cd.flank_is_common = true;
         m_flank = m_c; m_c = 0;
     }
+    // If both are zero the model is { cat_0, ..., cat_{A-1}, sigma_e I }: each
+    // category is conditioned only on the other categories. Unconditioned on any
+    // regional background, but still estimable, so keep the chunk.
 
     int Kt = 0; for (size_t k = 0; k < act.size(); ++k) Kt += (int) cat_cols[act[k]].size();
     cd.K = Kt + m_flank + m_c;
@@ -1389,7 +1391,7 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
 }
 
 // Multi-category SPA test. Components: 0..A-1 categories (tested), A flank,
-// A+1 common (if any), env residual. Mirrors test_chunk but loops the SPA over
+// then flank (if any), then common (if any), env residual. Mirrors test_chunk but loops the SPA over
 // the A categories, reusing the single per-chunk Cholesky.
 static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
                              const std::vector<double>& Vp, const std::vector<double>& yty,
@@ -1397,8 +1399,12 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                              ChunkResultA& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
     const int A = (int) cd.cat_m.size();
+    const bool has_f = (cd.m_flank  > 0);
     const bool has_c = (cd.m_common > 0);
-    const int C = A + 1 + (has_c ? 1 : 0), env = C;   // +1 flank, +1 common
+    // Components: the A tested categories, then flank and common ONLY if present.
+    // Built this way so flank_chunks = 0 with a complete annotation and no common
+    // fileset still runs, as { cat_0, ..., cat_{A-1}, sigma_e I }.
+    const int C = A + (has_f ? 1 : 0) + (has_c ? 1 : 0), env = C;
 
     cr.chr = cd.chr; cr.start = cd.start; cr.end = cd.end;
     // Report honestly when the common set is standing in as the background.
@@ -1410,13 +1416,14 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     cr.h2.assign(A, std::vector<double>(P, NA_REAL));
     cr.p_spa.assign(A, std::vector<double>(P, NA_REAL));
     cr.spa_used.assign(A, std::vector<int>(P, 0));
-    if (A <= 0 || cd.m_flank <= 0) return;
+    if (A <= 0) return;
 
-    // component column offsets in V: cats, then flank, then common
+    // component column offsets in V: cats, then flank (if any), then common (if any)
     std::vector<int> off(C + 1, 0);
     for (int c = 0; c < A; ++c) off[c + 1] = off[c] + cd.cat_m[c];
-    off[A + 1] = off[A] + cd.m_flank;
-    if (has_c) off[A + 2] = off[A + 1] + cd.m_common;
+    int nx = A;
+    if (has_f) { off[nx + 1] = off[nx] + cd.m_flank;  ++nx; }
+    if (has_c) { off[nx + 1] = off[nx] + cd.m_common; ++nx; }
 
     GenoMat Gf = GenoMat::Zero(K, K);
     Gf.selfadjointView<Eigen::Upper>().rankUpdate(cd.V.transpose());
