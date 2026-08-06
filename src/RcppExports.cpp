@@ -252,8 +252,8 @@ BEGIN_RCPP
 END_RCPP
 }
 // he_chunk_spa
-Rcpp::List he_chunk_spa(const std::string& filename, const SEXP pheno_mat, int chunk_size, int flank_chunks, int min_chunk_snps, double alpha, double alpha_common, Rcpp::Nullable<Rcpp::String> common_filename, double common_window, int max_common_snps, std::string out_file, int batch_size, int n_threads, Rcpp::Nullable<Rcpp::NumericVector> weights, Rcpp::Nullable<Rcpp::NumericMatrix> covariates, bool SPA, double spa_pval_threshold, Rcpp::Nullable<Rcpp::IntegerMatrix> annotation, Rcpp::Nullable<Rcpp::CharacterVector> annot_names);
-RcppExport SEXP _StratGWAS_he_chunk_spa(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP chunk_sizeSEXP, SEXP flank_chunksSEXP, SEXP min_chunk_snpsSEXP, SEXP alphaSEXP, SEXP alpha_commonSEXP, SEXP common_filenameSEXP, SEXP common_windowSEXP, SEXP max_common_snpsSEXP, SEXP out_fileSEXP, SEXP batch_sizeSEXP, SEXP n_threadsSEXP, SEXP weightsSEXP, SEXP covariatesSEXP, SEXP SPASEXP, SEXP spa_pval_thresholdSEXP, SEXP annotationSEXP, SEXP annot_namesSEXP) {
+Rcpp::List he_chunk_spa(const std::string& filename, const SEXP pheno_mat, int chunk_size, int flank_chunks, int min_chunk_snps, double alpha, double alpha_common, Rcpp::Nullable<Rcpp::String> common_filename, double common_window, int max_common_snps, std::string out_file, int batch_size, int n_threads, Rcpp::Nullable<Rcpp::NumericVector> weights, Rcpp::Nullable<Rcpp::NumericMatrix> covariates, bool SPA, double spa_pval_threshold, bool binary, Rcpp::Nullable<Rcpp::IntegerMatrix> annotation, Rcpp::Nullable<Rcpp::CharacterVector> annot_names);
+RcppExport SEXP _StratGWAS_he_chunk_spa(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP chunk_sizeSEXP, SEXP flank_chunksSEXP, SEXP min_chunk_snpsSEXP, SEXP alphaSEXP, SEXP alpha_commonSEXP, SEXP common_filenameSEXP, SEXP common_windowSEXP, SEXP max_common_snpsSEXP, SEXP out_fileSEXP, SEXP batch_sizeSEXP, SEXP n_threadsSEXP, SEXP weightsSEXP, SEXP covariatesSEXP, SEXP SPASEXP, SEXP spa_pval_thresholdSEXP, SEXP binarySEXP, SEXP annotationSEXP, SEXP annot_namesSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -274,9 +274,10 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::NumericMatrix> >::type covariates(covariatesSEXP);
     Rcpp::traits::input_parameter< bool >::type SPA(SPASEXP);
     Rcpp::traits::input_parameter< double >::type spa_pval_threshold(spa_pval_thresholdSEXP);
+    Rcpp::traits::input_parameter< bool >::type binary(binarySEXP);
     Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::IntegerMatrix> >::type annotation(annotationSEXP);
     Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::CharacterVector> >::type annot_names(annot_namesSEXP);
-    rcpp_result_gen = Rcpp::wrap(he_chunk_spa(filename, pheno_mat, chunk_size, flank_chunks, min_chunk_snps, alpha, alpha_common, common_filename, common_window, max_common_snps, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold, annotation, annot_names));
+    rcpp_result_gen = Rcpp::wrap(he_chunk_spa(filename, pheno_mat, chunk_size, flank_chunks, min_chunk_snps, alpha, alpha_common, common_filename, common_window, max_common_snps, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold, binary, annotation, annot_names));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -367,7 +368,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_he_multi_part", (DL_FUNC) &_StratGWAS_he_multi_part, 3},
     {"_StratGWAS_he_sliding_window_part", (DL_FUNC) &_StratGWAS_he_sliding_window_part, 20},
     {"_StratGWAS_reml_sliding_window_part", (DL_FUNC) &_StratGWAS_reml_sliding_window_part, 20},
-    {"_StratGWAS_he_chunk_spa", (DL_FUNC) &_StratGWAS_he_chunk_spa, 19},
+    {"_StratGWAS_he_chunk_spa", (DL_FUNC) &_StratGWAS_he_chunk_spa, 20},
     {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 2},
     {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},
     {"_StratGWAS_linear_gwas_parallel", (DL_FUNC) &_StratGWAS_linear_gwas_parallel, 4},

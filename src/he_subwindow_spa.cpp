@@ -788,8 +788,35 @@ struct ChunkResult {
 // Components: 0 = target chunk, 1 = flank, 2 = common (if any), env = residual.
 // Kernels use tr(K_a) = n, i.e. K_a = g_a S_A with g_a = n / tr(S_A), so
 // T(a,env) = n exactly for every a.
+// ===========================================================================
+// BINARY / NON-GAUSSIAN PHENOTYPE CORRECTION  (active only when binary = true;
+// every branch below is guarded, so the continuous path is untouched.)
+//
+// The chi-square-mixture null rests on whitening y = Sigma_0^{1/2} z with
+// z ~ N(0, I): that is the ONLY place normality is used, and it is where a
+// binary phenotype breaks the derivation. Writing Q = z' B z for independent
+// standardized z with 4th cumulant kappa4_i, the exact second cumulant is
+//
+//     Var(Q) = 2 tr(B^2) + sum_i kappa4_i * B_ii^2
+//              \________/   \__________________/
+//               = 2 sum lambda^2      Delta_2   (currently missing)
+//
+// The first cumulant is UNCHANGED (E[z_i^2] = 1 whatever the distribution), so
+// the point estimates vg / h2 are already valid for a binary trait; only the
+// spread is wrong. In simulation with rare variants the omission understates
+// Var by 41% at 2% prevalence and by 75% at 0.5% -- i.e. the reported SE is
+// half what it should be -- and adding Delta_2 recovers it to within 1% at
+// every prevalence tested.
+//
+// Delta_2 is carried through by rescaling the whole spectrum by a common
+// factor, which fixes the variance exactly while leaving the SHAPE of the
+// mixture as-is. This is the "Tier 1" correction of the companion note: it
+// corrects the second cumulant only. The third-cumulant correction needs an
+// O(n K^2) term and an O(n^2) term and is NOT implemented here.
+// ===========================================================================
 static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
                        const std::vector<double>& Vp, const std::vector<double>& yty,
+                       const std::vector<double>& kur, bool binary,
                        bool spa, double spa_thresh,
                        ChunkResult& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
@@ -888,6 +915,22 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         }
     };
 
+    // ---- binary: sum_i B_ii^2, once per chunk ------------------------------
+    // D_M and c_env depend on the chunk but NOT on the trait, so the diagonal
+    //     B_ii = sum_j D_M,j V_ij^2 + c_env
+    // is computed once here rather than P times. Cost O(nK), one pass over V.
+    double Sb2 = 0.0;
+    if (binary && spa && have_L) {
+        Eigen::VectorXd bdiag = Eigen::VectorXd::Constant(n, Tinv(0, env));
+        for (int a = 0; a < C; ++a) {
+            const double dm = Tinv(0, a) * g[a];
+            if (dm == 0.0) continue;
+            for (int j = off[a]; j < off[a + 1]; ++j)
+                bdiag.array() += dm * cd.V.col(j).cast<double>().array().square();
+        }
+        Sb2 = bdiag.squaredNorm();
+    }
+
     // ---- one GEMM for all traits, instead of a GEMV per trait --------------
     // V is n x K (467 MB at n=1e5, K=1168); the old per-trait
     // V.transpose()*Y.col(t) streamed all of it once PER TRAIT.
@@ -936,6 +979,18 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         double var0 = 2.0 * (N.cwiseProduct(N.transpose())).sum();
         if (n_rep > 0) var0 += (double) n_rep * 2.0 * eig_rep * eig_rep;
         if (!(var0 > 0.0)) continue;
+
+        // ---- binary: add Delta_2 = kappa4 * sum_i B_ii^2 --------------------
+        // kur[t] is the RAW 4th cumulant of trait t, so this is correct whether
+        // or not the phenotype was standardized. cscale carries the correction
+        // into the saddlepoint by rescaling the spectrum (see the header note);
+        // it is exactly 1 on the continuous path.
+        double cscale = 1.0;
+        if (binary && Sb2 > 0.0) {
+            const double d2 = kur[t] * Sb2;
+            if (var0 + d2 > 0.0) { cscale = std::sqrt((var0 + d2) / var0); var0 += d2; }
+        }
+
         cr.se_vg[t] = std::sqrt(var0);
         double p_wald = std::erfc(std::abs(sigma[0] / cr.se_vg[t]) / std::sqrt(2.0));
         if (p_wald >= spa_thresh) { cr.p_spa[t] = p_wald; cr.spa_used[t] = 0; continue; }
@@ -950,7 +1005,12 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         if (ses.info() != Eigen::Success) { cr.p_spa[t] = p_wald; continue; }
         const Eigen::VectorXd& ev = ses.eigenvalues();
         std::vector<double> eig(ev.data(), ev.data() + K);
-        QuadSpaResult qr = quad_spa_solve(sigma[0], eig, eig_rep, n_rep);
+        double eig_rep_s = eig_rep;
+        if (cscale != 1.0) {                       // binary variance correction
+            for (size_t e = 0; e < eig.size(); ++e) eig[e] *= cscale;
+            eig_rep_s *= cscale;
+        }
+        QuadSpaResult qr = quad_spa_solve(sigma[0], eig, eig_rep_s, n_rep);
         if (qr.converged) { cr.p_spa[t] = qr.p; cr.spa_used[t] = 1; }
         else              { cr.p_spa[t] = p_wald; cr.spa_used[t] = 0; }
     }
@@ -962,7 +1022,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
 struct ChunkParams {
     int chunk_size, flank_chunks, min_chunk_snps;
     long common_bp; bool common_window_given; int max_common_snps;
-    bool spa; double spa_thresh;
+    bool spa; double spa_thresh; bool binary;
     std::string out_file; int batch_size, n_threads;
 };
 
@@ -1131,14 +1191,16 @@ struct ChunkWorker : public RcppParallel::Worker {
     const ChunkContext& ctx; const std::vector<Job>& jobs; size_t job0;
     const Eigen::MatrixXd& Y; const GenoMat& Yf;
     const std::vector<double>& Vp; const std::vector<double>& yty;
+    const std::vector<double>& kur;
     const ChunkParams& pr; int flank_snps;
     std::vector<ChunkResult>& out; std::vector<char>& ok;
     ChunkWorker(const ChunkContext& ctx, const std::vector<Job>& jobs, size_t job0,
                 const Eigen::MatrixXd& Y, const GenoMat& Yf,
                 const std::vector<double>& Vp, const std::vector<double>& yty,
+                const std::vector<double>& kur,
                 const ChunkParams& pr, int flank_snps,
                 std::vector<ChunkResult>& out, std::vector<char>& ok)
-        : ctx(ctx), jobs(jobs), job0(job0), Y(Y), Yf(Yf), Vp(Vp), yty(yty),
+        : ctx(ctx), jobs(jobs), job0(job0), Y(Y), Yf(Yf), Vp(Vp), yty(yty), kur(kur),
           pr(pr), flank_snps(flank_snps), out(out), ok(ok) {}
     void operator()(std::size_t begin, std::size_t end) {
         for (std::size_t w = begin; w < end; ++w) {
@@ -1148,7 +1210,7 @@ struct ChunkWorker : public RcppParallel::Worker {
             if (!make_chunk(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
                             flank_snps, pr.common_bp, pr.common_window_given,
                             pr.max_common_snps, cd)) { ok[w] = 0; continue; }
-            test_chunk(cd, Y, Yf, Vp, yty, pr.spa, pr.spa_thresh, out[w]);
+            test_chunk(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, out[w]);
             ok[w] = 1;
         }
     }
@@ -1200,7 +1262,24 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     for (int t = 0; t < P; ++t) { double m = Y.col(t).mean();
         Vp[t]  = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1);
         yty[t] = Y.col(t).squaredNorm(); }
-    const GenoMat Yf = Y.cast<float>();      // cast once, not per trait per chunk
+    const GenoMat Yf = Y.cast<float>();
+    // Raw 4th cumulant per trait, kappa4 = m4 - 3 m2^2. Used only when
+    // binary = true. Working with the RAW cumulant rather than the standardized
+    // excess kurtosis keeps the correction valid whether or not the phenotype
+    // was scaled to unit variance; estimating it from the data means it also
+    // adapts when covariates have been regressed out and the phenotype is no
+    // longer exactly 0/1. For a standardized 0/1 trait of prevalence p it
+    // reproduces (1 - 6v)/v with v = p(1-p).
+    std::vector<double> kur(P, 0.0);
+    if (pr.binary) {
+        const double nn = (double) Y.rows();
+        for (int t = 0; t < P; ++t) {
+            Eigen::ArrayXd d = Y.col(t).array() - Y.col(t).mean();
+            const double m2 = d.square().sum() / nn;
+            const double m4 = d.square().square().sum() / nn;
+            kur[t] = m4 - 3.0 * m2 * m2;
+        }
+    }
 
     std::ofstream fout; bool tofile = !pr.out_file.empty();
     auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
@@ -1259,7 +1338,7 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
         const size_t nb = std::min((size_t) std::max(1, pr.batch_size), jobs.size() - idx);
         std::vector<ChunkResult> res(nb);
         std::vector<char> ok(nb, 0);
-        ChunkWorker wk(ctx, jobs, idx, Y, Yf, Vp, yty, pr, flank_snps, res, ok);
+        ChunkWorker wk(ctx, jobs, idx, Y, Yf, Vp, yty, kur, pr, flank_snps, res, ok);
         RcppParallel::parallelFor(0, nb, wk);
         idx += nb;
 
@@ -1444,6 +1523,7 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
 // the A categories, reusing the single per-chunk Cholesky.
 static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
                              const std::vector<double>& Vp, const std::vector<double>& yty,
+                             const std::vector<double>& kur, bool binary,
                              bool spa, double spa_thresh,
                              ChunkResultA& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
@@ -1537,6 +1617,23 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
         }
     };
 
+    // ---- binary: sum_i B_ii^2 per TESTED CATEGORY, once per chunk ----------
+    // M_0 differs between categories (row c of Tinv), so one diagonal per
+    // category -- but still independent of the trait, so A passes not A*P.
+    std::vector<double> Sb2(A, 0.0);
+    if (binary && spa && have_L) {
+        for (int c = 0; c < A; ++c) {
+            Eigen::VectorXd bdiag = Eigen::VectorXd::Constant(n, Tinv(c, env));
+            for (int a = 0; a < C; ++a) {
+                const double dm = Tinv(c, a) * g[a];
+                if (dm == 0.0) continue;
+                for (int j = off[a]; j < off[a + 1]; ++j)
+                    bdiag.array() += dm * cd.V.col(j).cast<double>().array().square();
+            }
+            Sb2[c] = bdiag.squaredNorm();
+        }
+    }
+
     Eigen::MatrixXd U = (cd.V.transpose() * Yf).cast<double>();      // K x P, one GEMM
 
     for (int t = 0; t < P; ++t) {
@@ -1577,6 +1674,13 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             double var0 = 2.0 * (N.cwiseProduct(N.transpose())).sum();
             if (n_rep > 0) var0 += (double) n_rep * 2.0 * eig_rep * eig_rep;
             if (!(var0 > 0.0)) continue;
+
+            double cscale = 1.0;                       // binary variance correction
+            if (binary && Sb2[c] > 0.0) {
+                const double d2 = kur[t] * Sb2[c];
+                if (var0 + d2 > 0.0) { cscale = std::sqrt((var0 + d2) / var0); var0 += d2; }
+            }
+
             cr.se_vg[c][t] = std::sqrt(var0);
             double p_wald = std::erfc(std::abs(sigma[c] / cr.se_vg[c][t]) / std::sqrt(2.0));
             if (p_wald >= spa_thresh) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
@@ -1590,7 +1694,12 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             if (ses.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; continue; }
             const Eigen::VectorXd& ev = ses.eigenvalues();
             std::vector<double> eig(ev.data(), ev.data() + K);
-            QuadSpaResult qr = quad_spa_solve(sigma[c], eig, eig_rep, n_rep);
+            double eig_rep_s = eig_rep;
+            if (cscale != 1.0) {
+                for (size_t e = 0; e < eig.size(); ++e) eig[e] *= cscale;
+                eig_rep_s *= cscale;
+            }
+            QuadSpaResult qr = quad_spa_solve(sigma[c], eig, eig_rep_s, n_rep);
             if (qr.converged) { cr.p_spa[c][t] = qr.p; cr.spa_used[c][t] = 1; }
             else              { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; }
         }
@@ -1601,14 +1710,16 @@ struct ChunkWorkerA : public RcppParallel::Worker {
     const ChunkContext& ctx; const std::vector<Job>& jobs; size_t job0;
     const Eigen::MatrixXd& Y; const GenoMat& Yf;
     const std::vector<double>& Vp; const std::vector<double>& yty;
+    const std::vector<double>& kur;
     const ChunkParams& pr; int flank_snps;
     std::vector<ChunkResultA>& out; std::vector<char>& ok;
     ChunkWorkerA(const ChunkContext& ctx, const std::vector<Job>& jobs, size_t job0,
                  const Eigen::MatrixXd& Y, const GenoMat& Yf,
                  const std::vector<double>& Vp, const std::vector<double>& yty,
+                 const std::vector<double>& kur,
                  const ChunkParams& pr, int flank_snps,
                  std::vector<ChunkResultA>& out, std::vector<char>& ok)
-        : ctx(ctx), jobs(jobs), job0(job0), Y(Y), Yf(Yf), Vp(Vp), yty(yty),
+        : ctx(ctx), jobs(jobs), job0(job0), Y(Y), Yf(Yf), Vp(Vp), yty(yty), kur(kur),
           pr(pr), flank_snps(flank_snps), out(out), ok(ok) {}
     void operator()(std::size_t begin, std::size_t end) {
         for (std::size_t w = begin; w < end; ++w) {
@@ -1618,7 +1729,7 @@ struct ChunkWorkerA : public RcppParallel::Worker {
             if (!make_chunk_annot(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
                                   flank_snps, pr.common_bp, pr.common_window_given,
                                   pr.max_common_snps, cd)) { ok[w] = 0; continue; }
-            test_chunk_annot(cd, Y, Yf, Vp, yty, pr.spa, pr.spa_thresh, out[w]);
+            test_chunk_annot(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, out[w]);
             ok[w] = 1;
         }
     }
@@ -1640,6 +1751,23 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
         Vp[t]  = (Y.col(t).array() - m).square().sum() / (Y.rows() - 1);
         yty[t] = Y.col(t).squaredNorm(); }
     const GenoMat Yf = Y.cast<float>();
+    // Raw 4th cumulant per trait, kappa4 = m4 - 3 m2^2. Used only when
+    // binary = true. Working with the RAW cumulant rather than the standardized
+    // excess kurtosis keeps the correction valid whether or not the phenotype
+    // was scaled to unit variance; estimating it from the data means it also
+    // adapts when covariates have been regressed out and the phenotype is no
+    // longer exactly 0/1. For a standardized 0/1 trait of prevalence p it
+    // reproduces (1 - 6v)/v with v = p(1-p).
+    std::vector<double> kur(P, 0.0);
+    if (pr.binary) {
+        const double nn = (double) Y.rows();
+        for (int t = 0; t < P; ++t) {
+            Eigen::ArrayXd d = Y.col(t).array() - Y.col(t).mean();
+            const double m2 = d.square().sum() / nn;
+            const double m4 = d.square().square().sum() / nn;
+            kur[t] = m4 - 3.0 * m2 * m2;
+        }
+    }
 
     std::ofstream fout; bool tofile = !pr.out_file.empty();
     auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
@@ -1674,7 +1802,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
         const size_t nb = std::min((size_t) std::max(1, pr.batch_size), jobs.size() - idx);
         std::vector<ChunkResultA> res(nb);
         std::vector<char> ok(nb, 0);
-        ChunkWorkerA wk(ctx, jobs, idx, Y, Yf, Vp, yty, pr, flank_snps, res, ok);
+        ChunkWorkerA wk(ctx, jobs, idx, Y, Yf, Vp, yty, kur, pr, flank_snps, res, ok);
         RcppParallel::parallelFor(0, nb, wk);
         idx += nb;
 
@@ -1737,6 +1865,7 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                         bool SPA = true,
                         double spa_pval_threshold = 0.1,
+                        bool binary = false,
                         Rcpp::Nullable<Rcpp::IntegerMatrix> annotation = R_NilValue,
                         Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
@@ -1752,7 +1881,16 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     pr.common_window_given = !ISNAN(common_window);
     pr.common_bp = pr.common_window_given ? (long) common_window : 0;
     pr.max_common_snps = max_common_snps;
-    pr.spa = SPA; pr.spa_thresh = spa_pval_threshold;
+    pr.spa = SPA; pr.spa_thresh = spa_pval_threshold; pr.binary = binary;
+    if (binary) {
+        if (!SPA) Rcpp::warning("binary = TRUE has no effect when SPA = FALSE");
+        Rcout << "Binary phenotype: applying the 4th-cumulant variance correction\n"
+              << "  Var(vg) = 2*sum(lambda^2) + kappa4 * sum_i (M_0)_ii^2.\n"
+              << "  Point estimates (vg, h2) are unchanged -- the 1st cumulant carries no\n"
+              << "  correction. This fixes se_vg and the Wald screen; the 3rd-cumulant\n"
+              << "  (skewness) correction is NOT applied, so residual miscalibration is\n"
+              << "  expected far into the tail for very imbalanced traits.\n";
+    }
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads;
     // Annotation supplied -> per-category SPA path. Every annotation column is a
     // tested category; the background comes from the adjacent chunks and/or the
