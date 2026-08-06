@@ -161,6 +161,34 @@ struct BedReader {
         }
         return true;
     }
+    // Decode an ARBITRARY (sorted) list of SNP indices. Used when a bp window has
+    // to be sub-sampled: the caller picks the columns first, so the decoded float
+    // matrix is bounded by the number of columns actually wanted rather than by
+    // however many SNPs happen to fall in the window. One seek+read per SNP, each
+    // bytes_per_snp long, so the byte buffer is bounded too.
+    bool read_raw_sel(const std::vector<int>& keep, const std::vector<int>& snps,
+                      GenoMat& X) const {
+        const int m = (int) snps.size(), nk = (int) keep.size();
+        X.resize(nk, m > 0 ? m : 0);
+        if (m <= 0) return true;
+        if (!ready) return false;
+        std::ifstream in(path.c_str(), std::ios::binary);
+        if (!in.is_open()) return false;
+        std::vector<unsigned char> row((size_t) bytes_per_snp);
+        for (int j = 0; j < m; ++j) {
+            const int s = snps[j];
+            if (s < 0 || s >= n_snps) return false;
+            in.seekg((std::streamoff) 3 + (std::streamoff) s * bytes_per_snp, std::ios::beg);
+            in.read((char*) row.data(), (std::streamsize) bytes_per_snp);
+            if (in.gcount() != (std::streamsize) bytes_per_snp) return false;
+            float* col = X.data() + (size_t) j * (size_t) nk;
+            for (int i = 0; i < nk; ++i) {
+                const int gi = keep[i];
+                col[i] = code2val[(row[gi >> 2] >> ((gi & 3) << 1)) & 3];
+            }
+        }
+        return true;
+    }
 };
 
 // Learn the 4-entry decode table from readBedBlock(), then verify it on blocks
@@ -337,17 +365,38 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
 // Read a cell by bp range [cell_start, cell_start + W) within chromosome index
 // range [lo, hi] of `bim`. Used for the COMMON fileset (matched to a WES cell's
 // bp span). Thread-safe; false on I/O failure.
+// `cap` bounds the number of columns DECODED, not merely the number kept.
+//
+// This used to read every SNP in the bp window into an n x m float matrix and only
+// then hand it to thin_cell(). That transient is n_inds * m * 4 bytes with m set by
+// the local density of the common panel -- unbounded, and at n = 1e5 a dense 1 Mb
+// window holding a few thousand common SNPs costs over a gigabyte PER THREAD. Under
+// Linux overcommit the allocation succeeds and the process dies with SIGBUS on first
+// touch, part-way through a run, only in dense regions. Selecting the stride first
+// makes the decoded matrix exactly min(m, cap) columns wide.
 static bool read_cell(const BedReader& br, const BimInfo& bim,
                       const std::vector<int>& keep,
-                      int lo, int hi, long cell_start, long W, Cell& cell) {
+                      int lo, int hi, long cell_start, long W, int cap, Cell& cell) {
     cell = Cell(); cell.i0 = -1;
     if (lo < 0 || hi < lo || W <= 0) { cell.X = GenoMat(keep.size(), 0); return true; }
     int i0 = lower_index(bim.bp, lo, hi, cell_start);
     int i1 = lower_index(bim.bp, lo, hi, cell_start + W);
     int m = i1 - i0;
     if (m <= 0) { cell.X = GenoMat(keep.size(), 0); return true; }
+
+    // Same even-stride selection thin_cell() used to apply afterwards, so the set of
+    // retained SNPs -- and hence every downstream number -- is unchanged.
+    std::vector<int> sel;
+    if (cap > 0 && m > cap) {
+        const int stride = (m + cap - 1) / cap;
+        sel.reserve(cap);
+        for (int j = i0; j < i1 && (int) sel.size() < cap; j += stride) sel.push_back(j);
+    } else {
+        sel.reserve(m);
+        for (int j = i0; j < i1; ++j) sel.push_back(j);
+    }
     GenoMat X;
-    if (!br.read_raw(keep, i0, i1, X)) return false;
+    if (!br.read_raw_sel(keep, sel, X)) return false;
     standardize_capture_maf(X, cell.maf);
     cell.X = std::move(X);
     cell.i0 = i0;
@@ -1009,8 +1058,8 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
             long half = common_bp / 2;
             long lo_bp = (ctr > half) ? (ctr - half) : 0;
             if (!read_cell(ctx.com, ctx.common_bim, ctx.common_keep, cc_lo, cc_hi,
-                           lo_bp, common_bp, com)) return false;
-            thin_cell(com, max_common);
+                           lo_bp, common_bp, max_common, com)) return false;
+            thin_cell(com, max_common);   // no-op now: read_cell already capped it
         } else {
             // No window specified: take the max_common nearest common SNPs to the
             // chunk midpoint directly. K_tot is bounded by max_common exactly, so
@@ -1341,8 +1390,8 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
             long half = common_bp / 2;
             long lo_bp = (ctr > half) ? (ctr - half) : 0;
             if (!read_cell(ctx.com, ctx.common_bim, ctx.common_keep, cc_lo, cc_hi,
-                           lo_bp, common_bp, com)) return false;
-            thin_cell(com, max_common);
+                           lo_bp, common_bp, max_common, com)) return false;
+            thin_cell(com, max_common);   // no-op now: read_cell already capped it
         } else {
             std::pair<int,int> rng = nearest_snp_range(ctx.common_bim.bp, cc_lo, cc_hi, ctr, max_common);
             if (rng.second > rng.first)
