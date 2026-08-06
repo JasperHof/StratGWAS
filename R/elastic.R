@@ -199,7 +199,7 @@ he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
     n_threads   = n_threads,
     covariates  = covariates,
     SPA         = T,
-    spa_pval_threshold = 0.1,
+    spa_pval_threshold = spa_pval_threshold,
     annotation = annotation,
     annot_names = annot_names
   )
