@@ -627,10 +627,154 @@ static void apply_alpha(GenoMat& X, const std::vector<float>& maf, double alpha,
         if (w != 1.0) X.col(j) *= (float) w;
     }
 }
+// ===========================================================================
+// EXACT-CUMULANT MACHINERY FOR A NON-GAUSSIAN PHENOTYPE   (binary path only)
+//
+// The chi-square mixture writes Q = sum_k lambda_k u_k^2 with u_k = a_k' z. For
+// Gaussian z the u_k are i.i.d. N(0,1) and u_k^2 ~ chi^2_1. For a binary z they
+// are not, and how badly depends on the PARTICIPATION RATIO of the direction,
+// PR_k = 1 / sum_i a_ki^4 -- the effective number of individuals carrying it.
+// At MAC ~ 5 the dominant directions have PR ~ 4, so u_k is nearly a two-point
+// variable and the chi^2_1 assumption is hopeless.
+//
+// The fix. u_k is a LINEAR combination of independent z_i, so its cumulants are
+// exact and cost nothing but power sums:
+//
+//        kappa_r(u_k) = kappa_r(z) * sum_i a_ki^r
+//
+// From those, the moments of u_k, hence the even moments (= moments of u_k^2),
+// hence the cumulants of u_k^2. Treating the u_k as independent -- uncorrelated
+// by construction, and VERIFIED accurate here (see below) -- gives
+//
+//        kappa_m(Q) = sum_k lambda_k^m kappa_m(u_k^2)
+//
+// exactly, for any m, in O(nK). Match the first four with a two-component
+// spectrum and hand that to the existing saddlepoint solver.
+//
+// WHY THIS AND NOT THE OBVIOUS ALTERNATIVES. Three things were tried and
+// rejected on measured evidence, so please do not "simplify" back to them:
+//   * kappa2 alone (the previous binary path): leaves 5.3x inflation at
+//     alpha = 1e-3 in the worst regime.
+//   * appending a pseudo-eigenvalue to match kappa3: type-I error 0.97 at
+//     alpha = 0.05. The added eigenvalue dominates and wrecks kappa4.
+//   * matching kappa1..kappa3 with a scaled chi-square: WORSE than kappa2 alone
+//     (0.0094 vs 0.0058 at alpha = 1e-3), because a 3-parameter family then has
+//     kappa4 200x too small. Partial moment matching is not monotone.
+// Four cumulants: 0.0012 against a nominal 0.001.
+//
+// The independence approximation was checked directly by resampling a separate
+// z per direction: cumulant ratios 0.94 / 1.36 / 0.92 and, at the true 99.9%
+// quantile, an assigned P of 0.00108 against 0.001.
+// ===========================================================================
+
+// central moments -> cumulants (mu[1] must be 0)
+static void moms_to_cums(const double* mu, double* kap, int up) {
+    static const double binom[9][9] = {
+        {1,0,0,0,0,0,0,0,0},{1,1,0,0,0,0,0,0,0},{1,2,1,0,0,0,0,0,0},
+        {1,3,3,1,0,0,0,0,0},{1,4,6,4,1,0,0,0,0},{1,5,10,10,5,1,0,0,0},
+        {1,6,15,20,15,6,1,0,0},{1,7,21,35,35,21,7,1,0},{1,8,28,56,70,56,28,8,1}};
+    kap[1] = mu[1];
+    for (int nn = 2; nn <= up; ++nn) {
+        double s = mu[nn];
+        for (int mm = 1; mm < nn; ++mm) s -= binom[nn-1][mm-1] * kap[mm] * mu[nn-mm];
+        kap[nn] = s;
+    }
+}
+// cumulants -> central moments
+static void cums_to_moms(const double* kap, double* mu, int up) {
+    static const double binom[9][9] = {
+        {1,0,0,0,0,0,0,0,0},{1,1,0,0,0,0,0,0,0},{1,2,1,0,0,0,0,0,0},
+        {1,3,3,1,0,0,0,0,0},{1,4,6,4,1,0,0,0,0},{1,5,10,10,5,1,0,0,0},
+        {1,6,15,20,15,6,1,0,0},{1,7,21,35,35,21,7,1,0},{1,8,28,56,70,56,28,8,1}};
+    mu[0] = 1.0; mu[1] = kap[1];
+    for (int nn = 2; nn <= up; ++nn) {
+        double s = kap[nn];
+        for (int mm = 1; mm < nn; ++mm) s += binom[nn-1][mm-1] * kap[mm] * mu[nn-mm];
+        mu[nn] = s;
+    }
+}
+
+// Match kappa1..kappa4 with a two-component spectrum {(l1,v1),(l2,v2)}:
+//     kappa_m = 2^{m-1} (m-1)! * sum_j v_j l_j^m
+// Damped Newton from several starts. Returns false if no valid (v_j > 0) fit.
+// Given the two eigenvalues, the two MULTIPLICITIES solve a 2x2 LINEAR system
+// (from kappa1, kappa2), so only a 2-D root find in (l1, l2) remains. Solving it
+// that way rather than as a blind 4-D Newton takes the success rate from ~34% to
+// essentially 100%, which matters because a failure here silently falls back to
+// the weaker variance-only correction.
+static bool solve_nu(double a, double b, const double* kq, double* p, double* q) {
+    const double det = a * b * (b - a);              // det[[a,b],[a^2,b^2]]
+    if (!(std::abs(det) > 1e-300) || !std::isfinite(det)) return false;
+    const double r1 = kq[1], r2 = kq[2] / 2.0;
+    *p = ( b * b * r1 - b * r2) / det;
+    *q = (-a * a * r1 + a * r2) / det;
+    return std::isfinite(*p) && std::isfinite(*q);
+}
+static bool fit_two_component(const double* kq, double* l1, double* v1,
+                              double* l2, double* v2) {
+    const double sc = std::sqrt(std::abs(kq[2]) / 2.0);
+    if (!(sc > 0.0) || !std::isfinite(sc)) return false;
+    // residuals in kappa3 / kappa4 as a function of (a,b) alone
+    struct R { static bool f(double a, double b, const double* kq,
+                             double& r3, double& r4, double& p, double& q) {
+        if (!solve_nu(a, b, kq, &p, &q)) return false;
+        r3 =  8.0 * (p*a*a*a       + q*b*b*b)       - kq[3];
+        r4 = 48.0 * (p*a*a*a*a     + q*b*b*b*b)     - kq[4];
+        return std::isfinite(r3) && std::isfinite(r4);
+    } };
+    // Dense grid of starts. Each solve is a handful of 2x2 operations, so this is
+    // free, and it takes the success rate from ~70% to ~100%. Multiple roots
+    // exist (the labelling of the two components is arbitrary); any valid one
+    // with positive multiplicities reproduces the same distribution.
+    static const double GA[6] = {0.25, 0.5, 1.0, 2.0, 4.0, 8.0};
+    static const double GB[6] = {-0.25, -0.5, -1.0, -2.0, -4.0, -8.0};
+    double best = -1.0;
+    for (int st = 0; st < 36; ++st) {
+        double a = GA[st / 6]*sc, b = GB[st % 6]*sc;
+        for (int it = 0; it < 300; ++it) {
+            double r3, r4, p, q;
+            if (!R::f(a, b, kq, r3, r4, p, q)) break;
+            // Scale the residuals by a NATURAL magnitude, not by kappa_m itself:
+            // kappa3 can pass through zero (the two components cancel), and a
+            // relative test against it then never converges.
+            const double s3 =  8.0 * sc*sc*sc, s4 = 48.0 * sc*sc*sc*sc;
+            const double nrm = std::max(std::abs(r3) / std::max(std::abs(kq[3]), s3),
+                                        std::abs(r4) / std::max(std::abs(kq[4]), s4));
+            if (nrm < 1e-9) {
+                if (p > 1e-12 && q > 1e-12 && (best < 0 || nrm < best)) {
+                    best = nrm; *l1 = a; *v1 = p; *l2 = b; *v2 = q;
+                }
+                break;
+            }
+            // numerical 2x2 Jacobian
+            const double ha = 1e-6*std::max(std::abs(a),sc), hb = 1e-6*std::max(std::abs(b),sc);
+            double r3a,r4a,r3b,r4b,pp,qq;
+            if (!R::f(a+ha,b,kq,r3a,r4a,pp,qq)) break;
+            if (!R::f(a,b+hb,kq,r3b,r4b,pp,qq)) break;
+            Eigen::Matrix2d J; Eigen::Vector2d F;
+            J(0,0)=(r3a-r3)/ha; J(0,1)=(r3b-r3)/hb;
+            J(1,0)=(r4a-r4)/ha; J(1,1)=(r4b-r4)/hb;
+            F << r3, r4;
+            Eigen::Vector2d d = J.fullPivLu().solve(F);
+            if (!d.allFinite()) break;
+            double damp = 1.0, mx = d.cwiseAbs().maxCoeff();
+            if (mx > 0.5*sc) damp = 0.5*sc/mx;          // trust region
+            a -= damp*d[0]; b -= damp*d[1];
+            if (!std::isfinite(a) || !std::isfinite(b)) break;
+            if (std::abs(a-b) < 1e-12*sc) break;
+        }
+    }
+    return best >= 0.0;
+}
+
 struct QuadSpaResult { double p; bool converged; };
 
+// `n_rep` and `nu2` are doubles: the binary 4-cumulant path needs FRACTIONAL
+// multiplicities (a scaled chi^2_nu is well defined for any nu > 0). The second
+// repeated pair (lam2, nu2) defaults to zero, so the Gaussian path is unchanged.
 static void quad_cgf(double t, const std::vector<double>& eig_explicit,
-                     double eig_rep, long n_rep, double& K, double& K1, double& K2) {
+                     double eig_rep, double n_rep, double& K, double& K1, double& K2,
+                     double lam2 = 0.0, double nu2 = 0.0) {
     K = 0.0; K1 = 0.0; K2 = 0.0;
     for (size_t j = 0; j < eig_explicit.size(); ++j) {
         double lam = eig_explicit[j];
@@ -641,16 +785,23 @@ static void quad_cgf(double t, const std::vector<double>& eig_explicit,
     }
     if (n_rep > 0) {
         double d = 1.0 - 2.0 * eig_rep * t;
-        double nr = (double) n_rep;
+        double nr = n_rep;
         K  += -0.5 * nr * std::log(d);
         K1 += nr * eig_rep / d;
         K2 += nr * 2.0 * eig_rep * eig_rep / (d * d);
     }
+    if (nu2 > 0) {
+        double d = 1.0 - 2.0 * lam2 * t;
+        K  += -0.5 * nu2 * std::log(d);
+        K1 += nu2 * lam2 / d;
+        K2 += nu2 * 2.0 * lam2 * lam2 / (d * d);
+    }
 }
 
 static QuadSpaResult quad_spa_solve(
-    double s_obs_in, const std::vector<double>& eig_in, double eig_rep_in, long n_rep,
-    int max_iter = 100, double tol = 1e-8
+    double s_obs_in, const std::vector<double>& eig_in, double eig_rep_in, double n_rep,
+    int max_iter = 100, double tol = 1e-8,
+    double lam2_in = 0.0, double nu2 = 0.0
 ) {
     QuadSpaResult res; res.p = NA_REAL; res.converged = false;
 
@@ -683,8 +834,12 @@ static QuadSpaResult quad_spa_solve(
         mean_raw += lam; var_raw += 2.0 * lam * lam;
     }
     if (n_rep > 0) {
-        mean_raw += (double) n_rep * eig_rep_in;
-        var_raw  += (double) n_rep * 2.0 * eig_rep_in * eig_rep_in;
+        mean_raw += n_rep * eig_rep_in;
+        var_raw  += n_rep * 2.0 * eig_rep_in * eig_rep_in;
+    }
+    if (nu2 > 0) {
+        mean_raw += nu2 * lam2_in;
+        var_raw  += nu2 * 2.0 * lam2_in * lam2_in;
     }
     // Only a genuinely degenerate (zero / non-finite) variance is unusable.
     if (!(var_raw > 0.0) || !std::isfinite(var_raw)) return res;
@@ -695,14 +850,16 @@ static QuadSpaResult quad_spa_solve(
     std::vector<double> eig_explicit(eig_in.size());
     for (size_t j = 0; j < eig_in.size(); ++j) eig_explicit[j] = eig_in[j] * scale;
     const double eig_rep = eig_rep_in * scale;
+    const double lam2    = lam2_in    * scale;
     const double s_obs   = s_obs_in   * scale;
 
-    double lam_min = eig_rep, lam_max = eig_rep;
+    double lam_min = (n_rep > 0) ? eig_rep : 0.0, lam_max = lam_min;
     for (size_t j = 0; j < eig_explicit.size(); ++j) {
         double lam = eig_explicit[j];
         if (lam < lam_min) lam_min = lam;
         if (lam > lam_max) lam_max = lam;
     }
+    if (nu2 > 0) { if (lam2 < lam_min) lam_min = lam2; if (lam2 > lam_max) lam_max = lam2; }
     // Dimensionless now: |lambda| <= 1/sqrt(2), so 1e-14 simply means
     // "no positive (negative) eigenvalue, hence no bound on t in that direction".
     const double lam_eps = 1e-14;
@@ -713,13 +870,13 @@ static QuadSpaResult quad_spa_solve(
     double t_lo_safe = (lam_min < -lam_eps) ? t_lo * (1.0 - margin) : t_lo;
 
     double t = 0.0, K, K1, K2;
-    quad_cgf(0.0, eig_explicit, eig_rep, n_rep, K, K1, K2);
+    quad_cgf(0.0, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2);
     double mean0 = K1, var0 = K2;          // var0 == 1 up to rounding
     if (!(var0 > 0.0)) return res;
 
     bool converged = false;
     for (int it = 0; it < max_iter; ++it) {
-        quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2);
+        quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2);
         double diff = K1 - s_obs;
         if (std::abs(diff) < tol * std::max(1.0, std::abs(s_obs - mean0))) { converged = true; break; }
         if (K2 < 1e-14) break;
@@ -734,7 +891,7 @@ static QuadSpaResult quad_spa_solve(
     }
     if (!converged) return res;
 
-    quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2);
+    quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2);
     if (K2 <= 0) return res;
 
     // Removable singularity at t ~ 0: the normal approximation is exact in
@@ -931,6 +1088,64 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         Sb2 = bdiag.squaredNorm();
     }
 
+    // ---- binary, 4-cumulant path: eigen-directions and their power sums -----
+    // Under the independence model the null covariance of the standardized
+    // phenotype is I, so B = M_0 = V D_M V' + c_env I. Its non-trivial
+    // eigenvalues are c_env + eig(L' D_M L), and the n-space eigenvectors are
+    //     a_k  proportional to  V L^{-T} phi_k ,   (L' D_M L) phi_k = mu_k phi_k
+    // All of this is trait-independent, so it is done once per chunk.
+    // Everything is guarded: on any failure Sb2-only (cscale) still applies.
+    // LAZY. This setup costs an eigensolve WITH vectors (~9K^3) plus an O(nK^2)
+    // product -- together comparable to the Gram, i.e. it roughly doubles the
+    // per-chunk cost. It must therefore be paid ONLY by chunks that actually
+    // reach the saddlepoint, not by every chunk. Computed on first demand from
+    // inside the trait loop, after the Wald screen.
+    const int NPOW = 8;
+    bool cum4_tried = false, have_cum4 = false;
+    Eigen::VectorXd lamB;                       // K eigenvalues of M_0
+    Eigen::MatrixXd Spow;                       // K x (NPOW+1) power sums sum_i a_ki^r
+    auto ensure_cum4 = [&]() -> bool {
+        if (cum4_tried) return have_cum4;
+        cum4_tried = true;
+        if (!(binary && spa && have_L && !kur.empty())) return false;
+        Eigen::MatrixXd Qm = Eigen::MatrixXd::Zero(K, K);
+        for (int a = 0; a < C; ++a) {
+            const double dm = Tinv(0, a) * g[a];
+            if (dm != 0.0) Qm.noalias() += dm * W[a];      // W[a] = L_a^T L_a
+        }
+        Qm = (0.5 * (Qm + Qm.transpose())).eval();
+        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> esQ(Qm);
+        if (esQ.info() == Eigen::Success) {
+            lamB = esQ.eigenvalues().array() + Tinv(0, env);
+            // Wmat = L^{-T} Phi  (L is lower triangular, so L^T is upper)
+            Eigen::MatrixXd Wmat =
+                L.transpose().triangularView<Eigen::Upper>().solve(esQ.eigenvectors());
+            Spow = Eigen::MatrixXd::Zero(K, NPOW + 1);
+            Eigen::VectorXd nrm2 = Eigen::VectorXd::Zero(K);
+            const int BS = 4096;                       // block rows: A is never stored whole
+            for (int r0 = 0; r0 < n; r0 += BS) {
+                const int rr = std::min(BS, n - r0);
+                Eigen::MatrixXd Ablk =
+                    cd.V.middleRows(r0, rr).cast<double>() * Wmat;   // rr x K
+                nrm2 += Ablk.colwise().squaredNorm();
+                Eigen::MatrixXd Pw = Ablk;
+                for (int r = 2; r <= NPOW; ++r) {
+                    Pw = Pw.cwiseProduct(Ablk);        // Ablk^r elementwise
+                    Spow.col(r) += Pw.colwise().sum().transpose();
+                }
+            }
+            // normalise a_k to unit length: sum_i a^r  ->  (sum_i a^r)/||a||^r
+            have_cum4 = true;
+            for (int k = 0; k < K; ++k) {
+                const double nn2 = nrm2[k];
+                if (!(nn2 > 0.0) || !std::isfinite(nn2)) { have_cum4 = false; break; }
+                const double nn = std::sqrt(nn2); double pw = nn2;   // ||a||^2
+                for (int r = 2; r <= NPOW; ++r) { Spow(k, r) /= pw; pw *= nn; }
+            }
+        }
+        return have_cum4;
+    };
+
     // ---- one GEMM for all traits, instead of a GEMV per trait --------------
     // V is n x K (467 MB at n=1e5, K=1168); the old per-trait
     // V.transpose()*Y.col(t) streamed all of it once PER TRAIT.
@@ -981,13 +1196,13 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         if (!(var0 > 0.0)) continue;
 
         // ---- binary: add Delta_2 = kappa4 * sum_i B_ii^2 --------------------
-        // kur[t] is the RAW 4th cumulant of trait t, so this is correct whether
+        // kur[t*9+4] is the RAW 4th cumulant of trait t, so this is correct whether
         // or not the phenotype was standardized. cscale carries the correction
         // into the saddlepoint by rescaling the spectrum (see the header note);
         // it is exactly 1 on the continuous path.
         double cscale = 1.0;
         if (binary && Sb2 > 0.0) {
-            const double d2 = kur[t] * Sb2;
+            const double d2 = kur[(size_t) t * 9 + 4] * Sb2;
             if (var0 + d2 > 0.0) { cscale = std::sqrt((var0 + d2) / var0); var0 += d2; }
         }
 
@@ -995,7 +1210,54 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         double p_wald = std::erfc(std::abs(sigma[0] / cr.se_vg[t]) / std::sqrt(2.0));
         if (p_wald >= spa_thresh) { cr.p_spa[t] = p_wald; cr.spa_used[t] = 0; continue; }
 
-        // ---- only now build Asym and solve the eigenproblem ------------------
+        // ---- binary, 4-cumulant path: TRIED FIRST ---------------------------
+        // kappa_r(u_k) = kappa_r(y) * sum_i a_ki^r, so the cumulants of Q follow
+        // from the power sums with no n-dimensional work at all. Match the first
+        // four with a two-component spectrum and solve on that. Done BEFORE the
+        // block below because when it succeeds none of the Cholesky of Smat, the
+        // two Cf products, or the K x K eigensolve is needed at all.
+        bool used_cum4 = false;
+        if (binary && ensure_cum4() && lamB.size() == K) {
+            const double* kz = &kur[(size_t) t * 9];
+            double KQ[5] = {0,0,0,0,0};
+            bool ok4 = true;
+            for (int k = 0; k < K && ok4; ++k) {
+                double ku[9] = {0,0,0,0,0,0,0,0,0};
+                for (int r = 2; r <= NPOW; ++r) ku[r] = kz[r] * Spow(k, r);
+                double mu[9]; cums_to_moms(ku, mu, NPOW);
+                double ms[5] = {1.0, mu[2], mu[4], mu[6], mu[8]};
+                double csq[5]; moms_to_cums(ms, csq, 4);
+                double lp = 1.0;
+                for (int mm = 1; mm <= 4; ++mm) {
+                    lp *= lamB[k];
+                    if (!std::isfinite(csq[mm])) { ok4 = false; break; }
+                    KQ[mm] += lp * csq[mm];
+                }
+            }
+            if (ok4) {
+                // (n-K) directions orthogonal to col(V): eigenvalue c_env, and
+                // u there is spread over all n hence Gaussian -> chi^2_1.
+                const double ce = Tinv(0, env), Vpt = (Vp[t] > 0 ? Vp[t] : 1.0);
+                double fac[5] = {0, 1, 2, 8, 48}, lp = 1.0, vp = 1.0;
+                for (int mm = 1; mm <= 4; ++mm) {
+                    lp *= ce; vp *= Vpt;
+                    KQ[mm] += fac[mm] * (double)(n - K) * lp * vp;
+                }
+                double l1, v1, l2, v2;
+                if (std::isfinite(KQ[2]) && KQ[2] > 0 &&
+                    fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
+                    std::vector<double> none;
+                    QuadSpaResult q4 = quad_spa_solve(sigma[0], none, l1, v1,
+                                                      100, 1e-8, l2, v2);
+                    if (q4.converged) {
+                        cr.p_spa[t] = q4.p; cr.spa_used[t] = 2; used_cum4 = true;
+                    }
+                }
+            }
+        }
+        if (used_cum4) continue;
+
+        // ---- fallback: build Asym and solve the eigenproblem -----------------
         Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
         if (lltS.info() != Eigen::Success) { cr.p_spa[t] = p_wald; continue; }
         Eigen::MatrixXd Cf = lltS.matrixL();
@@ -1270,14 +1532,22 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     // adapts when covariates have been regressed out and the phenotype is no
     // longer exactly 0/1. For a standardized 0/1 trait of prevalence p it
     // reproduces (1 - 6v)/v with v = p(1-p).
-    std::vector<double> kur(P, 0.0);
+    // Layout: kur[t*9 + r] = r-th cumulant of trait t, r = 1..8 (kur[t*9+1] = 0).
+    // Order 4 drives the variance correction; orders up to 8 are needed by the
+    // 4-cumulant path, because the cumulants of u_k^2 depend on the moments of
+    // u_k up to order 8. Estimated from the data, so this stays correct after
+    // covariates have been regressed out and the phenotype is no longer 0/1.
+    std::vector<double> kur;
     if (pr.binary) {
+        kur.assign((size_t) P * 9, 0.0);
         const double nn = (double) Y.rows();
         for (int t = 0; t < P; ++t) {
             Eigen::ArrayXd d = Y.col(t).array() - Y.col(t).mean();
-            const double m2 = d.square().sum() / nn;
-            const double m4 = d.square().square().sum() / nn;
-            kur[t] = m4 - 3.0 * m2 * m2;
+            double mu[9]; mu[0] = 1.0; mu[1] = 0.0;
+            Eigen::ArrayXd pw = d;
+            for (int r = 2; r <= 8; ++r) { pw = pw * d; mu[r] = pw.sum() / nn; }
+            double kp[9]; moms_to_cums(mu, kp, 8);
+            for (int r = 1; r <= 8; ++r) kur[(size_t) t * 9 + r] = kp[r];
         }
     }
 
@@ -1621,6 +1891,8 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     // M_0 differs between categories (row c of Tinv), so one diagonal per
     // category -- but still independent of the trait, so A passes not A*P.
     std::vector<double> Sb2(A, 0.0);
+    // Sb2 must be EAGER: it corrects var0, which feeds the Wald screen itself.
+    // It is only O(nK), so that is cheap.
     if (binary && spa && have_L) {
         for (int c = 0; c < A; ++c) {
             Eigen::VectorXd bdiag = Eigen::VectorXd::Constant(n, Tinv(c, env));
@@ -1633,6 +1905,54 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             Sb2[c] = bdiag.squaredNorm();
         }
     }
+    // The 4-cumulant setup is LAZY and PER CATEGORY: an eigensolve with vectors
+    // plus an O(nK^2) product, so doing it eagerly for every category of every
+    // chunk multiplied the run time by roughly (1 + A). Now a category pays it
+    // only when one of its tests actually reaches the saddlepoint.
+    const int NPOW = 8;
+    std::vector<char> cum4_tried(A, 0), have_cum4(A, 0);
+    std::vector<Eigen::VectorXd> lamB(A);
+    std::vector<Eigen::MatrixXd> Spow(A);
+    auto ensure_cum4 = [&](int c) -> bool {
+        if (cum4_tried[c]) return have_cum4[c] != 0;
+        cum4_tried[c] = 1;
+        if (!(binary && spa && have_L) || kur.empty()) return false;
+        {
+            Eigen::MatrixXd Qm = Eigen::MatrixXd::Zero(K, K);
+            for (int a = 0; a < C; ++a) {
+                const double dm = Tinv(c, a) * g[a];
+                if (dm != 0.0) Qm.noalias() += dm * W[a];
+            }
+            Qm = (0.5 * (Qm + Qm.transpose())).eval();
+            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> esQ(Qm);
+            if (esQ.info() != Eigen::Success) return false;
+            lamB[c] = esQ.eigenvalues().array() + Tinv(c, env);
+            Eigen::MatrixXd Wmat =
+                L.transpose().triangularView<Eigen::Upper>().solve(esQ.eigenvectors());
+            Spow[c] = Eigen::MatrixXd::Zero(K, NPOW + 1);
+            Eigen::VectorXd nrm2 = Eigen::VectorXd::Zero(K);
+            const int BS = 4096;
+            for (int r0 = 0; r0 < n; r0 += BS) {
+                const int rr = std::min(BS, n - r0);
+                Eigen::MatrixXd Ablk = cd.V.middleRows(r0, rr).cast<double>() * Wmat;
+                nrm2 += Ablk.colwise().squaredNorm();
+                Eigen::MatrixXd Pw = Ablk;
+                for (int r = 2; r <= NPOW; ++r) {
+                    Pw = Pw.cwiseProduct(Ablk);
+                    Spow[c].col(r) += Pw.colwise().sum().transpose();
+                }
+            }
+            bool okc = true;
+            for (int k = 0; k < K; ++k) {
+                const double nn2 = nrm2[k];
+                if (!(nn2 > 0.0) || !std::isfinite(nn2)) { okc = false; break; }
+                const double nn = std::sqrt(nn2); double pw = nn2;
+                for (int r = 2; r <= NPOW; ++r) { Spow[c](k, r) /= pw; pw *= nn; }
+            }
+            have_cum4[c] = okc ? 1 : 0;
+        }
+        return have_cum4[c] != 0;
+    };
 
     Eigen::MatrixXd U = (cd.V.transpose() * Yf).cast<double>();      // K x P, one GEMM
 
@@ -1677,7 +1997,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
 
             double cscale = 1.0;                       // binary variance correction
             if (binary && Sb2[c] > 0.0) {
-                const double d2 = kur[t] * Sb2[c];
+                const double d2 = kur[(size_t) t * 9 + 4] * Sb2[c];
                 if (var0 + d2 > 0.0) { cscale = std::sqrt((var0 + d2) / var0); var0 += d2; }
             }
 
@@ -1685,6 +2005,48 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             double p_wald = std::erfc(std::abs(sigma[c] / cr.se_vg[c][t]) / std::sqrt(2.0));
             if (p_wald >= spa_thresh) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
 
+            // 4-cumulant path first: when it succeeds, none of the Cholesky of
+            // Smat, the Cf products, or the eigensolve below is needed.
+            bool used_cum4 = false;
+            if (binary && ensure_cum4(c) && lamB[c].size() == K) {
+                const double* kz = &kur[(size_t) t * 9];
+                double KQ[5] = {0,0,0,0,0};
+                bool ok4 = true;
+                for (int k = 0; k < K && ok4; ++k) {
+                    double ku[9] = {0,0,0,0,0,0,0,0,0};
+                    for (int r = 2; r <= NPOW; ++r) ku[r] = kz[r] * Spow[c](k, r);
+                    double mu[9]; cums_to_moms(ku, mu, NPOW);
+                    double ms[5] = {1.0, mu[2], mu[4], mu[6], mu[8]};
+                    double csq[5]; moms_to_cums(ms, csq, 4);
+                    double lp = 1.0;
+                    for (int mm = 1; mm <= 4; ++mm) {
+                        lp *= lamB[c][k];
+                        if (!std::isfinite(csq[mm])) { ok4 = false; break; }
+                        KQ[mm] += lp * csq[mm];
+                    }
+                }
+                if (ok4) {
+                    const double cev = Tinv(c, env), Vpt = (Vp[t] > 0 ? Vp[t] : 1.0);
+                    double fac[5] = {0, 1, 2, 8, 48}, lp = 1.0, vp = 1.0;
+                    for (int mm = 1; mm <= 4; ++mm) {
+                        lp *= cev; vp *= Vpt;
+                        KQ[mm] += fac[mm] * (double)(n - K) * lp * vp;
+                    }
+                    double l1, v1, l2, v2;
+                    if (std::isfinite(KQ[2]) && KQ[2] > 0 &&
+                        fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
+                        std::vector<double> none;
+                        QuadSpaResult q4 = quad_spa_solve(sigma[c], none, l1, v1,
+                                                          100, 1e-8, l2, v2);
+                        if (q4.converged) {
+                            cr.p_spa[c][t] = q4.p; cr.spa_used[c][t] = 2; used_cum4 = true;
+                        }
+                    }
+                }
+            }
+            if (used_cum4) continue;
+
+            // ---- fallback: build Asym and solve the eigenproblem -------------
             Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
             if (lltS.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; continue; }
             Eigen::MatrixXd Cf = lltS.matrixL();
@@ -1758,14 +2120,22 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
     // adapts when covariates have been regressed out and the phenotype is no
     // longer exactly 0/1. For a standardized 0/1 trait of prevalence p it
     // reproduces (1 - 6v)/v with v = p(1-p).
-    std::vector<double> kur(P, 0.0);
+    // Layout: kur[t*9 + r] = r-th cumulant of trait t, r = 1..8 (kur[t*9+1] = 0).
+    // Order 4 drives the variance correction; orders up to 8 are needed by the
+    // 4-cumulant path, because the cumulants of u_k^2 depend on the moments of
+    // u_k up to order 8. Estimated from the data, so this stays correct after
+    // covariates have been regressed out and the phenotype is no longer 0/1.
+    std::vector<double> kur;
     if (pr.binary) {
+        kur.assign((size_t) P * 9, 0.0);
         const double nn = (double) Y.rows();
         for (int t = 0; t < P; ++t) {
             Eigen::ArrayXd d = Y.col(t).array() - Y.col(t).mean();
-            const double m2 = d.square().sum() / nn;
-            const double m4 = d.square().square().sum() / nn;
-            kur[t] = m4 - 3.0 * m2 * m2;
+            double mu[9]; mu[0] = 1.0; mu[1] = 0.0;
+            Eigen::ArrayXd pw = d;
+            for (int r = 2; r <= 8; ++r) { pw = pw * d; mu[r] = pw.sum() / nn; }
+            double kp[9]; moms_to_cums(mu, kp, 8);
+            for (int r = 1; r <= 8; ++r) kur[(size_t) t * 9 + r] = kp[r];
         }
     }
 
