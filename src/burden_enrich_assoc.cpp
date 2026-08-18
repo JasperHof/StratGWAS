@@ -502,13 +502,18 @@ RegResult regress_burden(const VectorXd& burden, const std::vector<double>& y,
 //   bed_prefix     - genotype fileset the burdens are built from
 //   he_file        - out_file produced by he_sliding_window_part() /
 //                     reml_sliding_window_part(), used to derive per-category
-//                     genome-wide heritability enrichment
+//                     genome-wide heritability enrichment.
+//                     OPTIONAL: omit it (or pass "") to build PLAIN UNWEIGHTED
+//                     burdens, i.e. weight 1 for every SNP. category_file and
+//                     trait_name are then unnecessary and ignored.
 //   category_file  - two whitespace-separated columns, SNP then category
 //                     name, aligned to bed_prefix's .bim (using the same
 //                     category names as cat_names passed to the HE/REML run);
-//                     SNPs not listed are treated as "uncategorized"
+//                     SNPs not listed are treated as "uncategorized".
+//                     Required only when he_file is given.
 //   trait_name     - which phenotype column of he_file to use for enrichment
-//                     (independent of which pheno_mat column(s) are tested)
+//                     (independent of which pheno_mat column(s) are tested).
+//                     Required only when he_file is given.
 //   pheno_mat      - numeric matrix of phenotype(s) with individual IDs as
 //                     rownames (same convention as he_sliding_window_part() /
 //                     linear_gwas_parallel()); one or more columns, matched to
@@ -521,11 +526,11 @@ RegResult regress_burden(const VectorXd& burden, const std::vector<double>& y,
 // [[Rcpp::export]]
 void burden_enrich_association(
     const std::string& bed_prefix,
-    const std::string& he_file,
-    const std::string& category_file,
-    const std::string& trait_name,
-    const SEXP pheno_mat,
-    const std::string& out_file,
+    const std::string& he_file        = "",   // "" -> UNWEIGHTED burden (all weights 1)
+    const std::string& category_file  = "",   // ignored when he_file is ""
+    const std::string& trait_name     = "",   // ignored when he_file is ""
+    const SEXP pheno_mat              = R_NilValue,   // required (see check below)
+    const std::string& out_file       = "",           // required (see check below)
     double kb_size             = -1,   // strategy 1: window size in kb
     int    n_snps_per_window   = -1,   // strategy 2: fixed SNP count
     double target_mac_per_ind  = -1,   // strategy 3: target MAC/n_inds
@@ -533,6 +538,15 @@ void burden_enrich_association(
     int    write_buffer_size   = 500,
     int    chunk_size          = 5000  // only used for strategy 3 MAC scan
 ) {
+    // pheno_mat and out_file carry defaults only so that the EARLIER arguments
+    // (he_file, category_file, trait_name) can be omitted -- C++ does not allow
+    // a defaulted parameter to be followed by a non-defaulted one. The
+    // positional order is unchanged, so existing calls keep working. Both are
+    // still genuinely required, hence these runtime checks.
+    if (Rf_isNull(pheno_mat))
+        Rcpp::stop("pheno_mat is required (numeric matrix, individual IDs as rownames)");
+    if (out_file.empty())
+        Rcpp::stop("out_file is required");
     // -- .bim / .fam for the burden fileset --
     List bim_list = read_bim_file(bed_prefix);
     IntegerVector snp_chr = bim_list["chr"];
@@ -548,11 +562,32 @@ void burden_enrich_association(
     Rcout << "Individuals (.fam): " << n_total_inds << "\n";
     Rcout << "SNPs (.bim): "        << n_snps << "\n";
 
-    // -- Per-category enrichment (genome-wide, non-LOCO) and per-SNP weight --
-    std::vector<std::string> cat_order;
-    std::unordered_map<std::string, double> enrichment =
-        compute_category_enrichment(he_file, trait_name, min_enrichment, cat_order);
-    std::vector<double> weight = read_snp_weights(category_file, snp_id, enrichment);
+    // -- Per-SNP burden weight -------------------------------------------------
+    // With he_file supplied, weights are the per-category genome-wide
+    // heritability enrichments (genome-wide, non-LOCO). With he_file omitted,
+    // every SNP gets weight 1, i.e. a PLAIN UNWEIGHTED burden -- the natural
+    // baseline to compare the enrichment-weighted version against, and useful
+    // on its own when no HE run is available.
+    std::vector<double> weight;
+    if (he_file.empty()) {
+        weight.assign(n_snps, 1.0);
+        Rcout << "No he_file given: building UNWEIGHTED burdens (weight 1 per SNP).\n";
+        if (!category_file.empty())
+            Rcout << "  NOTE: category_file is ignored without an he_file.\n";
+        if (!trait_name.empty())
+            Rcout << "  NOTE: trait_name is ignored without an he_file.\n";
+    } else {
+        if (category_file.empty())
+            Rcpp::stop("category_file is required when he_file is given "
+                       "(it maps each SNP to the category whose enrichment weights it)");
+        if (trait_name.empty())
+            Rcpp::stop("trait_name is required when he_file is given "
+                       "(it selects which phenotype's enrichment to use)");
+        std::vector<std::string> cat_order;
+        std::unordered_map<std::string, double> enrichment =
+            compute_category_enrichment(he_file, trait_name, min_enrichment, cat_order);
+        weight = read_snp_weights(category_file, snp_id, enrichment);
+    }
 
     // -- Phenotype matrix, matched to .fam by IID (rownames of pheno_mat) --
     if (!Rf_isMatrix(pheno_mat) || Rf_isNull(rownames(pheno_mat)))
