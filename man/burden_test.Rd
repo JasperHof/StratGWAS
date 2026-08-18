@@ -11,7 +11,8 @@ burden_test(
   category_file = NULL,
   trait_name = NULL,
   out_file = NULL,
-  kb_size = 1,
+  kb_size = NULL,
+  n_snps_per_window = NULL,
   min_enrichment = 0.5,
   write_buffer_size = 500,
   chunk_size = 5000

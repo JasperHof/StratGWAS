@@ -55,21 +55,36 @@ burden_correlations <- function(burden_file,
 burden_test <- function(bed_prefix, pheno_mat, he_file,
                         category_file = NULL,
                         trait_name = NULL, out_file = NULL,
-                        kb_size = 1, min_enrichment = 0.5,
+                        kb_size = NULL, n_snps_per_window = NULL, min_enrichment = 0.5,
                         write_buffer_size = 500,
                         chunk_size = 5000) {
 
-  burden_enrich_association(
-    bed_prefix          = bed_prefix,
-    pheno_mat           = pheno_mat,
-    he_file             = he_file,
-    category_file       = category_file,
-    trait_name          = trait_name,
-    out_file            = out_file,
-    kb_size             = kb_size,
-    min_enrichment      = min_enrichment,
-    write_buffer_size   = write_buffer_size,
-    chunk_size          = chunk_size
-  )
+  if (!is.null(kb_size)) {
+    burden_enrich_association(
+      bed_prefix          = bed_prefix,
+      pheno_mat           = pheno_mat,
+      he_file             = he_file,
+      category_file       = category_file,
+      trait_name          = trait_name,
+      out_file            = out_file,
+      kb_size             = kb_size,
+      min_enrichment      = min_enrichment,
+      write_buffer_size   = write_buffer_size,
+      chunk_size          = chunk_size
+    )
+  } else if (!is.null(n_snps_per_window)) {
+    burden_enrich_association(
+      bed_prefix          = bed_prefix,
+      pheno_mat           = pheno_mat,
+      he_file             = he_file,
+      category_file       = category_file,
+      trait_name          = trait_name,
+      out_file            = out_file,
+      n_snps_per_window   = n_snps_per_window,
+      min_enrichment      = min_enrichment,
+      write_buffer_size   = write_buffer_size,
+      chunk_size          = chunk_size
+    )
+  }
 
 }
