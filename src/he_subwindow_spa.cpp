@@ -1243,6 +1243,25 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                     lp *= ce; vp *= Vpt;
                     KQ[mm] += fac[mm] * (double)(n - K) * lp * vp;
                 }
+                // ---- USE THE INDEPENDENCE MODEL FOR SHAPE ONLY --------------
+                // Treating the u_k as independent drops every Cov(u_j^2, u_k^2)
+                // term, which systematically UNDERSTATES kappa2 -- measured at
+                // 0.92-0.94 of truth in validation, and worse as K grows. Left
+                // uncorrected the saddlepoint null is too narrow and every
+                // p-value comes out too small (a constant lambda_GC ~ 1.26,
+                // independent of h2, with var(vg/se_vg) still == 1).
+                //
+                // kappa2 is already known EXACTLY: var0 = Gaussian + Delta_2,
+                // and Delta_2 is exact. So rescale Q by s = sqrt(var0/KQ[2]).
+                // Under Q -> sQ, kappa_m -> s^m kappa_m, so this pins kappa2 to
+                // the exact value while leaving the STANDARDIZED skewness and
+                // kurtosis -- the only things the independence model is used
+                // for -- completely unchanged.
+                if (KQ[2] > 0.0 && var0 > 0.0 && std::isfinite(KQ[2])) {
+                    const double s = std::sqrt(var0 / KQ[2]);
+                    double sp = 1.0;
+                    for (int mm = 1; mm <= 4; ++mm) { sp *= s; KQ[mm] *= sp; }
+                }
                 double l1, v1, l2, v2;
                 if (std::isfinite(KQ[2]) && KQ[2] > 0 &&
                     fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
@@ -2031,6 +2050,12 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                     for (int mm = 1; mm <= 4; ++mm) {
                         lp *= cev; vp *= Vpt;
                         KQ[mm] += fac[mm] * (double)(n - K) * lp * vp;
+                    }
+                    // Shape only -- pin kappa2 to the exact var0. See test_chunk.
+                    if (KQ[2] > 0.0 && var0 > 0.0 && std::isfinite(KQ[2])) {
+                        const double s = std::sqrt(var0 / KQ[2]);
+                        double sp = 1.0;
+                        for (int mm = 1; mm <= 4; ++mm) { sp *= s; KQ[mm] *= sp; }
                     }
                     double l1, v1, l2, v2;
                     if (std::isfinite(KQ[2]) && KQ[2] > 0 &&
