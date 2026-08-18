@@ -667,29 +667,39 @@ static void apply_alpha(GenoMat& X, const std::vector<float>& maf, double alpha,
 // quantile, an assigned P of 0.00108 against 0.001.
 // ===========================================================================
 
+// Pascal's triangle up to order MAXCUM, built once. A function-local static has
+// thread-safe initialisation in C++11, so this is safe inside the workers.
+enum { MAXCUM = 12 };
+struct BinomTable {
+    double B[MAXCUM + 1][MAXCUM + 1];
+    BinomTable() {
+        for (int i = 0; i <= MAXCUM; ++i) {
+            for (int j = 0; j <= MAXCUM; ++j) B[i][j] = 0.0;
+            B[i][0] = 1.0;
+            for (int j = 1; j <= i; ++j)
+                B[i][j] = B[i-1][j-1] + ((j <= i-1) ? B[i-1][j] : 0.0);
+        }
+    }
+};
+static const BinomTable& binoms() { static BinomTable t; return t; }
+
 // central moments -> cumulants (mu[1] must be 0)
 static void moms_to_cums(const double* mu, double* kap, int up) {
-    static const double binom[9][9] = {
-        {1,0,0,0,0,0,0,0,0},{1,1,0,0,0,0,0,0,0},{1,2,1,0,0,0,0,0,0},
-        {1,3,3,1,0,0,0,0,0},{1,4,6,4,1,0,0,0,0},{1,5,10,10,5,1,0,0,0},
-        {1,6,15,20,15,6,1,0,0},{1,7,21,35,35,21,7,1,0},{1,8,28,56,70,56,28,8,1}};
+    const BinomTable& bt = binoms();
     kap[1] = mu[1];
     for (int nn = 2; nn <= up; ++nn) {
         double s = mu[nn];
-        for (int mm = 1; mm < nn; ++mm) s -= binom[nn-1][mm-1] * kap[mm] * mu[nn-mm];
+        for (int mm = 1; mm < nn; ++mm) s -= bt.B[nn-1][mm-1] * kap[mm] * mu[nn-mm];
         kap[nn] = s;
     }
 }
 // cumulants -> central moments
 static void cums_to_moms(const double* kap, double* mu, int up) {
-    static const double binom[9][9] = {
-        {1,0,0,0,0,0,0,0,0},{1,1,0,0,0,0,0,0,0},{1,2,1,0,0,0,0,0,0},
-        {1,3,3,1,0,0,0,0,0},{1,4,6,4,1,0,0,0,0},{1,5,10,10,5,1,0,0,0},
-        {1,6,15,20,15,6,1,0,0},{1,7,21,35,35,21,7,1,0},{1,8,28,56,70,56,28,8,1}};
+    const BinomTable& bt = binoms();
     mu[0] = 1.0; mu[1] = kap[1];
     for (int nn = 2; nn <= up; ++nn) {
         double s = kap[nn];
-        for (int mm = 1; mm < nn; ++mm) s += binom[nn-1][mm-1] * kap[mm] * mu[nn-mm];
+        for (int mm = 1; mm < nn; ++mm) s += bt.B[nn-1][mm-1] * kap[mm] * mu[nn-mm];
         mu[nn] = s;
     }
 }
@@ -767,6 +777,113 @@ static bool fit_two_component(const double* kq, double* l1, double* v1,
     return best >= 0.0;
 }
 
+// ---------------------------------------------------------------------------
+// THREE-component fit, matching SIX cumulants.
+//
+// Truncating at four cumulants is the dominant remaining error: against a Monte
+// Carlo reference the four-cumulant fit overshoots the upper tail by ~8% at
+// 1e-2 and ~24% at 1e-3, and moving to six roughly halves both. (Replacing the
+// saddlepoint with exact characteristic-function inversion, by contrast, changes
+// the answer by ~3% -- so the saddlepoint itself is not worth attacking.)
+//
+// Same structural trick as the two-component case, one dimension up: GIVEN the
+// three eigenvalues, the three multiplicities solve a 3x3 LINEAR system taken
+// from kappa1..kappa3, leaving only a 3-D root-find on the kappa4..kappa6
+// residuals. The system matrix has rows (l_j^m) for m = 1,2,3, whose determinant
+// is l1 l2 l3 (l2-l1)(l3-l1)(l3-l2): invertible whenever the values are distinct
+// and nonzero.
+// ---------------------------------------------------------------------------
+static bool solve_nu3(const double* l, const double* kq, double* nu) {
+    Eigen::Matrix3d A; Eigen::Vector3d r;
+    for (int m = 1; m <= 3; ++m) {
+        for (int j = 0; j < 3; ++j) A(m-1, j) = std::pow(l[j], m);
+        r[m-1] = kq[m] / (m == 1 ? 1.0 : (m == 2 ? 2.0 : 8.0));
+    }
+    Eigen::FullPivLU<Eigen::Matrix3d> lu(A);
+    if (!lu.isInvertible()) return false;
+    Eigen::Vector3d x = lu.solve(r);
+    if (!x.allFinite()) return false;
+    for (int j = 0; j < 3; ++j) nu[j] = x[j];
+    return true;
+}
+static bool fit_three_component(const double* kq, double* lout, double* nout) {
+    const double sc = std::sqrt(std::abs(kq[2]) / 2.0);
+    if (!(sc > 0.0) || !std::isfinite(sc)) return false;
+    const double w[7] = {0, 1, 2, 8, 48, 384, 3840};      // 2^{m-1}(m-1)!
+    struct R { static bool res(const double* l, const double* kq,
+                               double* rr, double* nu) {
+        if (!solve_nu3(l, kq, nu)) return false;
+        const double w[7] = {0, 1, 2, 8, 48, 384, 3840};
+        for (int m = 4; m <= 6; ++m) {
+            double s = 0.0;
+            for (int j = 0; j < 3; ++j) s += nu[j] * std::pow(l[j], m);
+            rr[m-4] = w[m] * s - kq[m];
+            if (!std::isfinite(rr[m-4])) return false;
+        }
+        return true;
+    } };
+    // Starting points. The plain grid alone converges on only about a third of
+    // cases; seeding from the (much more reliable) two-component solution, which
+    // already matches kappa1..kappa4, roughly doubles that. Those seeds are tried
+    // first.
+    double S[20][3]; int nS = 0;
+    double s1, w1, s2, w2;
+    if (fit_two_component(kq, &s1, &w1, &s2, &w2)) {
+        static const double thirds[6] = {0.25, 0.5, 2.0, 4.0, -0.5, -2.0};
+        for (int q = 0; q < 6; ++q) {
+            const double l3 = (thirds[q] > 0 ? s1 : s2) * std::abs(thirds[q]);
+            S[nS][0] = s1; S[nS][1] = s2; S[nS][2] = l3; ++nS;
+        }
+    }
+    static const double G[8][3] = {{ 1,-1, 2},{ 2,-1, 0.5},{ 1,-2, 3},
+                                   { 3,-0.5,1},{0.5,-3, 2},{ 1,-1, 4},
+                                   { 4,-2, 1},{ 2,-3, 0.5}};
+    for (int q = 0; q < 8 && nS < 20; ++q) {
+        S[nS][0] = G[q][0]*sc; S[nS][1] = G[q][1]*sc; S[nS][2] = G[q][2]*sc; ++nS;
+    }
+    double best = -1.0;
+    for (int st = 0; st < nS; ++st) {
+        double l[3] = {S[st][0], S[st][1], S[st][2]};
+        for (int it = 0; it < 300; ++it) {
+            double rr[3], nu[3];
+            if (!R::res(l, kq, rr, nu)) break;
+            double nrm = 0.0;
+            for (int m = 4; m <= 6; ++m) {
+                const double scl = std::max(std::abs(kq[m]), w[m]*std::pow(sc, m));
+                nrm = std::max(nrm, std::abs(rr[m-4]) / scl);
+            }
+            if (nrm < 1e-9) {
+                if (nu[0] > 1e-12 && nu[1] > 1e-12 && nu[2] > 1e-12 &&
+                    (best < 0 || nrm < best)) {
+                    best = nrm;
+                    for (int j = 0; j < 3; ++j) { lout[j] = l[j]; nout[j] = nu[j]; }
+                }
+                break;
+            }
+            Eigen::Matrix3d J; Eigen::Vector3d F(rr[0], rr[1], rr[2]);
+            bool ok = true;
+            for (int c = 0; c < 3 && ok; ++c) {
+                double lp[3] = {l[0], l[1], l[2]};
+                const double h = 1e-6 * std::max(std::abs(l[c]), sc);
+                lp[c] += h;
+                double r2[3], n2[3];
+                if (!R::res(lp, kq, r2, n2)) { ok = false; break; }
+                for (int m = 0; m < 3; ++m) J(m, c) = (r2[m] - rr[m]) / h;
+            }
+            if (!ok) break;
+            Eigen::Vector3d d = J.fullPivLu().solve(F);
+            if (!d.allFinite()) break;
+            double damp = 1.0, mx = d.cwiseAbs().maxCoeff();
+            if (mx > 0.5 * sc) damp = 0.5 * sc / mx;
+            for (int j = 0; j < 3; ++j) l[j] -= damp * d[j];
+            if (!std::isfinite(l[0]) || !std::isfinite(l[1]) || !std::isfinite(l[2])) break;
+            if (std::abs(l[0]-l[1]) < 1e-12*sc || std::abs(l[0]-l[2]) < 1e-12*sc ||
+                std::abs(l[1]-l[2]) < 1e-12*sc) break;
+        }
+    }
+    return best >= 0.0;
+}
+
 struct QuadSpaResult { double p; bool converged; };
 
 // `n_rep` and `nu2` are doubles: the binary 4-cumulant path needs FRACTIONAL
@@ -774,7 +891,8 @@ struct QuadSpaResult { double p; bool converged; };
 // repeated pair (lam2, nu2) defaults to zero, so the Gaussian path is unchanged.
 static void quad_cgf(double t, const std::vector<double>& eig_explicit,
                      double eig_rep, double n_rep, double& K, double& K1, double& K2,
-                     double lam2 = 0.0, double nu2 = 0.0) {
+                     double lam2 = 0.0, double nu2 = 0.0,
+                     double lam3 = 0.0, double nu3 = 0.0) {
     K = 0.0; K1 = 0.0; K2 = 0.0;
     for (size_t j = 0; j < eig_explicit.size(); ++j) {
         double lam = eig_explicit[j];
@@ -796,12 +914,19 @@ static void quad_cgf(double t, const std::vector<double>& eig_explicit,
         K1 += nu2 * lam2 / d;
         K2 += nu2 * 2.0 * lam2 * lam2 / (d * d);
     }
+    if (nu3 > 0) {
+        double d = 1.0 - 2.0 * lam3 * t;
+        K  += -0.5 * nu3 * std::log(d);
+        K1 += nu3 * lam3 / d;
+        K2 += nu3 * 2.0 * lam3 * lam3 / (d * d);
+    }
 }
 
 static QuadSpaResult quad_spa_solve(
     double s_obs_in, const std::vector<double>& eig_in, double eig_rep_in, double n_rep,
     int max_iter = 100, double tol = 1e-8,
-    double lam2_in = 0.0, double nu2 = 0.0
+    double lam2_in = 0.0, double nu2 = 0.0,
+    double lam3_in = 0.0, double nu3 = 0.0
 ) {
     QuadSpaResult res; res.p = NA_REAL; res.converged = false;
 
@@ -841,6 +966,10 @@ static QuadSpaResult quad_spa_solve(
         mean_raw += nu2 * lam2_in;
         var_raw  += nu2 * 2.0 * lam2_in * lam2_in;
     }
+    if (nu3 > 0) {
+        mean_raw += nu3 * lam3_in;
+        var_raw  += nu3 * 2.0 * lam3_in * lam3_in;
+    }
     // Only a genuinely degenerate (zero / non-finite) variance is unusable.
     if (!(var_raw > 0.0) || !std::isfinite(var_raw)) return res;
 
@@ -851,6 +980,7 @@ static QuadSpaResult quad_spa_solve(
     for (size_t j = 0; j < eig_in.size(); ++j) eig_explicit[j] = eig_in[j] * scale;
     const double eig_rep = eig_rep_in * scale;
     const double lam2    = lam2_in    * scale;
+    const double lam3    = lam3_in    * scale;
     const double s_obs   = s_obs_in   * scale;
 
     double lam_min = (n_rep > 0) ? eig_rep : 0.0, lam_max = lam_min;
@@ -860,6 +990,7 @@ static QuadSpaResult quad_spa_solve(
         if (lam > lam_max) lam_max = lam;
     }
     if (nu2 > 0) { if (lam2 < lam_min) lam_min = lam2; if (lam2 > lam_max) lam_max = lam2; }
+    if (nu3 > 0) { if (lam3 < lam_min) lam_min = lam3; if (lam3 > lam_max) lam_max = lam3; }
     // Dimensionless now: |lambda| <= 1/sqrt(2), so 1e-14 simply means
     // "no positive (negative) eigenvalue, hence no bound on t in that direction".
     const double lam_eps = 1e-14;
@@ -870,13 +1001,13 @@ static QuadSpaResult quad_spa_solve(
     double t_lo_safe = (lam_min < -lam_eps) ? t_lo * (1.0 - margin) : t_lo;
 
     double t = 0.0, K, K1, K2;
-    quad_cgf(0.0, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2);
+    quad_cgf(0.0, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2, lam3, nu3);
     double mean0 = K1, var0 = K2;          // var0 == 1 up to rounding
     if (!(var0 > 0.0)) return res;
 
     bool converged = false;
     for (int it = 0; it < max_iter; ++it) {
-        quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2);
+        quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2, lam3, nu3);
         double diff = K1 - s_obs;
         if (std::abs(diff) < tol * std::max(1.0, std::abs(s_obs - mean0))) { converged = true; break; }
         if (K2 < 1e-14) break;
@@ -891,7 +1022,7 @@ static QuadSpaResult quad_spa_solve(
     }
     if (!converged) return res;
 
-    quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2);
+    quad_cgf(t, eig_explicit, eig_rep, n_rep, K, K1, K2, lam2, nu2, lam3, nu3);
     if (K2 <= 0) return res;
 
     // Removable singularity at t ~ 0: the normal approximation is exact in
@@ -1100,7 +1231,10 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     // per-chunk cost. It must therefore be paid ONLY by chunks that actually
     // reach the saddlepoint, not by every chunk. Computed on first demand from
     // inside the trait loop, after the Wald screen.
-    const int NPOW = 8;
+    // Six cumulants of Q are matched, which needs cumulants of u_k^2 up to order
+    // 6, hence moments of u_k up to order 12, hence power sums to order 12.
+    const int NPOW = 12;
+    const int NCUM = 6;
     bool cum4_tried = false, have_cum4 = false;
     Eigen::VectorXd lamB;                       // K eigenvalues of M_0
     Eigen::MatrixXd Spow;                       // K x (NPOW+1) power sums sum_i a_ki^r
@@ -1202,7 +1336,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         // it is exactly 1 on the continuous path.
         double cscale = 1.0;
         if (binary && Sb2 > 0.0) {
-            const double d2 = kur[(size_t) t * 9 + 4] * Sb2;
+            const double d2 = kur[(size_t) t * (MAXCUM + 1) + 4] * Sb2;
             if (var0 + d2 > 0.0) { cscale = std::sqrt((var0 + d2) / var0); var0 += d2; }
         }
 
@@ -1218,17 +1352,18 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         // two Cf products, or the K x K eigensolve is needed at all.
         bool used_cum4 = false;
         if (binary && ensure_cum4() && lamB.size() == K) {
-            const double* kz = &kur[(size_t) t * 9];
-            double KQ[5] = {0,0,0,0,0};
+            const double* kz = &kur[(size_t) t * (MAXCUM + 1)];
+            double KQ[NCUM + 1] = {0,0,0,0,0,0,0};
             bool ok4 = true;
             for (int k = 0; k < K && ok4; ++k) {
-                double ku[9] = {0,0,0,0,0,0,0,0,0};
+                double ku[MAXCUM + 1] = {0};
                 for (int r = 2; r <= NPOW; ++r) ku[r] = kz[r] * Spow(k, r);
-                double mu[9]; cums_to_moms(ku, mu, NPOW);
-                double ms[5] = {1.0, mu[2], mu[4], mu[6], mu[8]};
-                double csq[5]; moms_to_cums(ms, csq, 4);
+                double mu[MAXCUM + 1]; cums_to_moms(ku, mu, NPOW);
+                double ms[NCUM + 1]; ms[0] = 1.0;
+                for (int s2 = 1; s2 <= NCUM; ++s2) ms[s2] = mu[2 * s2];
+                double csq[NCUM + 1]; moms_to_cums(ms, csq, NCUM);
                 double lp = 1.0;
-                for (int mm = 1; mm <= 4; ++mm) {
+                for (int mm = 1; mm <= NCUM; ++mm) {
                     lp *= lamB[k];
                     if (!std::isfinite(csq[mm])) { ok4 = false; break; }
                     KQ[mm] += lp * csq[mm];
@@ -1238,8 +1373,9 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                 // (n-K) directions orthogonal to col(V): eigenvalue c_env, and
                 // u there is spread over all n hence Gaussian -> chi^2_1.
                 const double ce = Tinv(0, env), Vpt = (Vp[t] > 0 ? Vp[t] : 1.0);
-                double fac[5] = {0, 1, 2, 8, 48}, lp = 1.0, vp = 1.0;
-                for (int mm = 1; mm <= 4; ++mm) {
+                const double fac[NCUM + 1] = {0, 1, 2, 8, 48, 384, 3840};
+                double lp = 1.0, vp = 1.0;
+                for (int mm = 1; mm <= NCUM; ++mm) {
                     lp *= ce; vp *= Vpt;
                     KQ[mm] += fac[mm] * (double)(n - K) * lp * vp;
                 }
@@ -1260,16 +1396,28 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                 if (KQ[2] > 0.0 && var0 > 0.0 && std::isfinite(KQ[2])) {
                     const double s = std::sqrt(var0 / KQ[2]);
                     double sp = 1.0;
-                    for (int mm = 1; mm <= 4; ++mm) { sp *= s; KQ[mm] *= sp; }
+                    for (int mm = 1; mm <= NCUM; ++mm) { sp *= s; KQ[mm] *= sp; }
                 }
-                double l1, v1, l2, v2;
-                if (std::isfinite(KQ[2]) && KQ[2] > 0 &&
-                    fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
+                // Cascade: six cumulants (three components) first, then four
+                // (two components), then the variance-only correction below.
+                if (std::isfinite(KQ[2]) && KQ[2] > 0) {
                     std::vector<double> none;
-                    QuadSpaResult q4 = quad_spa_solve(sigma[0], none, l1, v1,
-                                                      100, 1e-8, l2, v2);
-                    if (q4.converged) {
-                        cr.p_spa[t] = q4.p; cr.spa_used[t] = 2; used_cum4 = true;
+                    double L3[3], N3[3];
+                    if (fit_three_component(KQ, L3, N3)) {
+                        QuadSpaResult q6 = quad_spa_solve(sigma[0], none, L3[0], N3[0],
+                                                          100, 1e-8, L3[1], N3[1],
+                                                          L3[2], N3[2]);
+                        if (q6.converged) {
+                            cr.p_spa[t] = q6.p; cr.spa_used[t] = 3; used_cum4 = true;
+                        }
+                    }
+                    double l1, v1, l2, v2;
+                    if (!used_cum4 && fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
+                        QuadSpaResult q4 = quad_spa_solve(sigma[0], none, l1, v1,
+                                                          100, 1e-8, l2, v2);
+                        if (q4.converged) {
+                            cr.p_spa[t] = q4.p; cr.spa_used[t] = 2; used_cum4 = true;
+                        }
                     }
                 }
             }
@@ -1558,15 +1706,16 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     // covariates have been regressed out and the phenotype is no longer 0/1.
     std::vector<double> kur;
     if (pr.binary) {
-        kur.assign((size_t) P * 9, 0.0);
+        kur.assign((size_t) P * (MAXCUM + 1), 0.0);
         const double nn = (double) Y.rows();
         for (int t = 0; t < P; ++t) {
             Eigen::ArrayXd d = Y.col(t).array() - Y.col(t).mean();
-            double mu[9]; mu[0] = 1.0; mu[1] = 0.0;
+            double mu[MAXCUM + 1]; mu[0] = 1.0; mu[1] = 0.0;
             Eigen::ArrayXd pw = d;
-            for (int r = 2; r <= 8; ++r) { pw = pw * d; mu[r] = pw.sum() / nn; }
-            double kp[9]; moms_to_cums(mu, kp, 8);
-            for (int r = 1; r <= 8; ++r) kur[(size_t) t * 9 + r] = kp[r];
+            for (int r = 2; r <= MAXCUM; ++r) { pw = pw * d; mu[r] = pw.sum() / nn; }
+            double kp[MAXCUM + 1]; moms_to_cums(mu, kp, MAXCUM);
+            for (int r = 1; r <= MAXCUM; ++r)
+                kur[(size_t) t * (MAXCUM + 1) + r] = kp[r];
         }
     }
 
@@ -1928,7 +2077,10 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     // plus an O(nK^2) product, so doing it eagerly for every category of every
     // chunk multiplied the run time by roughly (1 + A). Now a category pays it
     // only when one of its tests actually reaches the saddlepoint.
-    const int NPOW = 8;
+    // Six cumulants of Q are matched, which needs cumulants of u_k^2 up to order
+    // 6, hence moments of u_k up to order 12, hence power sums to order 12.
+    const int NPOW = 12;
+    const int NCUM = 6;
     std::vector<char> cum4_tried(A, 0), have_cum4(A, 0);
     std::vector<Eigen::VectorXd> lamB(A);
     std::vector<Eigen::MatrixXd> Spow(A);
@@ -2016,7 +2168,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
 
             double cscale = 1.0;                       // binary variance correction
             if (binary && Sb2[c] > 0.0) {
-                const double d2 = kur[(size_t) t * 9 + 4] * Sb2[c];
+                const double d2 = kur[(size_t) t * (MAXCUM + 1) + 4] * Sb2[c];
                 if (var0 + d2 > 0.0) { cscale = std::sqrt((var0 + d2) / var0); var0 += d2; }
             }
 
@@ -2028,17 +2180,18 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             // Smat, the Cf products, or the eigensolve below is needed.
             bool used_cum4 = false;
             if (binary && ensure_cum4(c) && lamB[c].size() == K) {
-                const double* kz = &kur[(size_t) t * 9];
-                double KQ[5] = {0,0,0,0,0};
+                const double* kz = &kur[(size_t) t * (MAXCUM + 1)];
+                double KQ[NCUM + 1] = {0,0,0,0,0,0,0};
                 bool ok4 = true;
                 for (int k = 0; k < K && ok4; ++k) {
-                    double ku[9] = {0,0,0,0,0,0,0,0,0};
+                    double ku[MAXCUM + 1] = {0};
                     for (int r = 2; r <= NPOW; ++r) ku[r] = kz[r] * Spow[c](k, r);
-                    double mu[9]; cums_to_moms(ku, mu, NPOW);
-                    double ms[5] = {1.0, mu[2], mu[4], mu[6], mu[8]};
-                    double csq[5]; moms_to_cums(ms, csq, 4);
+                    double mu[MAXCUM + 1]; cums_to_moms(ku, mu, NPOW);
+                    double ms[NCUM + 1]; ms[0] = 1.0;
+                    for (int s2 = 1; s2 <= NCUM; ++s2) ms[s2] = mu[2 * s2];
+                    double csq[NCUM + 1]; moms_to_cums(ms, csq, NCUM);
                     double lp = 1.0;
-                    for (int mm = 1; mm <= 4; ++mm) {
+                    for (int mm = 1; mm <= NCUM; ++mm) {
                         lp *= lamB[c][k];
                         if (!std::isfinite(csq[mm])) { ok4 = false; break; }
                         KQ[mm] += lp * csq[mm];
@@ -2046,8 +2199,9 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                 }
                 if (ok4) {
                     const double cev = Tinv(c, env), Vpt = (Vp[t] > 0 ? Vp[t] : 1.0);
-                    double fac[5] = {0, 1, 2, 8, 48}, lp = 1.0, vp = 1.0;
-                    for (int mm = 1; mm <= 4; ++mm) {
+                    const double fac[NCUM + 1] = {0, 1, 2, 8, 48, 384, 3840};
+                    double lp = 1.0, vp = 1.0;
+                    for (int mm = 1; mm <= NCUM; ++mm) {
                         lp *= cev; vp *= Vpt;
                         KQ[mm] += fac[mm] * (double)(n - K) * lp * vp;
                     }
@@ -2055,16 +2209,26 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                     if (KQ[2] > 0.0 && var0 > 0.0 && std::isfinite(KQ[2])) {
                         const double s = std::sqrt(var0 / KQ[2]);
                         double sp = 1.0;
-                        for (int mm = 1; mm <= 4; ++mm) { sp *= s; KQ[mm] *= sp; }
+                        for (int mm = 1; mm <= NCUM; ++mm) { sp *= s; KQ[mm] *= sp; }
                     }
-                    double l1, v1, l2, v2;
-                    if (std::isfinite(KQ[2]) && KQ[2] > 0 &&
-                        fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
+                    if (std::isfinite(KQ[2]) && KQ[2] > 0) {
                         std::vector<double> none;
-                        QuadSpaResult q4 = quad_spa_solve(sigma[c], none, l1, v1,
-                                                          100, 1e-8, l2, v2);
-                        if (q4.converged) {
-                            cr.p_spa[c][t] = q4.p; cr.spa_used[c][t] = 2; used_cum4 = true;
+                        double L3[3], N3[3];
+                        if (fit_three_component(KQ, L3, N3)) {
+                            QuadSpaResult q6 = quad_spa_solve(sigma[c], none, L3[0], N3[0],
+                                                              100, 1e-8, L3[1], N3[1],
+                                                              L3[2], N3[2]);
+                            if (q6.converged) {
+                                cr.p_spa[c][t] = q6.p; cr.spa_used[c][t] = 3; used_cum4 = true;
+                            }
+                        }
+                        double l1, v1, l2, v2;
+                        if (!used_cum4 && fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
+                            QuadSpaResult q4 = quad_spa_solve(sigma[c], none, l1, v1,
+                                                              100, 1e-8, l2, v2);
+                            if (q4.converged) {
+                                cr.p_spa[c][t] = q4.p; cr.spa_used[c][t] = 2; used_cum4 = true;
+                            }
                         }
                     }
                 }
@@ -2152,15 +2316,16 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
     // covariates have been regressed out and the phenotype is no longer 0/1.
     std::vector<double> kur;
     if (pr.binary) {
-        kur.assign((size_t) P * 9, 0.0);
+        kur.assign((size_t) P * (MAXCUM + 1), 0.0);
         const double nn = (double) Y.rows();
         for (int t = 0; t < P; ++t) {
             Eigen::ArrayXd d = Y.col(t).array() - Y.col(t).mean();
-            double mu[9]; mu[0] = 1.0; mu[1] = 0.0;
+            double mu[MAXCUM + 1]; mu[0] = 1.0; mu[1] = 0.0;
             Eigen::ArrayXd pw = d;
-            for (int r = 2; r <= 8; ++r) { pw = pw * d; mu[r] = pw.sum() / nn; }
-            double kp[9]; moms_to_cums(mu, kp, 8);
-            for (int r = 1; r <= 8; ++r) kur[(size_t) t * 9 + r] = kp[r];
+            for (int r = 2; r <= MAXCUM; ++r) { pw = pw * d; mu[r] = pw.sum() / nn; }
+            double kp[MAXCUM + 1]; moms_to_cums(mu, kp, MAXCUM);
+            for (int r = 1; r <= MAXCUM; ++r)
+                kur[(size_t) t * (MAXCUM + 1) + r] = kp[r];
         }
     }
 
