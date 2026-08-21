@@ -23,7 +23,8 @@ he_reg_spa(
   spa_pval_threshold = 0.1,
   annotation = NULL,
   annot_names = NULL,
-  binary = F
+  binary = F,
+  chr = NULL
 )
 }
 \description{
