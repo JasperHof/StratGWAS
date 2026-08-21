@@ -1453,6 +1453,7 @@ struct ChunkParams {
     long common_bp; bool common_window_given; int max_common_snps;
     bool spa; double spa_thresh; bool binary;
     std::string out_file; int batch_size, n_threads;
+    std::string chr;                 // "" = all chromosomes; else test only this one
 };
 
 static void common_chr_range(const ChunkContext& ctx, const std::string& chr, int& lo, int& hi) {
@@ -1732,6 +1733,7 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     // enumerate chunks: consecutive blocks of chunk_size SNPs within a chromosome
     std::vector<Job> jobs;
     for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
+        if (!pr.chr.empty() && ctx.chr_order[ci] != pr.chr) continue;
         int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
         for (int a = lo; a <= hi; a += pr.chunk_size) {
             int b = std::min(hi + 1, a + pr.chunk_size);
@@ -2341,6 +2343,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
 
     std::vector<Job> jobs;
     for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
+        if (!pr.chr.empty() && ctx.chr_order[ci] != pr.chr) continue;
         int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
         for (int a = lo; a <= hi; a += pr.chunk_size) {
             int b = std::min(hi + 1, a + pr.chunk_size);
@@ -2427,7 +2430,8 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         double spa_pval_threshold = 0.1,
                         bool binary = false,
                         Rcpp::Nullable<Rcpp::IntegerMatrix> annotation = R_NilValue,
-                        Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue) {
+                        Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue,
+                        SEXP chr = R_NilValue) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (flank_chunks < 0) stop("flank_chunks must be >= 0");
     ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
@@ -2452,6 +2456,24 @@ Rcpp::List he_chunk_spa(const std::string& filename,
               << "  expected far into the tail for very imbalanced traits.\n";
     }
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads;
+    // chr = <value> restricts testing to one chromosome of the rare-variant data.
+    // Accepts numeric or character (chr = 7 and chr = "7" both work); the value is
+    // matched against the chromosome field of the .bim. Left NULL, all are tested.
+    if (!Rf_isNull(chr)) {
+        Rcpp::CharacterVector cs(Rf_coerceVector(chr, STRSXP));
+        if (cs.size() != 1) stop("chr must be a single value");
+        pr.chr = Rcpp::as<std::string>(cs[0]);
+        bool found = false;
+        for (size_t i = 0; i < ctx.chr_order.size() && !found; ++i)
+            if (ctx.chr_order[i] == pr.chr) found = true;
+        if (!found) {
+            std::string avail;
+            for (size_t i = 0; i < ctx.chr_order.size(); ++i)
+                avail += (i ? ", " : "") + ctx.chr_order[i];
+            stop("chr = '" + pr.chr + "' not found in " + filename + ".bim. Available: " + avail);
+        }
+        Rcout << "Restricting to chromosome " << pr.chr << "\n";
+    }
     // Annotation supplied -> per-category SPA path. Every annotation column is a
     // tested category; the background comes from the adjacent chunks and/or the
     // common SNPs, so with flank_chunks = 0 a common fileset is required.
