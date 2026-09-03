@@ -13,6 +13,8 @@ burden(
   out_file = NULL,
   write_buffer_genes = 500,
   effects_file = "",
+  annotation = NULL,
+  annot_names = NULL,
   write_burden_scores = TRUE
 )
 }

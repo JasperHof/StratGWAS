@@ -259,7 +259,9 @@ void write_burdens(
     const std::string& out_file,
     int write_buffer_size,
     const std::vector<double>& beta,   // empty = no heritability calculation
-    bool write_burden_scores           // false = skip writing burden score / kept_windows files
+    bool write_burden_scores,          // false = skip writing burden score / kept_windows files
+    const std::vector<int>& annot,     // flat n_snps x n_cat, column-major; empty = no categories
+    const std::vector<std::string>& cat_names   // one name per annotation column
 ) {
     bool has_effects = !beta.empty();
 
@@ -279,7 +281,7 @@ void write_burdens(
         std::string hers_file = out_file + ".hers";
         hers_out.open(hers_file);
         if (!hers_out.is_open()) Rcpp::stop("Could not open hers file: " + hers_file);
-        hers_out << "window\tchr\tbp_start\tbp_end\tn_snps\th2\tr2_burden\th2_burden\n";
+        hers_out << "window\tchr\tbp_start\tbp_end\tcategory\tn_snps\th2\tr2_burden\th2_burden\n";
     }
 
     // Running genetic score for the whole genome (only tracked if we have
@@ -289,6 +291,12 @@ void write_burdens(
     VectorXd burden_total = VectorXd::Zero(n_inds);
     double sum_window_h2 = 0.0;
     double sum_window_h2_burden = 0.0;
+
+    // Same quantities, tracked separately for each annotation category
+    const int n_cat = (int) cat_names.size();
+    std::vector<VectorXd> g_total_c(n_cat, VectorXd::Zero(n_inds));
+    std::vector<VectorXd> burden_total_c(n_cat, VectorXd::Zero(n_inds));
+    std::vector<double>   sum_h2_c(n_cat, 0.0), sum_h2b_c(n_cat, 0.0);
 
     std::vector<std::string> row_buf;
     std::vector<std::string> win_buf;
@@ -314,13 +322,34 @@ void write_burdens(
         VectorXd burden_vec = VectorXd::Zero(n_inds);
         VectorXd g_win = VectorXd::Zero(n_inds);   // true genetic score for this window
 
+        // Per-category versions of the same two vectors, plus the SNP count
+        std::vector<VectorXd> burden_c(n_cat, VectorXd::Zero(n_inds));
+        std::vector<VectorXd> g_c(n_cat, VectorXd::Zero(n_inds));
+        std::vector<int> m_c(n_cat, 0);
+        std::vector<int> mycats;                   // categories of the current SNP
+
         for (int s = 0; s < n_snps_win; ++s) {
-            double b = has_effects ? beta[w.start_idx + s] : 0.0;
+            int gidx = w.start_idx + s;
+            double b = has_effects ? beta[gidx] : 0.0;
+
+            // Resolve category membership once per SNP, not once per individual.
+            // Only needed when we have effects; otherwise mycats stays empty and
+            // the per-individual loop below is exactly as cheap as before.
+            mycats.clear();
+            if (has_effects)
+                for (int c = 0; c < n_cat; ++c)
+                    if (annot[(size_t) c * n_snps + gidx]) { mycats.push_back(c); m_c[c]++; }
+
+            const bool use_b = has_effects && b != 0.0;
             for (int i = 0; i < n_inds; ++i) {
                 int g = geno_block(i, s);
-                if (g != -1) {
-                    burden_vec(i) += g;
-                    if (has_effects && b != 0.0) g_win(i) += b * g;
+                if (g == -1) continue;
+                burden_vec(i) += g;
+                double bg = use_b ? b * g : 0.0;
+                if (use_b) g_win(i) += bg;
+                for (size_t k = 0; k < mycats.size(); ++k) {
+                    burden_c[mycats[k]](i) += g;
+                    if (use_b) g_c[mycats[k]](i) += bg;
                 }
             }
         }
@@ -352,13 +381,32 @@ void write_burdens(
             double h2_win_burden = r2_win * h2_win;
 
             hers_out << wlabel.str() << "\t" << w.chr << "\t" << w.bp_start << "\t"
-                      << w.bp_end << "\t" << n_snps_win << "\t" << h2_win << "\t"
+                      << w.bp_end << "\tALL\t" << n_snps_win << "\t" << h2_win << "\t"
                       << r2_win << "\t" << h2_win_burden << "\n";
 
             sum_window_h2 += h2_win;
             sum_window_h2_burden += h2_win_burden;
             g_total += g_win;
             burden_total += burden_vec;
+
+            // One row per category present in this window (empty ones are skipped,
+            // matching he_reg_spa, so downstream joins line up)
+            for (int c = 0; c < n_cat; ++c) {
+                if (m_c[c] == 0) continue;
+                double mean_gc = g_c[c].mean();
+                double h2_c    = (g_c[c].array() - mean_gc).square().sum() / (n_inds - 1);
+                double r2_c    = compute_r2(burden_c[c], g_c[c]);
+                double h2b_c   = r2_c * h2_c;
+
+                hers_out << wlabel.str() << "\t" << w.chr << "\t" << w.bp_start << "\t"
+                          << w.bp_end << "\t" << cat_names[c] << "\t" << m_c[c] << "\t"
+                          << h2_c << "\t" << r2_c << "\t" << h2b_c << "\n";
+
+                sum_h2_c[c]  += h2_c;
+                sum_h2b_c[c] += h2b_c;
+                g_total_c[c]      += g_c[c];
+                burden_total_c[c] += burden_c[c];
+            }
         }
 
         if (write_burden_scores && (int)row_buf.size() >= write_buffer_size) {
@@ -391,10 +439,19 @@ void write_burdens(
         double r2_total = compute_r2(burden_total, g_total);
         double h2_total_burden_actual = r2_total * h2_total_actual;
 
-        hers_out << "TOTAL_SUM\tNA\tNA\tNA\tNA\t" << sum_window_h2
+        hers_out << "TOTAL_SUM\tNA\tNA\tNA\tALL\tNA\t" << sum_window_h2
                   << "\tNA\t" << sum_window_h2_burden << "\n";
-        hers_out << "TOTAL_ACTUAL\tNA\tNA\tNA\tNA\t" << h2_total_actual
+        hers_out << "TOTAL_ACTUAL\tNA\tNA\tNA\tALL\tNA\t" << h2_total_actual
                   << "\t" << r2_total << "\t" << h2_total_burden_actual << "\n";
+        for (int c = 0; c < n_cat; ++c) {
+            double mg   = g_total_c[c].mean();
+            double h2a  = (g_total_c[c].array() - mg).square().sum() / (n_inds - 1);
+            double r2a  = compute_r2(burden_total_c[c], g_total_c[c]);
+            hers_out << "TOTAL_SUM\tNA\tNA\tNA\t" << cat_names[c] << "\tNA\t"
+                      << sum_h2_c[c] << "\tNA\t" << sum_h2b_c[c] << "\n";
+            hers_out << "TOTAL_ACTUAL\tNA\tNA\tNA\t" << cat_names[c] << "\tNA\t"
+                      << h2a << "\t" << r2a << "\t" << r2a * h2a << "\n";
+        }
         hers_out.close();
 
         Rcout << "Sum of per-window h2 (naive): " << sum_window_h2 << "\n";
@@ -431,7 +488,9 @@ void compute_burden_windows(
     int    write_buffer_size   = 500,
     int    chunk_size          = 5000, // only used for strategy 3 MAC scan
     std::string effects_file   = "",   // optional: SNP, effect size
-    bool   write_burden_scores = true
+    bool   write_burden_scores = true,
+    Rcpp::Nullable<Rcpp::IntegerMatrix>   annotation  = R_NilValue,  // n_snps x n_cat, 0/1
+    Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue   // one name per column
 ) {
     // -- Read .bim --
     List bim_list = read_bim_file(bed_prefix);
@@ -452,6 +511,39 @@ void compute_burden_windows(
     if (effects_file != "") {
         CharacterVector snp_id = bim_list["snp"];
         beta = read_effects_file(effects_file, snp_id);
+    }
+
+    // -- Optional annotation: every column is a category, as in he_reg_spa.
+    //    Heritability is reported for the window as a whole ("ALL") and for
+    //    each category separately. --
+    std::vector<int> annot;
+    std::vector<std::string> cat_names;
+    if (annotation.isNotNull()) {
+        Rcpp::IntegerMatrix A(annotation.get());
+        if (A.nrow() != n_snps)
+            Rcpp::stop("annotation must have one row per SNP in the .bim (" +
+                       std::to_string(n_snps) + " rows), got " + std::to_string(A.nrow()));
+        int n_cat = A.ncol();
+        if (annot_names.isNotNull()) {
+            Rcpp::CharacterVector nm(annot_names.get());
+            if (nm.size() != n_cat)
+                Rcpp::stop("annot_names length must equal the number of annotation columns");
+            for (int c = 0; c < n_cat; ++c) cat_names.push_back(Rcpp::as<std::string>(nm[c]));
+        } else {
+            for (int c = 0; c < n_cat; ++c) cat_names.push_back("CAT_" + std::to_string(c + 1));
+        }
+        annot.resize((size_t) n_snps * n_cat);
+        std::vector<long> per_cat(n_cat, 0);
+        for (int c = 0; c < n_cat; ++c)
+            for (int s = 0; s < n_snps; ++s) {
+                int v = (A(s, c) != 0) ? 1 : 0;
+                annot[(size_t) c * n_snps + s] = v;
+                per_cat[c] += v;
+            }
+        Rcout << "Annotation: " << n_cat << " categories (";
+        for (int c = 0; c < n_cat; ++c)
+            Rcout << (c ? ", " : "") << cat_names[c] << ": " << per_cat[c];
+        Rcout << " SNPs)\n";
     }
 
     // -- Check exactly one window strategy is specified --
@@ -476,5 +568,6 @@ void compute_burden_windows(
     Rcout << "Windows generated: " << windows.size() << "\n";
 
     // -- Compute and write burdens (and heritability, if effects given) --
-    write_burdens(windows, bed_prefix, n_inds, n_snps, out_file, write_buffer_size, beta, write_burden_scores);
+    write_burdens(windows, bed_prefix, n_inds, n_snps, out_file, write_buffer_size, beta,
+                  write_burden_scores, annot, cat_names);
 }
