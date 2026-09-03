@@ -24,7 +24,8 @@ he_reg_spa(
   annotation = NULL,
   annot_names = NULL,
   binary = F,
-  chr = NULL
+  chr = NULL,
+  flank_categories = NULL
 )
 }
 \description{

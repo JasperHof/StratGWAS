@@ -57,8 +57,8 @@ reml_sliding_window_part <- function(filename, pheno_mat, snp_cat, cat_names, wi
     .Call(`_StratGWAS_reml_sliding_window_part`, filename, pheno_mat, snp_cat, cat_names, window_size, min_snps, alpha, alpha_common, common_filename, max_iter, tol, se, out_file, batch_size, n_threads, seed, weights, covariates, collapse_mac, collapse_n)
 }
 
-he_chunk_spa <- function(filename, pheno_mat, chunk_size = 256L, flank_chunks = 1L, min_chunk_snps = 5L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, common_window = NA_real_, max_common_snps = 256L, out_file = "", batch_size = 64L, n_threads = 0L, weights = NULL, covariates = NULL, SPA = TRUE, spa_pval_threshold = 0.1, binary = FALSE, annotation = NULL, annot_names = NULL, chr = NULL) {
-    .Call(`_StratGWAS_he_chunk_spa`, filename, pheno_mat, chunk_size, flank_chunks, min_chunk_snps, alpha, alpha_common, common_filename, common_window, max_common_snps, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold, binary, annotation, annot_names, chr)
+he_chunk_spa <- function(filename, pheno_mat, chunk_size = 256L, flank_chunks = 1L, min_chunk_snps = 5L, alpha = -1.0, alpha_common = -1.0, common_filename = NULL, common_window = NA_real_, max_common_snps = 256L, out_file = "", batch_size = 64L, n_threads = 0L, weights = NULL, covariates = NULL, SPA = TRUE, spa_pval_threshold = 0.1, binary = FALSE, annotation = NULL, annot_names = NULL, chr = NULL, flank_categories = NULL) {
+    .Call(`_StratGWAS_he_chunk_spa`, filename, pheno_mat, chunk_size, flank_chunks, min_chunk_snps, alpha, alpha_common, common_filename, common_window, max_common_snps, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold, binary, annotation, annot_names, chr, flank_categories)
 }
 
 computeLDscoresFromBED <- function(file_prefix, geno_set) {

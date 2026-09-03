@@ -454,6 +454,9 @@ struct ChunkContext {
     bool use_annot; int n_annot_cat;
     std::vector<std::string> annot_names;
     std::vector<int> snp_cat;
+    // flank_categories: 1 = this SNP may be used as a flank SNP. Empty = no
+    // restriction, in which case the flank is built exactly as before.
+    std::vector<unsigned char> flank_ok;
     // Thread-safe genotype readers (replace readBedBlock in the hot path).
     BedReader wes, com;
     // Precomputed per-chromosome index range in the COMMON .bim. The old code
@@ -626,6 +629,51 @@ static void apply_alpha(GenoMat& X, const std::vector<float>& maf, double alpha,
                       if (lw < 0.0) lw = 0.0; w *= std::sqrt(lw); }
         if (w != 1.0) X.col(j) *= (float) w;
     }
+}
+
+// As apply_alpha, but for a non-contiguous SNP selection: the per-SNP weight
+// lookup uses sel[j] instead of i0 + j.
+static void apply_alpha_sel(GenoMat& X, const std::vector<float>& maf, double alpha,
+                            const std::vector<float>* wts, const std::vector<int>& sel) {
+    bool unit = (alpha == -1.0);
+    double e = (1.0 + alpha) / 2.0;
+    int nw = (wts != 0) ? (int) wts->size() : 0;
+    for (int j = 0; j < X.cols(); ++j) {
+        double w = 1.0;
+        if (!unit) { double f = maf[j]; w = (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), e) : 1.0; }
+        if (nw > 0) { int g = sel[j]; double lw = (g >= 0 && g < nw) ? (double)(*wts)[g] : 1.0;
+                      if (lw < 0.0) lw = 0.0; w *= std::sqrt(lw); }
+        if (w != 1.0) X.col(j) *= (float) w;
+    }
+}
+
+// Walk outward from a chunk edge collecting up to `want` WES indices that are
+// eligible for the flank. step = -1 walks left from the chunk start, +1 walks
+// right from the chunk end. Ineligible SNPs are stepped over rather than
+// counted, so the flank keeps its nominal size but spans more bp.
+// Returns indices in ASCENDING order, as read_raw_sel requires.
+static std::vector<int> flank_sel(const std::vector<unsigned char>& ok,
+                                  int edge, int step, int lo, int hi, int want) {
+    std::vector<int> sel;
+    if (want <= 0) return sel;
+    sel.reserve(want);
+    for (int j = edge; j >= lo && j <= hi && (int) sel.size() < want; j += step)
+        if (ok.empty() || ok[j]) sel.push_back(j);
+    if (step < 0) std::reverse(sel.begin(), sel.end());
+    return sel;
+}
+
+// Read an arbitrary (sorted, ascending) list of WES SNPs as one Cell.
+static bool read_cell_sel(const BedReader& br, const std::vector<int>& keep,
+                          const std::vector<int>& sel, Cell& cell) {
+    cell = Cell(); cell.i0 = -1;
+    if (sel.empty()) { cell.X = GenoMat((int) keep.size(), 0); return true; }
+    GenoMat X;
+    if (!br.read_raw_sel(keep, sel, X)) return false;
+    standardize_capture_maf(X, cell.maf);
+    cell.X = std::move(X);
+    cell.i0 = sel.front();
+    return true;
 }
 // ===========================================================================
 // EXACT-CUMULANT MACHINERY FOR A NON-GAUSSIAN PHENOTYPE   (binary path only)
@@ -1523,12 +1571,23 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
 
     Cell fl; fl.X = GenoMat(ctx.n_inds, 0);
     Cell fr; fr.X = GenoMat(ctx.n_inds, 0);
-    if (fL1 > fL0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fL0, fL1, fl)) return false;
-                     if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
-                     apply_alpha(fl.X, fl.maf, ctx.alpha, wp, fL0); }
-    if (fR1 > fR0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fR0, fR1, fr)) return false;
-                     if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
-                     apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
+    if (ctx.flank_ok.empty()) {
+        if (fL1 > fL0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fL0, fL1, fl)) return false;
+                         if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
+                         apply_alpha(fl.X, fl.maf, ctx.alpha, wp, fL0); }
+        if (fR1 > fR0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fR0, fR1, fr)) return false;
+                         if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
+                         apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
+    } else {
+        const std::vector<int> selL = flank_sel(ctx.flank_ok, a - 1, -1, chr_lo, chr_hi, flank_snps);
+        const std::vector<int> selR = flank_sel(ctx.flank_ok, b,     +1, chr_lo, chr_hi, flank_snps);
+        if (!selL.empty()) { if (!read_cell_sel(ctx.wes, ctx.geno_keep, selL, fl)) return false;
+                             if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
+                             apply_alpha_sel(fl.X, fl.maf, ctx.alpha, wp, selL); }
+        if (!selR.empty()) { if (!read_cell_sel(ctx.wes, ctx.geno_keep, selR, fr)) return false;
+                             if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
+                             apply_alpha_sel(fr.X, fr.maf, ctx.alpha, wp, selR); }
+    }
     cd.m_f = (int) fl.X.cols() + (int) fr.X.cols();
     // NOTE: the "no background" bail-out now happens AFTER the common set is read,
     // because with flank_chunks = 0 the common SNPs take over as the background.
@@ -1887,12 +1946,23 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
     const int fR0 = b, fR1 = std::min(chr_hi + 1, b + flank_snps);
     Cell fl; fl.X = GenoMat(ctx.n_inds, 0);
     Cell fr; fr.X = GenoMat(ctx.n_inds, 0);
-    if (fL1 > fL0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fL0, fL1, fl)) return false;
-                     if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
-                     apply_alpha(fl.X, fl.maf, ctx.alpha, wp, fL0); }
-    if (fR1 > fR0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fR0, fR1, fr)) return false;
-                     if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
-                     apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
+    if (ctx.flank_ok.empty()) {
+        if (fL1 > fL0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fL0, fL1, fl)) return false;
+                         if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
+                         apply_alpha(fl.X, fl.maf, ctx.alpha, wp, fL0); }
+        if (fR1 > fR0) { if (!read_cell_idx(ctx.wes, ctx.geno_keep, fR0, fR1, fr)) return false;
+                         if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
+                         apply_alpha(fr.X, fr.maf, ctx.alpha, wp, fR0); }
+    } else {
+        const std::vector<int> selL = flank_sel(ctx.flank_ok, a - 1, -1, chr_lo, chr_hi, flank_snps);
+        const std::vector<int> selR = flank_sel(ctx.flank_ok, b,     +1, chr_lo, chr_hi, flank_snps);
+        if (!selL.empty()) { if (!read_cell_sel(ctx.wes, ctx.geno_keep, selL, fl)) return false;
+                             if (ctx.covZ.cols() > 0) project_covariates(fl.X, ctx.covZ, ctx.covM);
+                             apply_alpha_sel(fl.X, fl.maf, ctx.alpha, wp, selL); }
+        if (!selR.empty()) { if (!read_cell_sel(ctx.wes, ctx.geno_keep, selR, fr)) return false;
+                             if (ctx.covZ.cols() > 0) project_covariates(fr.X, ctx.covZ, ctx.covM);
+                             apply_alpha_sel(fr.X, fr.maf, ctx.alpha, wp, selR); }
+    }
     // Background = adjacent chunks + any middle SNP in no category. The bail-out
     // moved BELOW the common read: with flank_chunks = 0 and a complete annotation
     // this count is legitimately zero, and the common SNPs take over as the
@@ -2431,12 +2501,40 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         bool binary = false,
                         Rcpp::Nullable<Rcpp::IntegerMatrix> annotation = R_NilValue,
                         Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue,
-                        SEXP chr = R_NilValue) {
+                        SEXP chr = R_NilValue,
+                        Rcpp::Nullable<Rcpp::IntegerVector> flank_categories = R_NilValue) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (flank_chunks < 0) stop("flank_chunks must be >= 0");
     ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
                                            common_filename, weights, covariates,
                                            annotation, annot_names);
+    // flank_categories = which annotation columns may supply flank SNPs (1-based,
+    // matching annot_names). Left NULL, the flank is built exactly as before.
+    if (flank_categories.isNotNull()) {
+        if (!ctx.use_annot)
+            stop("flank_categories requires an annotation matrix");
+        Rcpp::IntegerVector fc(flank_categories.get());
+        std::vector<bool> allow((size_t) ctx.n_annot_cat, false);
+        for (int i = 0; i < fc.size(); ++i) {
+            int c = fc[i];
+            if (c < 1 || c > ctx.n_annot_cat)
+                stop("flank_categories entries must lie between 1 and " +
+                     std::to_string(ctx.n_annot_cat));
+            allow[c - 1] = true;
+        }
+        ctx.flank_ok.assign(ctx.snp_cat.size(), 0);
+        long n_ok = 0;
+        for (size_t j = 0; j < ctx.snp_cat.size(); ++j) {
+            int c = ctx.snp_cat[j];
+            if (c >= 0 && allow[(size_t) c]) { ctx.flank_ok[j] = 1; ++n_ok; }
+        }
+        Rcout << "Flank restricted to categories:";
+        for (int c = 0; c < ctx.n_annot_cat; ++c)
+            if (allow[(size_t) c]) Rcout << " " << ctx.annot_names[c];
+        Rcout << "  (" << n_ok << " of " << ctx.snp_cat.size() << " SNPs eligible)\n";
+        if (n_ok == 0) stop("flank_categories leaves no eligible flank SNPs");
+    }
+
     ChunkParams pr;
     pr.chunk_size = chunk_size; pr.flank_chunks = flank_chunks;
     pr.min_chunk_snps = min_chunk_snps;
