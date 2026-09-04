@@ -1111,12 +1111,16 @@ struct ChunkData {
     // When flank_chunks = 0 the common SNPs ARE the background component, so they
     // occupy the flank block of V. Only affects how the columns are reported.
     bool flank_is_common;
-    ChunkData() : i0_target(0), m_t(0), m_f(0), m_c(0), K(0), flank_is_common(false) {}
+    // bp span of the common SNPs actually used for the background GRM (-1 = none)
+    long c_bp_lo, c_bp_hi;
+    ChunkData() : i0_target(0), m_t(0), m_f(0), m_c(0), K(0), flank_is_common(false),
+                  c_bp_lo(-1), c_bp_hi(-1) {}
 };
 
 struct ChunkResult {
     std::string chr; long start, end;
     int m_t, m_f, m_c;
+    long c_bp_lo, c_bp_hi;
     std::vector<double> vg, se_vg, h2, p_spa;
     std::vector<int> spa_used;
 };
@@ -1170,6 +1174,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     cr.chr = cd.chr; cr.start = cd.start; cr.end = cd.end;
     // Report honestly: when flank_chunks = 0 the flank block holds the common SNPs.
     cr.m_t = m_t;
+    cr.c_bp_lo = cd.c_bp_lo; cr.c_bp_hi = cd.c_bp_hi;
     cr.m_f = cd.flank_is_common ? 0   : m_f;
     cr.m_c = cd.flank_is_common ? m_f : m_c;
     cr.vg.assign(P, NA_REAL); cr.se_vg.assign(P, NA_REAL);
@@ -1609,13 +1614,29 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
             if (!read_cell(ctx.com, ctx.common_bim, ctx.common_keep, cc_lo, cc_hi,
                            lo_bp, common_bp, max_common, com)) return false;
             thin_cell(com, max_common);   // no-op now: read_cell already capped it
+            {   // bp span of the SNPs actually selected (mirrors read_cell's striding)
+                int ci0 = lower_index(ctx.common_bim.bp, cc_lo, cc_hi, lo_bp);
+                int ci1 = lower_index(ctx.common_bim.bp, cc_lo, cc_hi, lo_bp + common_bp);
+                if (ci1 > ci0) {
+                    int last = ci1 - 1, mm = ci1 - ci0;
+                    if (max_common > 0 && mm > max_common) {
+                        int stride = (mm + max_common - 1) / max_common, cnt = 0;
+                        for (int j2 = ci0; j2 < ci1 && cnt < max_common; j2 += stride) { last = j2; ++cnt; }
+                    }
+                    cd.c_bp_lo = ctx.common_bim.bp[ci0];
+                    cd.c_bp_hi = ctx.common_bim.bp[last];
+                }
+            }
         } else {
             // No window specified: take the max_common nearest common SNPs to the
             // chunk midpoint directly. K_tot is bounded by max_common exactly, so
             // no thinning step is needed.
             std::pair<int,int> rng = nearest_snp_range(ctx.common_bim.bp, cc_lo, cc_hi, ctr, max_common);
-            if (rng.second > rng.first)
+            if (rng.second > rng.first) {
                 if (!read_cell_idx(ctx.com, ctx.common_keep, rng.first, rng.second, com)) return false;
+                cd.c_bp_lo = ctx.common_bim.bp[rng.first];
+                cd.c_bp_hi = ctx.common_bim.bp[rng.second - 1];
+            }
         }
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
@@ -1784,7 +1805,7 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     if (tofile) {
         fout.open(pr.out_file.c_str());
         if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
-        fout << "chr\tstart\tend\tm_chunk\tm_flank\tm_common\tphenotype\tvg\tse_vg\th2";
+        fout << "chr\tstart\tend\tm_chunk\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2";
         if (pr.spa) fout << "\tp_spa\tspa_used";
         fout << "\n";
     }
@@ -1849,6 +1870,7 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
             for (int t = 0; t < P; ++t) {
                 fout << cr.chr << '\t' << cr.start << '\t' << cr.end << '\t'
                      << cr.m_t << '\t' << cr.m_f << '\t' << cr.m_c << '\t'
+                     << cr.c_bp_lo << '\t' << cr.c_bp_hi << '\t'
                      << as<std::string>(ctx.trait_names[t]) << '\t';
                 wr(fout, cr.vg[t]);    fout << '\t';
                 wr(fout, cr.se_vg[t]); fout << '\t';
@@ -1900,11 +1922,14 @@ struct ChunkDataA {
     GenoMat V;                         // [cat_0 | ... | cat_{A-1} | flank | common]
     std::vector<double> cj;
     bool flank_is_common;              // flank_chunks = 0: common SNPs are the background
-    ChunkDataA() : m_flank(0), m_common(0), K(0), flank_is_common(false) {}
+    long c_bp_lo, c_bp_hi;             // bp span of the common SNPs used (-1 = none)
+    ChunkDataA() : m_flank(0), m_common(0), K(0), flank_is_common(false),
+                   c_bp_lo(-1), c_bp_hi(-1) {}
 };
 struct ChunkResultA {
     std::string chr; long start, end;
     int m_flank, m_common;
+    long c_bp_lo, c_bp_hi;
     std::vector<std::string> cat_name;
     std::vector<int> cat_m;
     std::vector< std::vector<double> > vg, se_vg, h2, p_spa;   // [cat][trait]
@@ -1981,10 +2006,26 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
             if (!read_cell(ctx.com, ctx.common_bim, ctx.common_keep, cc_lo, cc_hi,
                            lo_bp, common_bp, max_common, com)) return false;
             thin_cell(com, max_common);   // no-op now: read_cell already capped it
+            {   // bp span of the SNPs actually selected (mirrors read_cell's striding)
+                int ci0 = lower_index(ctx.common_bim.bp, cc_lo, cc_hi, lo_bp);
+                int ci1 = lower_index(ctx.common_bim.bp, cc_lo, cc_hi, lo_bp + common_bp);
+                if (ci1 > ci0) {
+                    int last = ci1 - 1, mm = ci1 - ci0;
+                    if (max_common > 0 && mm > max_common) {
+                        int stride = (mm + max_common - 1) / max_common, cnt = 0;
+                        for (int j2 = ci0; j2 < ci1 && cnt < max_common; j2 += stride) { last = j2; ++cnt; }
+                    }
+                    cd.c_bp_lo = ctx.common_bim.bp[ci0];
+                    cd.c_bp_hi = ctx.common_bim.bp[last];
+                }
+            }
         } else {
             std::pair<int,int> rng = nearest_snp_range(ctx.common_bim.bp, cc_lo, cc_hi, ctr, max_common);
-            if (rng.second > rng.first)
+            if (rng.second > rng.first) {
                 if (!read_cell_idx(ctx.com, ctx.common_keep, rng.first, rng.second, com)) return false;
+                cd.c_bp_lo = ctx.common_bim.bp[rng.first];
+                cd.c_bp_hi = ctx.common_bim.bp[rng.second - 1];
+            }
         }
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
@@ -2049,6 +2090,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     // Report honestly when the common set is standing in as the background.
     cr.m_flank  = cd.flank_is_common ? 0           : cd.m_flank;
     cr.m_common = cd.flank_is_common ? cd.m_flank  : cd.m_common;
+    cr.c_bp_lo = cd.c_bp_lo; cr.c_bp_hi = cd.c_bp_hi;
     cr.cat_name = cd.cat_name; cr.cat_m = cd.cat_m;
     cr.vg.assign(A, std::vector<double>(P, NA_REAL));
     cr.se_vg.assign(A, std::vector<double>(P, NA_REAL));
@@ -2406,7 +2448,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
     if (tofile) {
         fout.open(pr.out_file.c_str());
         if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
-        fout << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tm_common\tphenotype\tvg\tse_vg\th2";
+        fout << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2";
         if (pr.spa) fout << "\tp_spa\tspa_used";
         fout << "\n";
     }
@@ -2450,6 +2492,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
                     fout << cr.chr << '\t' << cr.start << '\t' << cr.end << '\t'
                          << cr.cat_name[c] << '\t' << cr.cat_m[c] << '\t'
                          << cr.m_flank << '\t' << cr.m_common << '\t'
+                         << cr.c_bp_lo << '\t' << cr.c_bp_hi << '\t'
                          << as<std::string>(ctx.trait_names[t]) << '\t';
                     wr(fout, cr.vg[c][t]);    fout << '\t';
                     wr(fout, cr.se_vg[c][t]); fout << '\t';
