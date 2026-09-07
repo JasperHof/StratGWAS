@@ -160,7 +160,8 @@ he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
                         outfile, batch_size = 4, n_threads = 1,
                         covariates = NULL, SPA = T, spa_pval_threshold = 0.1,
                         annotation = NULL, annot_names = NULL,
-                        binary = F, chr = NULL, flank_categories = NULL) {
+                        binary = F, chr = NULL, flank_categories = NULL,
+                        project_common = F) {
 
   #storage.mode(snp_cat) <- "integer"          # <- force integer
   #snp_cat <- as.matrix(snp_cat)               # ensure it's a matrix, not df
@@ -205,7 +206,8 @@ he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
     annot_names = annot_names,
     binary      = binary,
     chr         = chr,
-    flank_categories = flank_categories
+    flank_categories = flank_categories,
+    project_common = project_common,
   )
 
   # hers$genome_h2 contains the genome estimates per alpha

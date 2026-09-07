@@ -457,6 +457,9 @@ struct ChunkContext {
     // flank_categories: 1 = this SNP may be used as a flank SNP. Empty = no
     // restriction, in which case the flank is built exactly as before.
     std::vector<unsigned char> flank_ok;
+    // project_common: remove everything the local common SNPs can explain from the
+    // WES genotypes, so the WES kernels are orthogonal to the common panel.
+    bool project_common;
     // Thread-safe genotype readers (replace readBedBlock in the hot path).
     BedReader wes, com;
     // Precomputed per-chromosome index range in the COMMON .bim. The old code
@@ -477,6 +480,25 @@ static void project_covariates(GenoMat& X, const GenoMat& Z, const GenoMat& M) {
     }
 }
 
+// Project a chunk's COMMON block out of a WES block:  X <- X - C (C'C)^+ C'X,
+// then restore unit column variance (same convention as project_covariates).
+// The WES kernels then cannot see any signal the local common SNPs can explain,
+// so the estimand becomes rare-variant variance CONDITIONAL on those SNPs.
+// (C'C)^+ is formed once per chunk and shared by the target and both flanks.
+static void project_out_common(GenoMat& X, const GenoMat& C,
+                               const Eigen::MatrixXd& CtCinv) {
+    if (X.cols() == 0 || C.cols() == 0) return;
+    Eigen::MatrixXd CtX = (C.transpose() * X).cast<double>();   // m_c x m_w, small
+    GenoMat B = (CtCinv * CtX).cast<float>();                   // m_c x m_w
+    X.noalias() -= C * B;
+    const int n = (int) X.rows();
+    for (int j = 0; j < X.cols(); ++j) {
+        double ss = X.col(j).cast<double>().squaredNorm();
+        double sd = std::sqrt(ss / (n - 1));
+        if (sd > 1e-10) X.col(j) /= (float) sd; else X.col(j).setZero();
+    }
+}
+
 static ChunkContext setup_chunk_context(const std::string& filename, const SEXP pheno_mat,
                                     double alpha, double alpha_common,
                                     Rcpp::Nullable<Rcpp::String> common_filename,
@@ -486,6 +508,7 @@ static ChunkContext setup_chunk_context(const std::string& filename, const SEXP 
                                     Rcpp::Nullable<Rcpp::CharacterVector> annot_names) {
     ChunkContext ctx;
     ctx.use_annot = false; ctx.n_annot_cat = 0;
+    ctx.project_common = false;
     ctx.wes_prefix = filename;
     ctx.wes_n_snps = count_lines(filename + ".bim");
     List fam = read_fam_file(filename);
@@ -1657,6 +1680,14 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
             apply_alpha(com.X, com.maf, ctx.alpha_common, 0, 0);
+            if (ctx.project_common) {
+                Eigen::MatrixXd CtC = (com.X.transpose() * com.X).cast<double>();
+                Eigen::MatrixXd CtCinv =
+                    CtC.completeOrthogonalDecomposition().pseudoInverse();
+                project_out_common(tgt.X, com.X, CtCinv);
+                project_out_common(fl.X,  com.X, CtCinv);
+                project_out_common(fr.X,  com.X, CtCinv);
+            }
         }
     }
     cd.m_c = (int) com.X.cols();
@@ -2051,6 +2082,14 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
         if (com.X.cols() > 0) {
             if (ctx.covZ.cols() > 0) project_covariates(com.X, ctx.covZ, ctx.covM);
             apply_alpha(com.X, com.maf, ctx.alpha_common, 0, 0);
+            if (ctx.project_common) {
+                Eigen::MatrixXd CtC = (com.X.transpose() * com.X).cast<double>();
+                Eigen::MatrixXd CtCinv =
+                    CtC.completeOrthogonalDecomposition().pseudoInverse();
+                project_out_common(tgt.X, com.X, CtCinv);
+                project_out_common(fl.X,  com.X, CtCinv);
+                project_out_common(fr.X,  com.X, CtCinv);
+            }
         }
     }
     int m_c = (int) com.X.cols();
@@ -2582,7 +2621,8 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         Rcpp::Nullable<Rcpp::IntegerMatrix> annotation = R_NilValue,
                         Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue,
                         SEXP chr = R_NilValue,
-                        Rcpp::Nullable<Rcpp::IntegerVector> flank_categories = R_NilValue) {
+                        Rcpp::Nullable<Rcpp::IntegerVector> flank_categories = R_NilValue,
+                        bool project_common = false) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (flank_chunks < 0) stop("flank_chunks must be >= 0");
     ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
@@ -2613,6 +2653,16 @@ Rcpp::List he_chunk_spa(const std::string& filename,
             if (allow[(size_t) c]) Rcout << " " << ctx.annot_names[c];
         Rcout << "  (" << n_ok << " of " << ctx.snp_cat.size() << " SNPs eligible)\n";
         if (n_ok == 0) stop("flank_categories leaves no eligible flank SNPs");
+    }
+
+    // project_common: orthogonalise the WES genotypes against the chunk's common
+    // block before anything else is computed.
+    ctx.project_common = project_common;
+    if (project_common) {
+        if (!ctx.use_common)
+            stop("project_common = TRUE requires a common_filename");
+        Rcout << "Projecting the common block out of the WES genotypes "
+              << "(estimand: rare-variant variance conditional on local common SNPs)\n";
     }
 
     ChunkParams pr;

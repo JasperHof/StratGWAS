@@ -25,7 +25,8 @@ he_reg_spa(
   annot_names = NULL,
   binary = F,
   chr = NULL,
-  flank_categories = NULL
+  flank_categories = NULL,
+  project_common = F
 )
 }
 \description{
