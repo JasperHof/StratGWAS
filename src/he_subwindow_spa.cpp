@@ -1123,6 +1123,8 @@ struct ChunkResult {
     long c_bp_lo, c_bp_hi;
     std::vector<double> vg, se_vg, h2, p_spa;
     std::vector<int> spa_used;
+    // background variance components, per trait (NA when the component is absent)
+    std::vector<double> vg_flank, vg_common, vg_env;
 };
 
 // Components: 0 = target chunk, 1 = flank, 2 = common (if any), env = residual.
@@ -1177,6 +1179,8 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     cr.c_bp_lo = cd.c_bp_lo; cr.c_bp_hi = cd.c_bp_hi;
     cr.m_f = cd.flank_is_common ? 0   : m_f;
     cr.m_c = cd.flank_is_common ? m_f : m_c;
+    cr.vg_flank.assign(P, NA_REAL); cr.vg_common.assign(P, NA_REAL);
+    cr.vg_env.assign(P, NA_REAL);
     cr.vg.assign(P, NA_REAL); cr.se_vg.assign(P, NA_REAL);
     cr.h2.assign(P, NA_REAL); cr.p_spa.assign(P, NA_REAL);
     cr.spa_used.assign(P, 0);
@@ -1350,6 +1354,18 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
 
         Eigen::VectorXd sigma = Tcod.solve(q);
         cr.vg[t] = sigma[0];
+        {   // background components. Column order in V is target, flank, common;
+            // when flank_chunks = 0 the flank block IS the common set, reported as such.
+            const int i_f = (m_f > 0) ? 1 : -1;
+            const int i_c = (m_c > 0) ? ((m_f > 0) ? 2 : 1) : -1;
+            if (cd.flank_is_common) {
+                cr.vg_common[t] = (i_f >= 0) ? sigma[i_f] : NA_REAL;
+            } else {
+                cr.vg_flank[t]  = (i_f >= 0) ? sigma[i_f] : NA_REAL;
+                cr.vg_common[t] = (i_c >= 0) ? sigma[i_c] : NA_REAL;
+            }
+            cr.vg_env[t] = sigma[env];
+        }
         cr.h2[t] = (Vp[t] > 0) ? sigma[0] / Vp[t] : NA_REAL;
         if (!spa || !have_L) continue;
 
@@ -1805,7 +1821,7 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
     if (tofile) {
         fout.open(pr.out_file.c_str());
         if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
-        fout << "chr\tstart\tend\tm_chunk\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2";
+        fout << "chr\tstart\tend\tm_chunk\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_common\tvg_env";
         if (pr.spa) fout << "\tp_spa\tspa_used";
         fout << "\n";
     }
@@ -1875,6 +1891,9 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
                 wr(fout, cr.vg[t]);    fout << '\t';
                 wr(fout, cr.se_vg[t]); fout << '\t';
                 wr(fout, cr.h2[t]);
+                fout << '\t'; wr(fout, cr.vg_flank[t]);
+                fout << '\t'; wr(fout, cr.vg_common[t]);
+                fout << '\t'; wr(fout, cr.vg_env[t]);
                 if (pr.spa) { fout << '\t'; wr(fout, cr.p_spa[t]); fout << '\t' << cr.spa_used[t]; }
                 fout << '\n';
             }
@@ -1934,6 +1953,8 @@ struct ChunkResultA {
     std::vector<int> cat_m;
     std::vector< std::vector<double> > vg, se_vg, h2, p_spa;   // [cat][trait]
     std::vector< std::vector<int> > spa_used;                   // [cat][trait]
+    // background components are per CHUNK, not per category: one value per trait
+    std::vector<double> vg_flank, vg_common, vg_env;
 };
 
 // Assemble one chunk, partitioning the target's columns by annotation category.
@@ -2092,6 +2113,8 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     cr.m_common = cd.flank_is_common ? cd.m_flank  : cd.m_common;
     cr.c_bp_lo = cd.c_bp_lo; cr.c_bp_hi = cd.c_bp_hi;
     cr.cat_name = cd.cat_name; cr.cat_m = cd.cat_m;
+    cr.vg_flank.assign(P, NA_REAL); cr.vg_common.assign(P, NA_REAL);
+    cr.vg_env.assign(P, NA_REAL);
     cr.vg.assign(A, std::vector<double>(P, NA_REAL));
     cr.se_vg.assign(A, std::vector<double>(P, NA_REAL));
     cr.h2.assign(A, std::vector<double>(P, NA_REAL));
@@ -2254,6 +2277,17 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
         for (int c = 0; c < A; ++c) {
             cr.vg[c][t] = sigma[c];
             cr.h2[c][t] = (Vp[t] > 0) ? sigma[c] / Vp[t] : NA_REAL;
+        }
+        {   // background components, per chunk (same value on every category row)
+            const int i_f = has_f ? A : -1;
+            const int i_c = has_c ? (A + (has_f ? 1 : 0)) : -1;
+            if (cd.flank_is_common) {
+                cr.vg_common[t] = (i_f >= 0) ? sigma[i_f] : NA_REAL;
+            } else {
+                cr.vg_flank[t]  = (i_f >= 0) ? sigma[i_f] : NA_REAL;
+                cr.vg_common[t] = (i_c >= 0) ? sigma[i_c] : NA_REAL;
+            }
+            cr.vg_env[t] = sigma[env];
         }
         if (!spa || !have_L) continue;
 
@@ -2448,7 +2482,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
     if (tofile) {
         fout.open(pr.out_file.c_str());
         if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
-        fout << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2";
+        fout << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_common\tvg_env";
         if (pr.spa) fout << "\tp_spa\tspa_used";
         fout << "\n";
     }
@@ -2497,6 +2531,9 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
                     wr(fout, cr.vg[c][t]);    fout << '\t';
                     wr(fout, cr.se_vg[c][t]); fout << '\t';
                     wr(fout, cr.h2[c][t]);
+                    fout << '\t'; wr(fout, cr.vg_flank[t]);
+                    fout << '\t'; wr(fout, cr.vg_common[t]);
+                    fout << '\t'; wr(fout, cr.vg_env[t]);
                     if (pr.spa) { fout << '\t'; wr(fout, cr.p_spa[c][t]); fout << '\t' << cr.spa_used[c][t]; }
                     fout << '\n';
                 }
