@@ -263,8 +263,30 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   }
 
   # Compute Cochran's Q statistic for each stratifcation variable
+  cochran <- vector("list", length(strata$strat_details))
+
   for (k in 1:length(strata$strat_details)) {
-    idx <- which(grepl(paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index, "_"), colnames(gencov_all)))
+    idx <- which(grepl(paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index, "_"), colnames(multi)))
+    BETA <- do.call(cbind, lapply(ss_list[idx], function(x) x$BETA))
+    SE <- do.call(cbind, lapply(ss_list[idx], function(x) x$SE))
+    rownames(BETA) <- rownames(SE) <- ss_list[[1]]$Predictor
+
+    # Compute Cochran's Q per SNP and test significance
+    W        <- 1 / SE^2                                    # inverse-variance weights
+    beta_bar <- rowSums(W * BETA) / rowSums(W)              # weighted mean effect per SNP
+    Q        <- rowSums(W * (BETA - beta_bar)^2)            # Cochran's Q
+    df       <- length(idx) - 1
+
+    # Q ~ chi-square(df) under homogeneity ----------------
+    P_het <- pchisq(Q, df = df, lower.tail = FALSE)
+    I2    <- pmax(0, (Q - df) / Q) * 100
+
+    # Return dataframe
+    het <- data.frame("snp" = ss_list[[1]]$Predictor, "beta_bar" = beta_bar, "Q" = Q, "I2" = I2, "P_het" = P_het)
+    colnames(het) <- paste0(colnames(het), "_", paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index))
+    rownames(het) <- NULL
+
+    cochran[[k]] <- het
   }
   
   # Compute liability scale heritabilities + SE
@@ -298,6 +320,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     jack_ests = jack_ests,
     jack = jack,
     hers = hers,
+    cochran = cochran,
     var_names = colnames(multi),
     strat_details = strata$strat_details
   )

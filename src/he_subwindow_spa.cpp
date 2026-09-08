@@ -1182,7 +1182,7 @@ struct ChunkResult {
 static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
                        const std::vector<double>& Vp, const std::vector<double>& yty,
                        const std::vector<double>& kur, bool binary,
-                       bool spa, double spa_thresh, bool off_diag,
+                       bool spa, double spa_thresh, bool off_diag, int cov_df,
                        ChunkResult& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
     const int K = cd.K, m_t = cd.m_t, m_f = cd.m_f, m_c = cd.m_c;
@@ -1231,8 +1231,15 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                 G2.block(off[a], off[b], off[a+1]-off[a], off[b+1]-off[b]).sum();
             T(a,b) = v; T(b,a) = v;
         }
+    // tr(K_a) = n by construction (g_a = n / tr(S_a)), and K_a = P K_a P because
+    // the covariates were projected out of the genotypes, so tr(P K_a) = n still.
+    // But tr(P) = n - cov_df, NOT n: y lives in the orthogonal complement of the
+    // cov_df covariate directions, so E(y'y) = sum_b sigma_b n + sigma_e (n - cov_df).
+    // Using n here forces the missing sigma_e * cov_df into the genetic components:
+    // sigma_hat_a gains approximately sigma_e * cov_df * m_a / n^2, a positive offset
+    // proportional to the number of covariates and to the SNP count of the component.
     for (int a = 0; a < C; ++a) { T(a,env) = (double) n; T(env,a) = (double) n; }
-    T(env,env) = (double) n;
+    T(env,env) = (double) (n - cov_df);
     Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
     Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
 
@@ -1571,6 +1578,8 @@ struct ChunkParams {
     long common_bp; bool common_window_given; int max_common_snps;
     bool spa; double spa_thresh; bool binary;
     bool off_diag;                 // classical HE: use off-diagonal pairs only
+    int  cov_df;                   // rank of the projection already applied to y:
+                                   // n_covariates + 1 (intercept). T(env,env) = n - cov_df.
     std::string out_file; int batch_size, n_threads;
     std::string chr;                 // "" = all chromosomes; else test only this one
 };
@@ -1794,7 +1803,8 @@ struct ChunkWorker : public RcppParallel::Worker {
             if (!make_chunk(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
                             flank_snps, pr.common_bp, pr.common_window_given,
                             pr.max_common_snps, cd)) { ok[w] = 0; continue; }
-            test_chunk(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, pr.off_diag, out[w]);
+            test_chunk(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, pr.off_diag,
+                       pr.cov_df, out[w]);
             ok[w] = 1;
         }
     }
@@ -2162,7 +2172,7 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
 static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
                              const std::vector<double>& Vp, const std::vector<double>& yty,
                              const std::vector<double>& kur, bool binary,
-                             bool spa, double spa_thresh, bool off_diag,
+                             bool spa, double spa_thresh, bool off_diag, int cov_df,
                              ChunkResultA& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
     const int A = (int) cd.cat_m.size();
@@ -2213,8 +2223,9 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             double v = g[a] * g[b] * G2.block(off[a], off[b], off[a+1]-off[a], off[b+1]-off[b]).sum();
             T(a, b) = v; T(b, a) = v;
         }
+    // See test_chunk: tr(P) = n - cov_df, not n, once covariates are regressed out.
     for (int a = 0; a < C; ++a) { T(a, env) = (double) n; T(env, a) = (double) n; }
-    T(env, env) = (double) n;
+    T(env, env) = (double) (n - cov_df);
     Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
     Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
 
@@ -2520,7 +2531,8 @@ struct ChunkWorkerA : public RcppParallel::Worker {
             if (!make_chunk_annot(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
                                   flank_snps, pr.common_bp, pr.common_window_given,
                                   pr.max_common_snps, cd)) { ok[w] = 0; continue; }
-            test_chunk_annot(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, pr.off_diag, out[w]);
+            test_chunk_annot(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh,
+                             pr.off_diag, pr.cov_df, out[w]);
             ok[w] = 1;
         }
     }
@@ -2676,7 +2688,8 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         SEXP chr = R_NilValue,
                         Rcpp::Nullable<Rcpp::IntegerVector> flank_categories = R_NilValue,
                         bool project_common = false,
-                        bool off_diag = false) {
+                        bool off_diag = false,
+                        double cov_df = NA_REAL) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (flank_chunks < 0) stop("flank_chunks must be >= 0");
     ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
@@ -2729,6 +2742,16 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     pr.max_common_snps = max_common_snps;
     pr.spa = SPA; pr.spa_thresh = spa_pval_threshold; pr.binary = binary;
     pr.off_diag = off_diag;
+    // Degrees of freedom removed from the phenotype before it reached us.
+    // Auto = (number of covariate columns) + 1 for the intercept, since both the
+    // phenotype and the genotypes are mean-centred. Pass cov_df explicitly if the
+    // phenotype was residualised on a different set than the one handed to this
+    // function, or cov_df = 0 to restore the old (uncorrected) behaviour.
+    pr.cov_df = ISNAN(cov_df) ? ((int) ctx.covZ.cols() + 1) : (int) cov_df;
+    if (pr.cov_df < 0) pr.cov_df = 0;
+    if (pr.cov_df >= ctx.n_inds) stop("cov_df must be smaller than the sample size");
+    Rcout << "Environment moment uses tr(I - P) correction: T(env,env) = n - "
+          << pr.cov_df << " (n = " << ctx.n_inds << ").\n";
     if (off_diag) {
         if (SPA) stop("off_diag = TRUE is not supported with SPA = TRUE: the null "
                       "distribution machinery assumes the full quadratic form");

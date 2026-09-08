@@ -27,7 +27,8 @@ he_reg_spa(
   chr = NULL,
   flank_categories = NULL,
   project_common = F,
-  off_diag = F
+  off_diag = F,
+  cov_df = NA
 )
 }
 \description{
