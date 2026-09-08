@@ -314,3 +314,23 @@ weights_univariate <- function(strata, gencov, trans, gencov_all, names) {
     weights_uni_se = trans_se
   ))
 } 
+
+#' Compute the GDIS estimates of genetic distance between subgroups
+#'
+#' @keywords internal
+gdis <- function(gencov_use, gencor_use) {
+
+  gencor_use[gencor_use > 1] <- 1
+  K  <- nrow(gencov_use)
+  h2 <- diag(gencov_use)                  # subgroup heritabilities
+  GD <- sqrt(h2)                          # Eq 1: distance of each subgroup from controls
+  GA <- acos(gencor_use)                  # Eq 2: angle between every pair of subgroups (radians)
+
+  # Law of cosines -> genetic distance between every pair of subgroups
+  dists <- outer(h2, h2, "+") - 2 * outer(GD, GD) * cos(GA)
+  diag(dists) <- 0
+  GD_pairwise <- sqrt(dists)
+  dimnames(GD_pairwise) <- dimnames(gencov_use)
+
+  return(GD_pairwise)
+} 

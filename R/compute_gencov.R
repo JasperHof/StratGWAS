@@ -262,6 +262,11 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     }
   }
 
+  # Compute Cochran's Q statistic for each stratifcation variable
+  for (k in 1:length(strata$strat_details)) {
+    idx <- which(grepl(paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index, "_"), colnames(gencov_all)))
+  }
+  
   # Compute liability scale heritabilities + SE
   prevs <- colMeans(multi_matched > 0, na.rm = T)
   t <- qnorm(1 - prevs)

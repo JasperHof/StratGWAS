@@ -1182,7 +1182,7 @@ struct ChunkResult {
 static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
                        const std::vector<double>& Vp, const std::vector<double>& yty,
                        const std::vector<double>& kur, bool binary,
-                       bool spa, double spa_thresh,
+                       bool spa, double spa_thresh, bool off_diag,
                        ChunkResult& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
     const int K = cd.K, m_t = cd.m_t, m_f = cd.m_f, m_c = cd.m_c;
@@ -1235,6 +1235,26 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     T(env,env) = (double) n;
     Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
     Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
+
+    // ---- off-diagonal (classical Haseman-Elston) system --------------------
+    // Drop i == j from every moment. D(i,a) = g_a * sum_{j in block a} V(i,j)^2
+    // is the diagonal of K_a, so  T_off(a,b) = tr(K_a K_b) - sum_i K_a,ii K_b,ii
+    // and q_off(a) = y'K_a y - sum_i K_a,ii y_i^2. sigma_e drops out entirely
+    // (sigma_e * I has no off-diagonal), so the system is C x C, not (C+1)^2.
+    Eigen::MatrixXd Doff, Toff;
+    Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod_off;
+    if (off_diag) {
+        Doff.setZero(n, C);
+        for (int a2 = 0; a2 < C; ++a2) {
+            Eigen::ArrayXd acc = Eigen::ArrayXd::Zero(n);
+            for (int j = off[a2]; j < off[a2 + 1]; ++j)
+                acc += cd.V.col(j).cast<double>().array().square();
+            Doff.col(a2) = g[a2] * acc.matrix();
+        }
+        Toff = T.topLeftCorner(C, C) - Doff.transpose() * Doff;
+        Tcod_off.compute(Toff);
+    }
+
 
     // ---- Cholesky of G, once per chunk -------------------------------------
     Eigen::MatrixXd L; bool have_L = false;
@@ -1375,7 +1395,13 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         }
         q[env] = yty[t];                    // constant across chunks; hoisted
 
-        Eigen::VectorXd sigma = Tcod.solve(q);
+        Eigen::VectorXd sigma;
+        if (off_diag) {
+            Eigen::VectorXd y2 = Y.col(t).array().square();
+            Eigen::VectorXd qo = q.head(C) - Doff.transpose() * y2;
+            Eigen::VectorXd so = Tcod_off.solve(qo);
+            sigma.setZero(C + 1); sigma.head(C) = so;      // sigma_e not identified
+        } else sigma = Tcod.solve(q);
         cr.vg[t] = sigma[0];
         {   // background components. Column order in V is target, flank, common;
             // when flank_chunks = 0 the flank block IS the common set, reported as such.
@@ -1544,6 +1570,7 @@ struct ChunkParams {
     int chunk_size, flank_chunks, min_chunk_snps;
     long common_bp; bool common_window_given; int max_common_snps;
     bool spa; double spa_thresh; bool binary;
+    bool off_diag;                 // classical HE: use off-diagonal pairs only
     std::string out_file; int batch_size, n_threads;
     std::string chr;                 // "" = all chromosomes; else test only this one
 };
@@ -1767,7 +1794,7 @@ struct ChunkWorker : public RcppParallel::Worker {
             if (!make_chunk(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
                             flank_snps, pr.common_bp, pr.common_window_given,
                             pr.max_common_snps, cd)) { ok[w] = 0; continue; }
-            test_chunk(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, out[w]);
+            test_chunk(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, pr.off_diag, out[w]);
             ok[w] = 1;
         }
     }
@@ -2135,7 +2162,7 @@ static bool make_chunk_annot(const ChunkContext& ctx, size_t ci, int a, int b,
 static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
                              const std::vector<double>& Vp, const std::vector<double>& yty,
                              const std::vector<double>& kur, bool binary,
-                             bool spa, double spa_thresh,
+                             bool spa, double spa_thresh, bool off_diag,
                              ChunkResultA& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
     const int A = (int) cd.cat_m.size();
@@ -2190,6 +2217,26 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     T(env, env) = (double) n;
     Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
     Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
+
+    // ---- off-diagonal (classical Haseman-Elston) system --------------------
+    // Drop i == j from every moment. D(i,a) = g_a * sum_{j in block a} V(i,j)^2
+    // is the diagonal of K_a, so  T_off(a,b) = tr(K_a K_b) - sum_i K_a,ii K_b,ii
+    // and q_off(a) = y'K_a y - sum_i K_a,ii y_i^2. sigma_e drops out entirely
+    // (sigma_e * I has no off-diagonal), so the system is C x C, not (C+1)^2.
+    Eigen::MatrixXd Doff, Toff;
+    Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod_off;
+    if (off_diag) {
+        Doff.setZero(n, C);
+        for (int a2 = 0; a2 < C; ++a2) {
+            Eigen::ArrayXd acc = Eigen::ArrayXd::Zero(n);
+            for (int j = off[a2]; j < off[a2 + 1]; ++j)
+                acc += cd.V.col(j).cast<double>().array().square();
+            Doff.col(a2) = g[a2] * acc.matrix();
+        }
+        Toff = T.topLeftCorner(C, C) - Doff.transpose() * Doff;
+        Tcod_off.compute(Toff);
+    }
+
 
     Eigen::MatrixXd L; bool have_L = false;
     if (spa) {
@@ -2311,7 +2358,13 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             q[c] = g[c] * qc;
         }
         q[env] = yty[t];
-        Eigen::VectorXd sigma = Tcod.solve(q);
+        Eigen::VectorXd sigma;
+        if (off_diag) {
+            Eigen::VectorXd y2 = Y.col(t).array().square();
+            Eigen::VectorXd qo = q.head(C) - Doff.transpose() * y2;
+            Eigen::VectorXd so = Tcod_off.solve(qo);
+            sigma.setZero(C + 1); sigma.head(C) = so;      // sigma_e not identified
+        } else sigma = Tcod.solve(q);
 
         for (int c = 0; c < A; ++c) {
             cr.vg[c][t] = sigma[c];
@@ -2467,7 +2520,7 @@ struct ChunkWorkerA : public RcppParallel::Worker {
             if (!make_chunk_annot(ctx, j.ci, j.a, j.b, j.chr_lo, j.chr_hi, cc_lo, cc_hi,
                                   flank_snps, pr.common_bp, pr.common_window_given,
                                   pr.max_common_snps, cd)) { ok[w] = 0; continue; }
-            test_chunk_annot(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, out[w]);
+            test_chunk_annot(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, pr.off_diag, out[w]);
             ok[w] = 1;
         }
     }
@@ -2622,7 +2675,8 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue,
                         SEXP chr = R_NilValue,
                         Rcpp::Nullable<Rcpp::IntegerVector> flank_categories = R_NilValue,
-                        bool project_common = false) {
+                        bool project_common = false,
+                        bool off_diag = false) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (flank_chunks < 0) stop("flank_chunks must be >= 0");
     ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
@@ -2674,6 +2728,13 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     pr.common_bp = pr.common_window_given ? (long) common_window : 0;
     pr.max_common_snps = max_common_snps;
     pr.spa = SPA; pr.spa_thresh = spa_pval_threshold; pr.binary = binary;
+    pr.off_diag = off_diag;
+    if (off_diag) {
+        if (SPA) stop("off_diag = TRUE is not supported with SPA = TRUE: the null "
+                      "distribution machinery assumes the full quadratic form");
+        Rcout << "Off-diagonal (classical Haseman-Elston) system: i == j dropped "
+              << "from every moment; sigma_e is not identified and is reported as 0.\n";
+    }
     if (binary) {
         if (!SPA) Rcpp::warning("binary = TRUE has no effect when SPA = FALSE");
         Rcout << "Binary phenotype: applying the 4th-cumulant variance correction\n"

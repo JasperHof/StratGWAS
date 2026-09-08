@@ -26,7 +26,8 @@ he_reg_spa(
   binary = F,
   chr = NULL,
   flank_categories = NULL,
-  project_common = F
+  project_common = F,
+  off_diag = F
 )
 }
 \description{

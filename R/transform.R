@@ -213,6 +213,10 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
   }
   weights_df$cont_means <- weights_means
 
+  # Compute GDIS distances between subgroups
+  gencor_use <- gencov$gencor[idx, idx]
+  GDIS <- gdis(gencov_use, gencor_use)
+
   message(paste0("Writing transformed phenotype to ",
                  paste0(outfile, ".transformed")))
   write.table(trans_pheno, paste0(outfile, ".transformed"),
@@ -289,10 +293,12 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
 
   return(list(
     transformed_pheno = trans_pheno,
+    gencov_liab = gencov_use,
     weights = trans,
     weights_se = weights_se,
     weights_uni = weights_uni$weights_uni,
     weights_uni_se = weights_uni$weights_uni_se,
+    GDIS = GDIS,
     inflation_criteria = inflation_results
   ))
 }
