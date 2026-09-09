@@ -283,7 +283,6 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
 
     # Return dataframe
     het <- data.frame("snp" = ss_list[[1]]$Predictor, "beta_bar" = beta_bar, "Q" = Q, "I2" = I2, "P_het" = P_het)
-    colnames(het) <- paste0(colnames(het), "_", paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index))
     rownames(het) <- NULL
 
     cochran[[k]] <- het
@@ -304,6 +303,10 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   colnames(co_hers) = c("Trait1", "Trait2", "Coheritability", "SE")
 
   # Write output files with row/column names
+  for (k in 1:length(strata$strat_details)) {
+    write.table(cochran[[k]], paste0(outfile, "_", paste0(strata$strat_details[[k]]$type, "_", strata$strat_details[[k]]$var_index), ".cochran"),
+              quote = FALSE, row.names = FALSE, col.names = TRUE)
+  }
   write.table(co_hers, paste0(outfile, ".cohers"),
               quote = FALSE, row.names = FALSE, col.names = TRUE)
   write.table(hers_all, paste0(outfile, ".hers"),

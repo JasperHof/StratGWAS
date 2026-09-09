@@ -209,7 +209,7 @@ he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
     flank_categories = flank_categories,
     project_common = project_common,
     off_diag    = off_diag,
-    cov_df      = cov_df,
+    cov_df      = cov_df
   )
 
   # hers$genome_h2 contains the genome estimates per alpha
