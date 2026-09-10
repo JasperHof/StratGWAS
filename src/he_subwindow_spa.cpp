@@ -1123,6 +1123,152 @@ static QuadSpaResult quad_spa_solve(
 
 
 
+
+// ===========================================================================
+// CO-HERITABILITY  (coher = TRUE)
+// ===========================================================================
+// The estimator is the SAME linear system. Because sigma_hat = T^+ q is linear
+// in q, feeding it the CROSS moments
+//     q_a = g_a * sum_{j in a} (V' y1)_j (V' y2)_j ,   q_env = y1' y2
+// returns the genetic COVARIANCE of each component instead of the variance.
+// T is untouched: it depends only on the kernels, not on the phenotype.
+//
+// The null is where the two differ. Writing Q = y1' M_c y2 and stacking
+// z = (y1, y2), Q = z' B z with B = [[0, M_c/2],[M_c/2, 0]] and
+// Omega = [[S1, S12],[S12, S2]]. B is INDEFINITE, so the null is a chi-square
+// mixture with eigenvalues of BOTH signs -- exactly the regime where normal and
+// Satterthwaite approximations fail in both tails and where the saddlepoint
+// earns its keep. quad_spa_solve already brackets t on two sides and already
+// returns a two-sided p-value, so it is reused unchanged.
+//
+// H0 IS NOT THE UNIVARIATE H0. Under "no genetic covariance at this locus" the
+// two traits may each still be heritable here, so the tested component is KEPT
+// in S1 and S2 and nulled only in S12. (The univariate test nulls it in Sigma_0
+// itself.) Getting this wrong makes the test conservative at heritable loci.
+//
+// Exact variance, from tr((B Omega)^2):
+//     Var(Q) = tr(M S1 M S2) + tr((M S12)^2)
+// which in the K-space representation used throughout is
+//     tr(A S1 A S2) + tr((A S12)^2) + (n-K) c_env^2 (e1 e2 + e12^2).
+//
+// On col(V)^perp all four matrices act as scalars, so those n-K directions each
+// contribute a 2x2 problem with eigenvalues (c_env/2)(e12 +/- sqrt(e1 e2)) --
+// one positive, one negative. They go into quad_spa_solve's repeated slots.
+//
+// Validated against a direct 2n-dimensional simulation: the reduced spectrum
+// matches the full one to 7 digits, the variance formula matches the empirical
+// variance to 0.4%, and the SPA p-values are uniform (0.049 / 0.0095 / 0.0014
+// observed at alpha = 0.05 / 0.01 / 0.001).
+// ===========================================================================
+struct CoherFit {
+    Eigen::MatrixXd S1, S2, S12, Ac;
+    double var0, e1, e2, e12, c_env;
+    bool ok;
+    CoherFit() : var0(0), e1(0), e2(0), e12(0), c_env(0), ok(false) {}
+};
+
+// S = L' D L + e I for a block-constant D given by per-component values.
+static void coher_block(const Eigen::MatrixXd& L,
+                        const std::vector<Eigen::MatrixXd>& W, bool use_wcache,
+                        const std::vector<int>& off, int C, int K,
+                        const std::vector<double>& d, double e,
+                        Eigen::MatrixXd& out) {
+    if (use_wcache) {
+        out.setZero(K, K);
+        for (int a = 0; a < C; ++a) if (d[a] != 0.0) out.noalias() += d[a] * W[a];
+    } else {
+        Eigen::VectorXd D(K);
+        for (int a = 0; a < C; ++a)
+            for (int j = off[a]; j < off[a + 1]; ++j) D[j] = d[a];
+        out.noalias() = L.transpose() * (D.asDiagonal() * L);
+    }
+    out.diagonal().array() += e;
+}
+
+// Null variance of Q = y1' M_c y2 under H0: cov(component c) = 0.
+static void coher_fit(int c, const Eigen::MatrixXd& Tinv, int C, int env,
+                      const std::vector<double>& g, const std::vector<int>& off,
+                      int K, int n, const Eigen::MatrixXd& L,
+                      const std::vector<Eigen::MatrixXd>& W, bool use_wcache,
+                      const Eigen::MatrixXd& Ac,
+                      const Eigen::VectorXd& sg1, const Eigen::VectorXd& sg2,
+                      const Eigen::VectorXd& s12, double Vp1, double Vp2,
+                      CoherFit& F) {
+    std::vector<double> d1(C), d2(C), d12(C);
+    for (int a = 0; a < C; ++a) {
+        d1[a]  = (sg1[a] > 0.0 ? sg1[a] : 0.0) * g[a];   // nuisance: KEEP component c
+        d2[a]  = (sg2[a] > 0.0 ? sg2[a] : 0.0) * g[a];
+        d12[a] = s12[a] * g[a];
+    }
+    d12[c] = 0.0;                                        // the tested co-component
+    F.e1  = std::max(sg1[env], 1e-8 * (Vp1 > 0 ? Vp1 : 1.0));
+    F.e2  = std::max(sg2[env], 1e-8 * (Vp2 > 0 ? Vp2 : 1.0));
+    F.e12 = s12[env];
+    F.c_env = Tinv(c, env);
+    // |e12| must respect Cauchy-Schwarz or Omega is not a covariance matrix.
+    const double ecap = 0.999 * std::sqrt(F.e1 * F.e2);
+    if (F.e12 >  ecap) F.e12 =  ecap;
+    if (F.e12 < -ecap) F.e12 = -ecap;
+
+    coher_block(L, W, use_wcache, off, C, K, d1,  F.e1,  F.S1);
+    coher_block(L, W, use_wcache, off, C, K, d2,  F.e2,  F.S2);
+    coher_block(L, W, use_wcache, off, C, K, d12, F.e12, F.S12);
+    F.Ac = Ac;
+
+    Eigen::MatrixXd N1, N2, N12;
+    N1.noalias()  = F.Ac * F.S1;
+    N2.noalias()  = F.Ac * F.S2;
+    N12.noalias() = F.Ac * F.S12;
+    double v = (N1.cwiseProduct(N2.transpose())).sum()
+             + (N12.cwiseProduct(N12.transpose())).sum();
+    const long n_rep = (long) n - K;
+    if (n_rep > 0)
+        v += (double) n_rep * F.c_env * F.c_env * (F.e1 * F.e2 + F.e12 * F.e12);
+    F.var0 = v;
+    F.ok = (v > 0.0) && std::isfinite(v);
+}
+
+// Full null spectrum: 2K explicit eigenvalues plus two repeated groups.
+static bool coher_spectrum(const CoherFit& F, int K, int n,
+                           std::vector<double>& eig,
+                           double& eig_rep, double& lam2, double& n_rep) {
+    const int K2 = 2 * K;
+    Eigen::MatrixXd Om(K2, K2);
+    Om.topLeftCorner(K, K)     = F.S1;
+    Om.topRightCorner(K, K)    = F.S12;
+    Om.bottomLeftCorner(K, K)  = F.S12;
+    Om.bottomRightCorner(K, K) = F.S2;
+    // Plug-in estimates need not give a PSD Omega. Shrink the cross block until
+    // they do; shrinking S12 toward 0 moves toward independence, the
+    // conservative direction for a covariance test.
+    Eigen::LLT<Eigen::MatrixXd> llt;
+    double shrink = 1.0; bool have = false;
+    for (int it = 0; it < 12; ++it) {
+        llt.compute(Om);
+        if (llt.info() == Eigen::Success) { have = true; break; }
+        shrink *= 0.5;
+        Om.topRightCorner(K, K)   = shrink * F.S12;
+        Om.bottomLeftCorner(K, K) = shrink * F.S12;
+    }
+    if (!have) return false;
+    Eigen::MatrixXd Cf = llt.matrixL();
+    // Bk = [[0, A/2],[A/2, 0]];  Asym = Cf' Bk Cf, symmetric, 2K x 2K.
+    Eigen::MatrixXd BC(K2, K2);
+    BC.topRows(K).noalias()    = 0.5 * (F.Ac * Cf.bottomRows(K));
+    BC.bottomRows(K).noalias() = 0.5 * (F.Ac * Cf.topRows(K));
+    Eigen::MatrixXd Asym; Asym.noalias() = Cf.transpose() * BC;
+    Asym = (0.5 * (Asym + Asym.transpose())).eval();
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ses(Asym, Eigen::EigenvaluesOnly);
+    if (ses.info() != Eigen::Success) return false;
+    const Eigen::VectorXd& ev = ses.eigenvalues();
+    eig.assign(ev.data(), ev.data() + K2);
+    const double root = std::sqrt(std::max(0.0, F.e1 * F.e2));
+    eig_rep = 0.5 * F.c_env * (F.e12 + root);
+    lam2    = 0.5 * F.c_env * (F.e12 - root);
+    n_rep   = (double) (n - K);
+    return true;
+}
+
 // ===========================================================================
 // One chunk's assembled region
 // ===========================================================================
@@ -1148,6 +1294,8 @@ struct ChunkResult {
     std::vector<int> spa_used;
     // background variance components, per trait (NA when the component is absent)
     std::vector<double> vg_flank, vg_common, vg_env;
+    // coher only: the two univariate target estimates, so rg is recoverable
+    std::vector<double> vg_t1, vg_t2;
 };
 
 // Components: 0 = target chunk, 1 = flank, 2 = common (if any), env = residual.
@@ -1183,6 +1331,9 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                        const std::vector<double>& Vp, const std::vector<double>& yty,
                        const std::vector<double>& kur, bool binary,
                        bool spa, double spa_thresh, bool off_diag, int cov_df,
+                       bool coher,
+                       const std::vector< std::pair<int,int> >& pairs,
+                       const std::vector<double>& ycross,
                        ChunkResult& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
     const int K = cd.K, m_t = cd.m_t, m_f = cd.m_f, m_c = cd.m_c;
@@ -1202,11 +1353,14 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     cr.c_bp_lo = cd.c_bp_lo; cr.c_bp_hi = cd.c_bp_hi;
     cr.m_f = cd.flank_is_common ? 0   : m_f;
     cr.m_c = cd.flank_is_common ? m_f : m_c;
-    cr.vg_flank.assign(P, NA_REAL); cr.vg_common.assign(P, NA_REAL);
-    cr.vg_env.assign(P, NA_REAL);
-    cr.vg.assign(P, NA_REAL); cr.se_vg.assign(P, NA_REAL);
-    cr.h2.assign(P, NA_REAL); cr.p_spa.assign(P, NA_REAL);
-    cr.spa_used.assign(P, 0);
+    // In coher mode every output row is a PAIR of traits, not a trait.
+    const int NO = coher ? (int) pairs.size() : P;
+    cr.vg_flank.assign(NO, NA_REAL); cr.vg_common.assign(NO, NA_REAL);
+    cr.vg_env.assign(NO, NA_REAL);
+    cr.vg.assign(NO, NA_REAL); cr.se_vg.assign(NO, NA_REAL);
+    cr.h2.assign(NO, NA_REAL); cr.p_spa.assign(NO, NA_REAL);
+    cr.spa_used.assign(NO, 0);
+    cr.vg_t1.assign(NO, NA_REAL); cr.vg_t2.assign(NO, NA_REAL);
     if (m_t <= 0) return;
 
     // ---- Gram matrix (K x K, K is BOUNDED by chunk_size and flank_chunks) ---
@@ -1391,6 +1545,93 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     // V is n x K (467 MB at n=1e5, K=1168); the old per-trait
     // V.transpose()*Y.col(t) streamed all of it once PER TRAIT.
     Eigen::MatrixXd U = (cd.V.transpose() * Yf).cast<double>();      // K x P
+
+    // ---- CO-HERITABILITY BRANCH -------------------------------------------
+    if (coher) {
+        // Univariate solves for every trait: needed for the NULL covariance of
+        // the pair statistic (see the CoherFit header note). Cheap -- the solve
+        // is (C+1) x (C+1) and all the heavy work is already done.
+        std::vector<Eigen::VectorXd> sg(P);
+        for (int t = 0; t < P; ++t) {
+            Eigen::VectorXd qu(C + 1);
+            for (int a = 0; a < C; ++a) {
+                double qa = 0.0;
+                for (int j = off[a]; j < off[a + 1]; ++j) qa += U(j, t) * U(j, t);
+                qu[a] = g[a] * qa;
+            }
+            qu[env] = yty[t];
+            sg[t] = Tcod.solve(qu);
+        }
+        // A = M_0 in K-space is trait-independent: build it once for the chunk.
+        Eigen::MatrixXd Ac;
+        if (spa && have_L) {
+            std::vector<double> dm(C);
+            for (int a = 0; a < C; ++a) dm[a] = Tinv(0, a) * g[a];
+            coher_block(L, W, use_wcache, off, C, K, dm, Tinv(0, env), Ac);
+        }
+        const bool spec_ok = spa && have_L &&
+            ((double) 4 * K * K * 8.0 * 3.0 <= 2.0e9);   // 3 x (2K)^2 doubles
+
+        for (int pi = 0; pi < (int) pairs.size(); ++pi) {
+            const int t1 = pairs[pi].first, t2 = pairs[pi].second;
+            Eigen::VectorXd q(C + 1);
+            for (int a = 0; a < C; ++a) {
+                double qa = 0.0;
+                for (int j = off[a]; j < off[a + 1]; ++j) qa += U(j, t1) * U(j, t2);
+                q[a] = g[a] * qa;
+            }
+            q[env] = ycross[pi];
+            Eigen::VectorXd s12;
+            if (off_diag) {
+                Eigen::VectorXd y12 = Y.col(t1).array() * Y.col(t2).array();
+                Eigen::VectorXd qo = q.head(C) - Doff.transpose() * y12;
+                Eigen::VectorXd so = Tcod_off.solve(qo);
+                s12.setZero(C + 1); s12.head(C) = so;
+            } else s12 = Tcod.solve(q);
+
+            cr.vg[pi]    = s12[0];
+            cr.vg_t1[pi] = sg[t1][0];
+            cr.vg_t2[pi] = sg[t2][0];
+            {
+                const int i_f = (m_f > 0) ? 1 : -1;
+                const int i_c = (m_c > 0) ? ((m_f > 0) ? 2 : 1) : -1;
+                if (cd.flank_is_common) {
+                    cr.vg_common[pi] = (i_f >= 0) ? s12[i_f] : NA_REAL;
+                } else {
+                    cr.vg_flank[pi]  = (i_f >= 0) ? s12[i_f] : NA_REAL;
+                    cr.vg_common[pi] = (i_c >= 0) ? s12[i_c] : NA_REAL;
+                }
+                cr.vg_env[pi] = s12[env];
+            }
+            // h2 column carries the STANDARDIZED co-heritability, cov/sqrt(V1 V2),
+            // the direct analogue of vg/Vp in the univariate output. Divide by
+            // sqrt(vg_t1 * vg_t2) in R for the local genetic correlation.
+            const double vv = Vp[t1] * Vp[t2];
+            cr.h2[pi] = (vv > 0.0) ? s12[0] / std::sqrt(vv) : NA_REAL;
+            if (!spa || !have_L) continue;
+
+            CoherFit F;
+            coher_fit(0, Tinv, C, env, g, off, K, n, L, W, use_wcache, Ac,
+                      sg[t1], sg[t2], s12, Vp[t1], Vp[t2], F);
+            if (!F.ok) continue;
+            cr.se_vg[pi] = std::sqrt(F.var0);
+            const double p_wald =
+                std::erfc(std::abs(s12[0] / cr.se_vg[pi]) / std::sqrt(2.0));
+            if (p_wald >= spa_thresh || !spec_ok) {
+                cr.p_spa[pi] = p_wald; cr.spa_used[pi] = 0; continue;
+            }
+            std::vector<double> eig; double erep, l2, nrep;
+            if (!coher_spectrum(F, K, n, eig, erep, l2, nrep)) {
+                cr.p_spa[pi] = p_wald; cr.spa_used[pi] = 0; continue;
+            }
+            QuadSpaResult qr = quad_spa_solve(s12[0], eig, erep, nrep,
+                                              100, 1e-8, l2, nrep);
+            if (qr.converged) { cr.p_spa[pi] = qr.p; cr.spa_used[pi] = 1; }
+            else              { cr.p_spa[pi] = p_wald; cr.spa_used[pi] = 0; }
+        }
+        return;
+    }
+
 
     for (int t = 0; t < P; ++t) {
         const Eigen::VectorXd u = U.col(t);
@@ -1582,6 +1823,12 @@ struct ChunkParams {
                                    // n_covariates + 1 (intercept). T(env,env) = n - cov_df.
     std::string out_file; int batch_size, n_threads;
     std::string chr;                 // "" = all chromosomes; else test only this one
+    // coher: test the genetic COVARIANCE of each trait pair instead of the
+    // heritability of each trait. Requires >= 2 phenotype columns.
+    bool coher;
+    std::vector< std::pair<int,int> > pairs;   // 0-based trait indices
+    std::vector<std::string> pair_names;       // "trait1_trait2"
+    std::vector<double> ycross;                // y_t1' y_t2, one per pair
 };
 
 static void common_chr_range(const ChunkContext& ctx, const std::string& chr, int& lo, int& hi) {
@@ -1804,7 +2051,7 @@ struct ChunkWorker : public RcppParallel::Worker {
                             flank_snps, pr.common_bp, pr.common_window_given,
                             pr.max_common_snps, cd)) { ok[w] = 0; continue; }
             test_chunk(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, pr.off_diag,
-                       pr.cov_df, out[w]);
+                       pr.cov_df, pr.coher, pr.pairs, pr.ycross, out[w]);
             ok[w] = 1;
         }
     }
@@ -1891,6 +2138,9 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
         if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
         fout << "chr\tstart\tend\tm_chunk\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_common\tvg_env";
         if (pr.spa) fout << "\tp_spa\tspa_used";
+        // coher appends the two univariate target estimates so that the local
+        // genetic correlation vg / sqrt(vg_t1 * vg_t2) is recoverable in R.
+        if (pr.coher) fout << "\tvg_t1\tvg_t2";
         fout << "\n";
     }
 
@@ -1951,11 +2201,13 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
             if (!ok[b]) { ++n_skip; continue; }
             ++n_done;
             if (!tofile || cr.vg.empty()) continue;
-            for (int t = 0; t < P; ++t) {
+            const int NOUT = pr.coher ? (int) pr.pairs.size() : P;
+            for (int t = 0; t < NOUT; ++t) {
                 fout << cr.chr << '\t' << cr.start << '\t' << cr.end << '\t'
                      << cr.m_t << '\t' << cr.m_f << '\t' << cr.m_c << '\t'
                      << cr.c_bp_lo << '\t' << cr.c_bp_hi << '\t'
-                     << as<std::string>(ctx.trait_names[t]) << '\t';
+                     << (pr.coher ? pr.pair_names[t]
+                                  : as<std::string>(ctx.trait_names[t])) << '\t';
                 wr(fout, cr.vg[t]);    fout << '\t';
                 wr(fout, cr.se_vg[t]); fout << '\t';
                 wr(fout, cr.h2[t]);
@@ -1963,6 +2215,8 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
                 fout << '\t'; wr(fout, cr.vg_common[t]);
                 fout << '\t'; wr(fout, cr.vg_env[t]);
                 if (pr.spa) { fout << '\t'; wr(fout, cr.p_spa[t]); fout << '\t' << cr.spa_used[t]; }
+                if (pr.coher) { fout << '\t'; wr(fout, cr.vg_t1[t]);
+                                fout << '\t'; wr(fout, cr.vg_t2[t]); }
                 fout << '\n';
             }
         }
@@ -2023,6 +2277,8 @@ struct ChunkResultA {
     std::vector< std::vector<int> > spa_used;                   // [cat][trait]
     // background components are per CHUNK, not per category: one value per trait
     std::vector<double> vg_flank, vg_common, vg_env;
+    // coher only: the two univariate target estimates, so rg is recoverable
+    std::vector< std::vector<double> > vg_t1, vg_t2;            // [cat][pair]
 };
 
 // Assemble one chunk, partitioning the target's columns by annotation category.
@@ -2173,6 +2429,9 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                              const std::vector<double>& Vp, const std::vector<double>& yty,
                              const std::vector<double>& kur, bool binary,
                              bool spa, double spa_thresh, bool off_diag, int cov_df,
+                             bool coher,
+                             const std::vector< std::pair<int,int> >& pairs,
+                             const std::vector<double>& ycross,
                              ChunkResultA& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
     const int A = (int) cd.cat_m.size();
@@ -2189,13 +2448,16 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     cr.m_common = cd.flank_is_common ? cd.m_flank  : cd.m_common;
     cr.c_bp_lo = cd.c_bp_lo; cr.c_bp_hi = cd.c_bp_hi;
     cr.cat_name = cd.cat_name; cr.cat_m = cd.cat_m;
-    cr.vg_flank.assign(P, NA_REAL); cr.vg_common.assign(P, NA_REAL);
-    cr.vg_env.assign(P, NA_REAL);
-    cr.vg.assign(A, std::vector<double>(P, NA_REAL));
-    cr.se_vg.assign(A, std::vector<double>(P, NA_REAL));
-    cr.h2.assign(A, std::vector<double>(P, NA_REAL));
-    cr.p_spa.assign(A, std::vector<double>(P, NA_REAL));
-    cr.spa_used.assign(A, std::vector<int>(P, 0));
+    const int NO = coher ? (int) pairs.size() : P;
+    cr.vg_flank.assign(NO, NA_REAL); cr.vg_common.assign(NO, NA_REAL);
+    cr.vg_env.assign(NO, NA_REAL);
+    cr.vg.assign(A, std::vector<double>(NO, NA_REAL));
+    cr.se_vg.assign(A, std::vector<double>(NO, NA_REAL));
+    cr.h2.assign(A, std::vector<double>(NO, NA_REAL));
+    cr.p_spa.assign(A, std::vector<double>(NO, NA_REAL));
+    cr.spa_used.assign(A, std::vector<int>(NO, 0));
+    cr.vg_t1.assign(A, std::vector<double>(NO, NA_REAL));
+    cr.vg_t2.assign(A, std::vector<double>(NO, NA_REAL));
     if (A <= 0) return;
 
     // component column offsets in V: cats, then flank (if any), then common (if any)
@@ -2360,6 +2622,94 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     };
 
     Eigen::MatrixXd U = (cd.V.transpose() * Yf).cast<double>();      // K x P, one GEMM
+
+    // ---- CO-HERITABILITY BRANCH (annotation path) --------------------------
+    // Same construction as the plain path, but every one of the A tested
+    // categories has its own M_c, hence its own A_c and its own null spectrum.
+    if (coher) {
+        std::vector<Eigen::VectorXd> sg(P);
+        for (int t = 0; t < P; ++t) {
+            Eigen::VectorXd qu(C + 1);
+            for (int cc = 0; cc < C; ++cc) {
+                double qa = 0.0;
+                for (int j = off[cc]; j < off[cc + 1]; ++j) qa += U(j, t) * U(j, t);
+                qu[cc] = g[cc] * qa;
+            }
+            qu[env] = yty[t];
+            sg[t] = Tcod.solve(qu);
+        }
+        std::vector<Eigen::MatrixXd> Acat(A);
+        if (spa && have_L) {
+            for (int c = 0; c < A; ++c) {
+                std::vector<double> dm(C);
+                for (int a2 = 0; a2 < C; ++a2) dm[a2] = Tinv(c, a2) * g[a2];
+                coher_block(L, W, use_wcache, off, C, K, dm, Tinv(c, env), Acat[c]);
+            }
+        }
+        const bool spec_ok = spa && have_L &&
+            ((double) 4 * K * K * 8.0 * 3.0 <= 2.0e9);
+
+        for (int pi = 0; pi < (int) pairs.size(); ++pi) {
+            const int t1 = pairs[pi].first, t2 = pairs[pi].second;
+            Eigen::VectorXd q(C + 1);
+            for (int cc = 0; cc < C; ++cc) {
+                double qa = 0.0;
+                for (int j = off[cc]; j < off[cc + 1]; ++j) qa += U(j, t1) * U(j, t2);
+                q[cc] = g[cc] * qa;
+            }
+            q[env] = ycross[pi];
+            Eigen::VectorXd s12;
+            if (off_diag) {
+                Eigen::VectorXd y12 = Y.col(t1).array() * Y.col(t2).array();
+                Eigen::VectorXd qo = q.head(C) - Doff.transpose() * y12;
+                Eigen::VectorXd so = Tcod_off.solve(qo);
+                s12.setZero(C + 1); s12.head(C) = so;
+            } else s12 = Tcod.solve(q);
+
+            const double vv = Vp[t1] * Vp[t2];
+            for (int c = 0; c < A; ++c) {
+                cr.vg[c][pi]    = s12[c];
+                cr.vg_t1[c][pi] = sg[t1][c];
+                cr.vg_t2[c][pi] = sg[t2][c];
+                cr.h2[c][pi] = (vv > 0.0) ? s12[c] / std::sqrt(vv) : NA_REAL;
+            }
+            {
+                const int i_f = has_f ? A : -1;
+                const int i_c = has_c ? (A + (has_f ? 1 : 0)) : -1;
+                if (cd.flank_is_common) {
+                    cr.vg_common[pi] = (i_f >= 0) ? s12[i_f] : NA_REAL;
+                } else {
+                    cr.vg_flank[pi]  = (i_f >= 0) ? s12[i_f] : NA_REAL;
+                    cr.vg_common[pi] = (i_c >= 0) ? s12[i_c] : NA_REAL;
+                }
+                cr.vg_env[pi] = s12[env];
+            }
+            if (!spa || !have_L) continue;
+
+            for (int c = 0; c < A; ++c) {
+                CoherFit F;
+                coher_fit(c, Tinv, C, env, g, off, K, n, L, W, use_wcache, Acat[c],
+                          sg[t1], sg[t2], s12, Vp[t1], Vp[t2], F);
+                if (!F.ok) continue;
+                cr.se_vg[c][pi] = std::sqrt(F.var0);
+                const double p_wald =
+                    std::erfc(std::abs(s12[c] / cr.se_vg[c][pi]) / std::sqrt(2.0));
+                if (p_wald >= spa_thresh || !spec_ok) {
+                    cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; continue;
+                }
+                std::vector<double> eig; double erep, l2, nrep;
+                if (!coher_spectrum(F, K, n, eig, erep, l2, nrep)) {
+                    cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; continue;
+                }
+                QuadSpaResult qr = quad_spa_solve(s12[c], eig, erep, nrep,
+                                                  100, 1e-8, l2, nrep);
+                if (qr.converged) { cr.p_spa[c][pi] = qr.p; cr.spa_used[c][pi] = 1; }
+                else              { cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; }
+            }
+        }
+        return;
+    }
+
 
     for (int t = 0; t < P; ++t) {
         const Eigen::VectorXd u = U.col(t);
@@ -2532,7 +2882,8 @@ struct ChunkWorkerA : public RcppParallel::Worker {
                                   flank_snps, pr.common_bp, pr.common_window_given,
                                   pr.max_common_snps, cd)) { ok[w] = 0; continue; }
             test_chunk_annot(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh,
-                             pr.off_diag, pr.cov_df, out[w]);
+                             pr.off_diag, pr.cov_df, pr.coher, pr.pairs, pr.ycross,
+                             out[w]);
             ok[w] = 1;
         }
     }
@@ -2588,6 +2939,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
         if (!fout.is_open()) stop("Could not open out_file: " + pr.out_file);
         fout << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_common\tvg_env";
         if (pr.spa) fout << "\tp_spa\tspa_used";
+        if (pr.coher) fout << "\tvg_t1\tvg_t2";
         fout << "\n";
     }
 
@@ -2625,13 +2977,15 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
             ++n_done;
             if (!tofile || cr.cat_name.empty()) continue;
             int A = (int) cr.cat_name.size();
+            const int NOUT = pr.coher ? (int) pr.pairs.size() : P;
             for (int c = 0; c < A; ++c)
-                for (int t = 0; t < P; ++t) {
+                for (int t = 0; t < NOUT; ++t) {
                     fout << cr.chr << '\t' << cr.start << '\t' << cr.end << '\t'
                          << cr.cat_name[c] << '\t' << cr.cat_m[c] << '\t'
                          << cr.m_flank << '\t' << cr.m_common << '\t'
                          << cr.c_bp_lo << '\t' << cr.c_bp_hi << '\t'
-                         << as<std::string>(ctx.trait_names[t]) << '\t';
+                         << (pr.coher ? pr.pair_names[t]
+                                      : as<std::string>(ctx.trait_names[t])) << '\t';
                     wr(fout, cr.vg[c][t]);    fout << '\t';
                     wr(fout, cr.se_vg[c][t]); fout << '\t';
                     wr(fout, cr.h2[c][t]);
@@ -2639,6 +2993,8 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
                     fout << '\t'; wr(fout, cr.vg_common[t]);
                     fout << '\t'; wr(fout, cr.vg_env[t]);
                     if (pr.spa) { fout << '\t'; wr(fout, cr.p_spa[c][t]); fout << '\t' << cr.spa_used[c][t]; }
+                    if (pr.coher) { fout << '\t'; wr(fout, cr.vg_t1[c][t]);
+                                    fout << '\t'; wr(fout, cr.vg_t2[c][t]); }
                     fout << '\n';
                 }
         }
@@ -2689,7 +3045,9 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         Rcpp::Nullable<Rcpp::IntegerVector> flank_categories = R_NilValue,
                         bool project_common = false,
                         bool off_diag = false,
-                        double cov_df = NA_REAL) {
+                        double cov_df = NA_REAL,
+                        bool coher = false,
+                        Rcpp::Nullable<Rcpp::IntegerMatrix> pairs = R_NilValue) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (flank_chunks < 0) stop("flank_chunks must be >= 0");
     ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
@@ -2752,6 +3110,54 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     if (pr.cov_df >= ctx.n_inds) stop("cov_df must be smaller than the sample size");
     Rcout << "Environment moment uses tr(I - P) correction: T(env,env) = n - "
           << pr.cov_df << " (n = " << ctx.n_inds << ").\n";
+
+    // ---- co-heritability mode ---------------------------------------------
+    pr.coher = coher;
+    if (coher) {
+        if (ctx.n_pheno < 2)
+            stop("coher = TRUE needs at least 2 phenotype columns; got %d", ctx.n_pheno);
+        if (binary)
+            stop("coher = TRUE is not supported with binary = TRUE: the cumulant "
+                 "machinery that corrects a binary null is univariate. Use "
+                 "binary = FALSE (the point estimates stay valid; only the tail "
+                 "calibration assumes normality).");
+        if (pairs.isNotNull()) {
+            Rcpp::IntegerMatrix pm(pairs.get());
+            if (pm.ncol() != 2) stop("pairs must be a two-column matrix of 1-based trait indices");
+            for (int r = 0; r < pm.nrow(); ++r) {
+                int a = pm(r, 0) - 1, b = pm(r, 1) - 1;
+                if (a < 0 || b < 0 || a >= ctx.n_pheno || b >= ctx.n_pheno)
+                    stop("pairs contains an index outside 1..%d", ctx.n_pheno);
+                if (a == b) stop("pairs contains a trait paired with itself (row %d)", r + 1);
+                pr.pairs.push_back(std::make_pair(a, b));
+            }
+        } else {
+            for (int a = 0; a < ctx.n_pheno; ++a)
+                for (int b = a + 1; b < ctx.n_pheno; ++b)
+                    pr.pairs.push_back(std::make_pair(a, b));
+        }
+        pr.pair_names.resize(pr.pairs.size());
+        pr.ycross.resize(pr.pairs.size());
+        for (size_t i = 0; i < pr.pairs.size(); ++i) {
+            const int a = pr.pairs[i].first, b = pr.pairs[i].second;
+            pr.pair_names[i] = as<std::string>(ctx.trait_names[a]) + "_" +
+                               as<std::string>(ctx.trait_names[b]);
+            pr.ycross[i] = ctx.Y.col(a).dot(ctx.Y.col(b));
+        }
+        Rcout << "Co-heritability mode: estimating the genetic COVARIANCE of "
+              << pr.pairs.size() << " trait pair"
+              << (pr.pairs.size() == 1 ? "" : "s")
+              << " (from " << ctx.n_pheno << " phenotype columns).\n"
+              << "  vg     = local genetic covariance of the target component\n"
+              << "  h2     = vg / sqrt(Vp1 * Vp2), the standardized co-heritability\n"
+              << "  vg_t1, vg_t2 = the two univariate target estimates, so the local\n"
+              << "           genetic correlation is vg / sqrt(vg_t1 * vg_t2) in R\n"
+              << "  p_spa  = TWO-SIDED, since a genetic covariance may be negative.\n";
+        if (SPA)
+            Rcout << "  The null spectrum is indefinite (eigenvalues of both signs) and is\n"
+                  << "  solved on a 2K x 2K problem, so significant chunks cost ~8x the\n"
+                  << "  univariate eigensolve. The Wald screen still skips the rest.\n";
+    }
     if (off_diag) {
         if (SPA) stop("off_diag = TRUE is not supported with SPA = TRUE: the null "
                       "distribution machinery assumes the full quadratic form");
