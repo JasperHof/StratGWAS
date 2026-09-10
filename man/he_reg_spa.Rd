@@ -28,7 +28,8 @@ he_reg_spa(
   flank_categories = NULL,
   project_common = F,
   off_diag = F,
-  cov_df = NA
+  cov_df = NA,
+  coher = F
 )
 }
 \description{
