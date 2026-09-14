@@ -1196,8 +1196,21 @@ static void coher_fit(int c, const Eigen::MatrixXd& Tinv, int C, int env,
                       CoherFit& F) {
     std::vector<double> d1(C), d2(C), d12(C);
     for (int a = 0; a < C; ++a) {
-        d1[a]  = (sg1[a] > 0.0 ? sg1[a] : 0.0) * g[a];   // nuisance: KEEP component c
-        d2[a]  = (sg2[a] > 0.0 ? sg2[a] : 0.0) * g[a];
+        // DO NOT CLAMP THE TESTED COMPONENT. It is a nuisance here, not the
+        // null hypothesis, so it must stay in Sigma_1 and Sigma_2 -- zeroing it
+        // gives 84% type I error at loci where the traits really are heritable.
+        // But clamping it at zero is just as wrong in the other direction: where
+        // the true target h2 is 0, sigma_hat is symmetric about 0, the clamp
+        // fires ~half the time and returns E[max(0,sigma_hat)] ~ 0.4 sd instead
+        // of 0 -- for BOTH traits, multiplied together inside
+        // tr(M Sigma_1 M Sigma_2). Measured effect: SE inflated ~15%, variance
+        // ~33%, lambda_GC ~ 0.8, i.e. uniformly DEFLATED p-values with a
+        // straight QQ line of slope ~0.8.
+        // The clamp is kept on the background components, whose true values sit
+        // well away from zero so it essentially never fires, and where it does
+        // useful work keeping Omega positive definite.
+        d1[a]  = (a == c ? sg1[a] : (sg1[a] > 0.0 ? sg1[a] : 0.0)) * g[a];
+        d2[a]  = (a == c ? sg2[a] : (sg2[a] > 0.0 ? sg2[a] : 0.0)) * g[a];
         d12[a] = s12[a] * g[a];
     }
     d12[c] = 0.0;                                        // the tested co-component
@@ -1241,12 +1254,24 @@ static bool coher_spectrum(const CoherFit& F, int K, int n,
     // Plug-in estimates need not give a PSD Omega. Shrink the cross block until
     // they do; shrinking S12 toward 0 moves toward independence, the
     // conservative direction for a covariance test.
+    // An unclamped negative estimate for the tested component can, rarely, tip a
+    // diagonal block indefinite. Shrinking the cross block cannot fix that, so
+    // pull the diagonal blocks toward their environment-only form first.
     Eigen::LLT<Eigen::MatrixXd> llt;
-    double shrink = 1.0; bool have = false;
-    for (int it = 0; it < 12; ++it) {
+    double shrink = 1.0, dshrink = 1.0; bool have = false;
+    for (int it = 0; it < 16; ++it) {
         llt.compute(Om);
         if (llt.info() == Eigen::Success) { have = true; break; }
-        shrink *= 0.5;
+        if (Eigen::LLT<Eigen::MatrixXd>(Om.topLeftCorner(K, K)).info() != Eigen::Success ||
+            Eigen::LLT<Eigen::MatrixXd>(Om.bottomRightCorner(K, K)).info() != Eigen::Success) {
+            dshrink *= 0.5;
+            Om.topLeftCorner(K, K) =
+                dshrink * F.S1 + (1.0 - dshrink) * F.e1 * Eigen::MatrixXd::Identity(K, K);
+            Om.bottomRightCorner(K, K) =
+                dshrink * F.S2 + (1.0 - dshrink) * F.e2 * Eigen::MatrixXd::Identity(K, K);
+        } else {
+            shrink *= 0.5;
+        }
         Om.topRightCorner(K, K)   = shrink * F.S12;
         Om.bottomLeftCorner(K, K) = shrink * F.S12;
     }
