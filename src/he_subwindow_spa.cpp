@@ -472,6 +472,7 @@ struct GwBackground {
     bool active; int B;
     GenoMat Z, Ur;                 // n x B : probes, and (K_gw - I) Z
     double trK, trK2;              // exact, after normalisation trK = n
+    double trKP, trK2P;            // the same traces under the covariate projection
     Eigen::MatrixXd qgw;           // P x P: y_s' K_gw y_t, exact (covers pairs)
     Eigen::MatrixXd sigma;         // P x P: sigma_gw for each trait and pair
     GwBackground() : active(false), B(0), trK(0.0), trK2(0.0) {}
@@ -493,6 +494,7 @@ static bool gw_cache_read(const std::string& path, GwBackground& gw, int n, int 
     f.read((char*)&bb, sizeof(int));
     if (!f || nn != n || pp != P || bb != gw.B) return false;
     f.read((char*)&gw.trK, sizeof(double)); f.read((char*)&gw.trK2, sizeof(double));
+    f.read((char*)&gw.trKP, sizeof(double)); f.read((char*)&gw.trK2P, sizeof(double));
     gw.qgw.setZero(P, P);
     f.read((char*)gw.qgw.data(), (std::streamsize) P * P * sizeof(double));
     gw.Z.resize(n, gw.B); gw.Ur.resize(n, gw.B);
@@ -510,6 +512,8 @@ static void gw_cache_write(const std::string& path, const GwBackground& gw,
     f.write((const char*)&bb, sizeof(int));
     f.write((const char*)&gw.trK, sizeof(double));
     f.write((const char*)&gw.trK2, sizeof(double));
+    f.write((const char*)&gw.trKP, sizeof(double));
+    f.write((const char*)&gw.trK2P, sizeof(double));
     f.write((const char*)gw.qgw.data(), (std::streamsize) P * P * sizeof(double));
     f.write((const char*)gw.Z.data(),  (std::streamsize) n * gw.B * sizeof(float));
     f.write((const char*)gw.Ur.data(), (std::streamsize) n * gw.B * sizeof(float));
@@ -588,6 +592,7 @@ static void project_out_common(GenoMat& X, const GenoMat& C,
 static void load_gw_background(const std::string& prefix,
                                const std::vector<std::string>& analysis_iid,
                                const Eigen::MatrixXd& Y,
+                               const Eigen::MatrixXd& Cd,
                                int B, unsigned seed, GwBackground& gw) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
     gw.B = B;
@@ -638,6 +643,12 @@ static void load_gw_background(const std::string& prefix,
     for (int i = 0; i < n; ++i)
         for (int b = 0; b < B; ++b) gw.Z(i, b) = (rng() & 1u) ? 1.0f : -1.0f;
     GenoMat U = GenoMat::Zero(n, B);
+    // Cov holds an ORTHONORMAL basis of the space removed from y (intercept +
+    // covariates). Accumulating Wc = K_gw Cov in the same pass gives the
+    // projected traces exactly, at the cost of one n x c float matrix.
+    const GenoMat Cov = Cd.cast<float>();
+    const int nc = (int) Cov.cols();
+    GenoMat Wc = GenoMat::Zero(n, nc > 0 ? nc : 1);
     gw.qgw.setZero(P, P);
     gw.trK = 0.0; gw.trK2 = 0.0;
 
@@ -657,6 +668,14 @@ static void load_gw_background(const std::string& prefix,
         const double kii = row[gi];
         gw.trK += kii; gw.trK2 += kii * kii;
         gw.qgw.noalias() += kii * Y.row(ai).transpose() * Y.row(ai);
+        // U = K_gw Z needs the DIAGONAL term too. Omitting it leaves
+        // (K_gw - diag(K_gw)) Z, and since the mean diagonal is 1 that turns
+        // Ur into (K_gw - 2I) Z, which silently cancels the +n in
+        // tr(K_a K_gw) = n + tr(K_a R). Because a CONSTANT offset on q lands
+        // entirely in sigma_e and moves no sigma_a, losing that n converts the
+        // whole correction into a spurious shift of m_a * sigma_gw / n on vg.
+        U.row(ai).noalias() += (float) kii * gw.Z.row(ai);
+        Wc.row(ai).noalias() += (float) kii * Cov.row(ai);
 
         double acc2 = 0.0;
         for (long long gj = 0; gj < gi; ++gj) {
@@ -672,6 +691,10 @@ static void load_gw_background(const std::string& prefix,
         if (lim > 0) {
             U.row(ai).noalias()       += gathf.head(lim).transpose() * gw.Z.topRows(lim);
             U.topRows(lim).noalias()  += gathf.head(lim) * gw.Z.row(ai);
+            if (nc > 0) {
+                Wc.row(ai).noalias()      += gathf.head(lim).transpose() * Cov.topRows(lim);
+                Wc.topRows(lim).noalias() += gathf.head(lim) * Cov.row(ai);
+            }
             // y_s' K y_t picks up K_ij (y_si y_tj + y_sj y_ti) for every j < i,
             // so one P-vector and a rank-2 update per row.
             const Eigen::VectorXd w = Y.topRows(lim).transpose() * gathd.head(lim);
@@ -692,6 +715,18 @@ static void load_gw_background(const std::string& prefix,
     gw.trK2 *= sc * sc; gw.trK = (double) n;
     gw.qgw *= sc;
     gw.Ur = (sc * U.array()).matrix() - gw.Z;       // (K_gw - I) Z
+    // Projected traces. With P = I - C C' and C orthonormal,
+    //   tr(P K P)     = tr(K) - ||C' K C||_trace = n - tr(C' W)
+    //   tr((P K P)^2) = tr(K^2) - 2 ||K C||_F^2 + ||C' K C||_F^2
+    // Using the UNPROJECTED traces instead biases sigma_gw low, because the
+    // covariate directions are the top eigenvectors of a common-SNP GRM and
+    // carry a disproportionate share of tr(K^2).
+    if (nc > 0) {
+        Eigen::MatrixXd Wd = (sc * Wc.array()).matrix().cast<double>();   // K_gw C
+        Eigen::MatrixXd CW = Cd.transpose() * Wd;                          // C' K_gw C
+        gw.trKP  = gw.trK  - CW.trace();
+        gw.trK2P = gw.trK2 - 2.0 * Wd.squaredNorm() + CW.squaredNorm();
+    } else { gw.trKP = gw.trK; gw.trK2P = gw.trK2; }
 
     gw.active = true;
     gw_cache_write(cache, gw, n, P);
@@ -3413,7 +3448,14 @@ Rcpp::List he_chunk_spa(const std::string& filename,
         Rcpp::CharacterVector gp(grm_prefix.get());
         const std::string gpre = Rcpp::as<std::string>(gp[0]);
         if (grm_probes < 4) stop("grm_probes must be at least 4");
-        load_gw_background(gpre, ctx.analysis_iid_s, ctx.Y, grm_probes, grm_seed, ctx.gw);
+        // orthonormal basis of the projected-out space: intercept + covariates
+        Eigen::MatrixXd Cd(ctx.n_inds, 1 + ctx.covZ.cols());
+        Cd.col(0).setOnes();
+        if (ctx.covZ.cols() > 0) Cd.rightCols(ctx.covZ.cols()) = ctx.covZ.cast<double>();
+        Eigen::HouseholderQR<Eigen::MatrixXd> qrC(Cd);
+        Cd = qrC.householderQ() * Eigen::MatrixXd::Identity(ctx.n_inds, Cd.cols());
+        load_gw_background(gpre, ctx.analysis_iid_s, ctx.Y, Cd,
+                           grm_probes, grm_seed, ctx.gw);
 
         // sigma_gw ONCE, genome-wide, from the exact 2x2 moment system:
         //   [ tr(K^2)  tr(K)   ] [ sigma_gw ]   [ y_s' K y_t ]
@@ -3423,8 +3465,8 @@ Rcpp::List he_chunk_spa(const std::string& filename,
         // sigma_gw as KNOWN downstream.
         const int P = ctx.n_pheno, nn = ctx.n_inds;
         Eigen::Matrix2d A;
-        A << ctx.gw.trK2, ctx.gw.trK,
-             ctx.gw.trK,  (double)(nn - pr.cov_df);
+        A << ctx.gw.trK2P, ctx.gw.trKP,
+             ctx.gw.trKP, (double)(nn - pr.cov_df);
         ctx.gw.sigma.setZero(P, P);
         for (int a = 0; a < P; ++a)
             for (int b = 0; b < P; ++b) {
@@ -3436,6 +3478,7 @@ Rcpp::List he_chunk_spa(const std::string& filename,
         const double rw = (ctx.gw.trK2 - ctx.gw.trK) / ctx.gw.trK;
         Rcout << "Genome-wide background active (" << grm_probes << " probes).\n"
               << "  tr(K_gw^2)/tr(K_gw) = " << ctx.gw.trK2 / ctx.gw.trK
+              << "   (projected: " << ctx.gw.trK2P / ctx.gw.trKP << ")"
               << "   =>  ||K_gw - I||_F^2 / n = " << rw << "\n"
               << "  sigma_gw per trait:";
         for (int a = 0; a < P; ++a) Rcout << " " << ctx.gw.sigma(a, a);
