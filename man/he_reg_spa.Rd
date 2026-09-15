@@ -29,7 +29,9 @@ he_reg_spa(
   project_common = F,
   off_diag = F,
   cov_df = NA,
-  coher = F
+  coher = F,
+  grm_prefix = NULL,
+  grm_probes = 64
 )
 }
 \description{
