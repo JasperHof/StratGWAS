@@ -1560,6 +1560,11 @@ struct ChunkResult {
     std::vector<double> vg_flank, vg_common, vg_env;
     // coher only: the two univariate target estimates, so rg is recoverable
     std::vector<double> vg_t1, vg_t2;
+    // grm_prefix only: tr(K_a K_gw) / n for the tested component. 1.0 means the
+    // genome-wide kernel is ORTHOGONAL to this window's kernel, so the offset
+    // collapses to the constant sigma_gw * n and lands entirely in sigma_e --
+    // i.e. the background component can do nothing for this window.
+    double tr_gw;
 };
 
 // Components: 0 = target chunk, 1 = flank, 2 = common (if any), env = residual.
@@ -1625,6 +1630,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
     cr.h2.assign(NO, NA_REAL); cr.p_spa.assign(NO, NA_REAL);
     cr.spa_used.assign(NO, 0);
     cr.vg_t1.assign(NO, NA_REAL); cr.vg_t2.assign(NO, NA_REAL);
+    cr.tr_gw = NA_REAL;
     if (m_t <= 0) return;
 
     // ---- Gram matrix (K x K, K is BOUNDED by chunk_size and flank_chunks) ---
@@ -1697,6 +1703,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
             for (int j = off[a]; j < off[a + 1]; ++j) s2 += Pz.row(j).dot(Qu.row(j));
             trKgwA[a] = (double) n + g[a] * s2 / (double) gw.B;
         }
+        cr.tr_gw = trKgwA[0] / (double) n;      // the tested component
     }
 
     // ---- Cholesky of G, once per chunk -------------------------------------
@@ -2437,6 +2444,7 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
         // coher appends the two univariate target estimates so that the local
         // genetic correlation vg / sqrt(vg_t1 * vg_t2) is recoverable in R.
         if (pr.coher) fout << "\tvg_t1\tvg_t2";
+        if (ctx.gw.active) fout << "\ttr_gw";
         fout << "\n";
     }
 
@@ -2513,6 +2521,7 @@ static Rcpp::List chunk_driver(ChunkContext& ctx, const ChunkParams& pr) {
                 if (pr.spa) { fout << '\t'; wr(fout, cr.p_spa[t]); fout << '\t' << cr.spa_used[t]; }
                 if (pr.coher) { fout << '\t'; wr(fout, cr.vg_t1[t]);
                                 fout << '\t'; wr(fout, cr.vg_t2[t]); }
+                if (ctx.gw.active) { fout << '\t'; wr(fout, cr.tr_gw); }
                 fout << '\n';
             }
         }
@@ -2575,6 +2584,7 @@ struct ChunkResultA {
     std::vector<double> vg_flank, vg_common, vg_env;
     // coher only: the two univariate target estimates, so rg is recoverable
     std::vector< std::vector<double> > vg_t1, vg_t2;            // [cat][pair]
+    std::vector<double> tr_gw;                                  // [cat]
 };
 
 // Assemble one chunk, partitioning the target's columns by annotation category.
@@ -2754,6 +2764,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     cr.spa_used.assign(A, std::vector<int>(NO, 0));
     cr.vg_t1.assign(A, std::vector<double>(NO, NA_REAL));
     cr.vg_t2.assign(A, std::vector<double>(NO, NA_REAL));
+    cr.tr_gw.assign(A, NA_REAL);
     if (A <= 0) return;
 
     // component column offsets in V: cats, then flank (if any), then common (if any)
@@ -2821,6 +2832,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             for (int j = off[a]; j < off[a + 1]; ++j) s2 += Pz.row(j).dot(Qu.row(j));
             trKgwA[a] = (double) n + g[a] * s2 / (double) gw.B;
         }
+        for (int c2 = 0; c2 < A; ++c2) cr.tr_gw[c2] = trKgwA[c2] / (double) n;
     }
 
     Eigen::MatrixXd L; bool have_L = false;
@@ -3268,6 +3280,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
         fout << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tm_common\tcommon_bp_lo\tcommon_bp_hi\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_common\tvg_env";
         if (pr.spa) fout << "\tp_spa\tspa_used";
         if (pr.coher) fout << "\tvg_t1\tvg_t2";
+        if (ctx.gw.active) fout << "\ttr_gw";
         fout << "\n";
     }
 
@@ -3323,6 +3336,7 @@ static Rcpp::List chunk_driver_annot(ChunkContext& ctx, const ChunkParams& pr) {
                     if (pr.spa) { fout << '\t'; wr(fout, cr.p_spa[c][t]); fout << '\t' << cr.spa_used[c][t]; }
                     if (pr.coher) { fout << '\t'; wr(fout, cr.vg_t1[c][t]);
                                     fout << '\t'; wr(fout, cr.vg_t2[c][t]); }
+                    if (ctx.gw.active) { fout << '\t'; wr(fout, cr.tr_gw[c]); }
                     fout << '\n';
                 }
         }
