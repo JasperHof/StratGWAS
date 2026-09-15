@@ -433,6 +433,89 @@ static std::vector< std::pair<int,int> > build_cells(const std::vector<long>& bp
 
 
 // ===========================================================================
+// GENOME-WIDE BACKGROUND COMPONENT  (grm_prefix = "...")
+// ===========================================================================
+// One extra variance component K_gw, supplied as a precomputed GCTA-format GRM
+// (float32, packed lower triangle including the diagonal, n(n+1)/2 entries).
+// Its job is to soak up the DISTAL genetic variance -- mostly common-variant --
+// that local flanks and a 256-SNP local common block cannot reach, and which
+// otherwise leaks into the WES kernels and accumulates across thousands of
+// windows.
+//
+// The matrix is NEVER materialised. One streaming pass over the file yields
+// three quantities EXACTLY:
+//     tr(K_gw)                          sum of the diagonal
+//     tr(K_gw^2)  = 2 sum_{i>j} K_ij^2 + sum_i K_ii^2
+//     y' K_gw y   = sum_i K_ii y_i^2 + 2 sum_{i>j} K_ij y_i y_j   (per trait)
+// plus, with a shared random probe block Z (n x B),
+//     U = K_gw Z
+//
+// sigma_gw is then estimated ONCE, genome-wide, from the exact 2x2 system
+//     [ tr(K^2)  tr(K) ] [ sigma_gw ]   [ y'Ky ]
+//     [ tr(K)    n - c ] [ sigma_e  ] = [ y'y  ]
+// and treated as KNOWN in every window. That leaves T completely unchanged --
+// only q is offset --  and avoids the SE inflation that a free per-window
+// sigma_gw would bring (K_gw is close to a multiple of I, so it is weakly
+// identified against sigma_e inside a single window).
+//
+// VARIANCE REDUCTION. A GRM is dominated by its diagonal: tr(K^2) ~ n + n^2/M,
+// which at n = 1e5 and M ~ 1e6 is ~1.1 n. Writing K_gw = I + R,
+//     tr(K_a K_gw) = tr(K_a) + tr(K_a R) = n + tr(K_a R)
+// because tr(K_a) = n exactly by the g_a normalisation. So we probe only R,
+// storing Ur = (K_gw - I) Z rather than U. The stochastic part then targets a
+// quantity ~10x smaller and the same B buys ~10x the accuracy, free.
+//
+// Per chunk the only new work is P = V'Z and Q = V'Ur (two n x K x B GEMMs),
+// against the n K^2 / 2 Gram already being paid -- about 15% at B = 32.
+// ===========================================================================
+struct GwBackground {
+    bool active; int B;
+    GenoMat Z, Ur;                 // n x B : probes, and (K_gw - I) Z
+    double trK, trK2;              // exact, after normalisation trK = n
+    Eigen::MatrixXd qgw;           // P x P: y_s' K_gw y_t, exact (covers pairs)
+    Eigen::MatrixXd sigma;         // P x P: sigma_gw for each trait and pair
+    GwBackground() : active(false), B(0), trK(0.0), trK2(0.0) {}
+};
+
+// Cache so a 40-job sweep pays the 20 GB pass once, not 40 times.
+static std::string gw_cache_path(const std::string& prefix, int B, unsigned seed,
+                                 int n, int P) {
+    std::ostringstream o;
+    o << prefix << ".gwcache_B" << B << "_s" << seed << "_n" << n << "_p" << P;
+    return o.str();
+}
+
+static bool gw_cache_read(const std::string& path, GwBackground& gw, int n, int P) {
+    std::ifstream f(path.c_str(), std::ios::binary);
+    if (!f.is_open()) return false;
+    int nn = 0, pp = 0, bb = 0;
+    f.read((char*)&nn, sizeof(int)); f.read((char*)&pp, sizeof(int));
+    f.read((char*)&bb, sizeof(int));
+    if (!f || nn != n || pp != P || bb != gw.B) return false;
+    f.read((char*)&gw.trK, sizeof(double)); f.read((char*)&gw.trK2, sizeof(double));
+    gw.qgw.setZero(P, P);
+    f.read((char*)gw.qgw.data(), (std::streamsize) P * P * sizeof(double));
+    gw.Z.resize(n, gw.B); gw.Ur.resize(n, gw.B);
+    f.read((char*)gw.Z.data(),  (std::streamsize) n * gw.B * sizeof(float));
+    f.read((char*)gw.Ur.data(), (std::streamsize) n * gw.B * sizeof(float));
+    return (bool) f;
+}
+
+static void gw_cache_write(const std::string& path, const GwBackground& gw,
+                           int n, int P) {
+    std::ofstream f(path.c_str(), std::ios::binary);
+    if (!f.is_open()) return;
+    int nn = n, pp = P, bb = gw.B;
+    f.write((const char*)&nn, sizeof(int)); f.write((const char*)&pp, sizeof(int));
+    f.write((const char*)&bb, sizeof(int));
+    f.write((const char*)&gw.trK, sizeof(double));
+    f.write((const char*)&gw.trK2, sizeof(double));
+    f.write((const char*)gw.qgw.data(), (std::streamsize) P * P * sizeof(double));
+    f.write((const char*)gw.Z.data(),  (std::streamsize) n * gw.B * sizeof(float));
+    f.write((const char*)gw.Ur.data(), (std::streamsize) n * gw.B * sizeof(float));
+}
+
+// ===========================================================================
 // Context
 // ===========================================================================
 struct ChunkContext {
@@ -449,6 +532,8 @@ struct ChunkContext {
     double alpha, alpha_common;
     std::vector<float> snp_weights;
     GenoMat covZ, covM;
+    GwBackground gw;          // optional genome-wide background component
+    std::vector<std::string> analysis_iid_s;   // IIDs of the kept individuals
     // Optional annotation: EVERY column is a tested functional category.
     // snp_cat[j] = 0..n_annot_cat-1 (a tested category) or -1 (flank/background).
     bool use_annot; int n_annot_cat;
@@ -497,6 +582,122 @@ static void project_out_common(GenoMat& X, const GenoMat& C,
         double sd = std::sqrt(ss / (n - 1));
         if (sd > 1e-10) X.col(j) /= (float) sd; else X.col(j).setZero();
     }
+}
+
+
+static void load_gw_background(const std::string& prefix,
+                               const std::vector<std::string>& analysis_iid,
+                               const Eigen::MatrixXd& Y,
+                               int B, unsigned seed, GwBackground& gw) {
+    const int n = (int) Y.rows(), P = (int) Y.cols();
+    gw.B = B;
+    const std::string cache = gw_cache_path(prefix, B, seed, n, P);
+    if (gw_cache_read(cache, gw, n, P)) {
+        gw.active = true;
+        Rcout << "Genome-wide background: reusing cache " << cache << "\n";
+        return;
+    }
+
+    // ---- ids -----------------------------------------------------------
+    std::ifstream fid((prefix + ".grm.id").c_str());
+    if (!fid.is_open()) stop("Cannot open " + prefix + ".grm.id");
+    std::map<std::string,int> want;
+    for (int i = 0; i < n; ++i) want[analysis_iid[i]] = i;
+    std::vector<int> idx;                      // GRM row -> analysis row, or -1
+    std::string line, a, b;
+    while (std::getline(fid, line)) {
+        std::istringstream ls(line);
+        if (!(ls >> a >> b)) continue;
+        std::map<std::string,int>::const_iterator it = want.find(b);
+        if (it == want.end()) it = want.find(a);
+        idx.push_back(it == want.end() ? -1 : it->second);
+    }
+    fid.close();
+    const long long ng = (long long) idx.size();
+    int matched = 0;
+    for (long long i = 0; i < ng; ++i) if (idx[i] >= 0) ++matched;
+    if (matched < n)
+        stop("Only %d of %d analysis individuals found in %s.grm.id",
+             matched, n, prefix.c_str());
+
+    // ---- file must be float32, packed lower triangle with diagonal ------
+    const std::string bin = prefix + ".grm.bin";
+    std::ifstream fb(bin.c_str(), std::ios::binary | std::ios::ate);
+    if (!fb.is_open()) stop("Cannot open " + bin);
+    const long long bytes = (long long) fb.tellg();
+    const long long expect = ng * (ng + 1) / 2 * 4;
+    if (bytes != expect)
+        stop("%s is %lld bytes; expected %lld for %lld ids in float32 packed "
+             "lower-triangle (GCTA) format. A double-precision GRM would be "
+             "twice that.", bin.c_str(), bytes, expect, ng);
+    fb.seekg(0, std::ios::beg);
+
+    // ---- one streaming pass --------------------------------------------
+    std::mt19937 rng(seed);
+    gw.Z.resize(n, B);
+    for (int i = 0; i < n; ++i)
+        for (int b = 0; b < B; ++b) gw.Z(i, b) = (rng() & 1u) ? 1.0f : -1.0f;
+    GenoMat U = GenoMat::Zero(n, B);
+    gw.qgw.setZero(P, P);
+    gw.trK = 0.0; gw.trK2 = 0.0;
+
+    std::vector<float>  row((size_t) ng);
+    Eigen::VectorXf gathf = Eigen::VectorXf::Zero(n);
+    Eigen::VectorXd gathd = Eigen::VectorXd::Zero(n);
+    long long runmax = -1;
+    Rcout << "Genome-wide background: streaming " << bin << " ("
+          << (bytes / 1048576) << " MB, " << ng << " ids, B = " << B
+          << " probes). One pass, then cached.\n";
+
+    for (long long gi = 0; gi < ng; ++gi) {
+        fb.read((char*) row.data(), (std::streamsize)(gi + 1) * 4);
+        if (!fb) stop("Short read from " + bin);
+        const int ai = idx[gi];
+        if (ai < 0) continue;
+        const double kii = row[gi];
+        gw.trK += kii; gw.trK2 += kii * kii;
+        gw.qgw.noalias() += kii * Y.row(ai).transpose() * Y.row(ai);
+
+        double acc2 = 0.0;
+        for (long long gj = 0; gj < gi; ++gj) {
+            const int aj = idx[gj];
+            if (aj < 0) continue;
+            const float v = row[gj];
+            gathf[aj] = v; gathd[aj] = v;
+            acc2 += (double) v * v;
+            if (aj > runmax) runmax = aj;
+        }
+        gw.trK2 += 2.0 * acc2;
+        const int lim = (int) runmax + 1;
+        if (lim > 0) {
+            U.row(ai).noalias()       += gathf.head(lim).transpose() * gw.Z.topRows(lim);
+            U.topRows(lim).noalias()  += gathf.head(lim) * gw.Z.row(ai);
+            // y_s' K y_t picks up K_ij (y_si y_tj + y_sj y_ti) for every j < i,
+            // so one P-vector and a rank-2 update per row.
+            const Eigen::VectorXd w = Y.topRows(lim).transpose() * gathd.head(lim);
+            gw.qgw.noalias() += Y.row(ai).transpose() * w.transpose();
+            gw.qgw.noalias() += w * Y.row(ai);
+        }
+        for (long long gj = 0; gj < gi; ++gj) {
+            const int aj = idx[gj];
+            if (aj >= 0) { gathf[aj] = 0.0f; gathd[aj] = 0.0; }
+        }
+        if ((gi & 8191LL) == 0) Rcpp::checkUserInterrupt();
+    }
+    fb.close();
+
+    // ---- normalise to tr(K_gw) = n, matching the g_a convention ---------
+    if (!(gw.trK > 0.0)) stop("Genome-wide GRM has non-positive trace");
+    const double sc = (double) n / gw.trK;
+    gw.trK2 *= sc * sc; gw.trK = (double) n;
+    gw.qgw *= sc;
+    gw.Ur = (sc * U.array()).matrix() - gw.Z;       // (K_gw - I) Z
+
+    gw.active = true;
+    gw_cache_write(cache, gw, n, P);
+    Rcout << "  tr(K_gw) = " << gw.trK << "   tr(K_gw^2) = " << gw.trK2
+          << "   (ratio " << gw.trK2 / gw.trK << ", 1 would mean K_gw = I)\n"
+          << "  cached to " << cache << "\n";
 }
 
 static ChunkContext setup_chunk_context(const std::string& filename, const SEXP pheno_mat,
@@ -606,6 +807,9 @@ static ChunkContext setup_chunk_context(const std::string& filename, const SEXP 
 
     CharacterVector analysis_iid(ctx.n_inds);
     for (int i = 0; i < ctx.n_inds; ++i) analysis_iid[i] = geno_iid[ctx.geno_keep[i]];
+    ctx.analysis_iid_s.resize(ctx.n_inds);
+    for (int i = 0; i < ctx.n_inds; ++i)
+        ctx.analysis_iid_s[i] = Rcpp::as<std::string>(analysis_iid[i]);
     for (int j = 0; j < ctx.wes_n_snps; ++j) {
         if (ctx.chr_order.empty() || ctx.wes_bim.chr[j] != ctx.chr_order.back()) {
             ctx.chr_order.push_back(ctx.wes_bim.chr[j]);
@@ -1356,7 +1560,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                        const std::vector<double>& Vp, const std::vector<double>& yty,
                        const std::vector<double>& kur, bool binary,
                        bool spa, double spa_thresh, bool off_diag, int cov_df,
-                       bool coher,
+                       const GwBackground& gw, bool coher,
                        const std::vector< std::pair<int,int> >& pairs,
                        const std::vector<double>& ycross,
                        ChunkResult& cr) {
@@ -1441,6 +1645,24 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         Tcod_off.compute(Toff);
     }
 
+
+
+    // ---- tr(K_a K_gw) for the genome-wide background -----------------------
+    // tr(K_a K_gw) = tr(K_a) + tr(K_a R) = n + tr(K_a R), with R = K_gw - I.
+    // Only the small part is probed (Ur = R Z), which is what makes B = 32
+    // sufficient: a GRM is diagonal-dominated, so tr(K_a R) << n.
+    //   tr(K_a R) ~ (g_a / B) sum_{j in a} sum_b (V'Z)(j,b) (V'Ur)(j,b)
+    std::vector<double> trKgwA;
+    if (gw.active) {
+        trKgwA.assign(C, 0.0);
+        Eigen::MatrixXd Pz = (cd.V.transpose() * gw.Z ).cast<double>();   // K x B
+        Eigen::MatrixXd Qu = (cd.V.transpose() * gw.Ur).cast<double>();   // K x B
+        for (int a = 0; a < C; ++a) {
+            double s2 = 0.0;
+            for (int j = off[a]; j < off[a + 1]; ++j) s2 += Pz.row(j).dot(Qu.row(j));
+            trKgwA[a] = (double) n + g[a] * s2 / (double) gw.B;
+        }
+    }
 
     // ---- Cholesky of G, once per chunk -------------------------------------
     Eigen::MatrixXd L; bool have_L = false;
@@ -1585,6 +1807,11 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                 qu[a] = g[a] * qa;
             }
             qu[env] = yty[t];
+            if (gw.active) {
+                const double s0 = gw.sigma(t, t);
+                for (int aa = 0; aa < C; ++aa) qu[aa] -= s0 * trKgwA[aa];
+                qu[env] -= s0 * gw.trK;
+            }
             sg[t] = Tcod.solve(qu);
         }
         // A = M_0 in K-space is trait-independent: build it once for the chunk.
@@ -1606,6 +1833,11 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                 q[a] = g[a] * qa;
             }
             q[env] = ycross[pi];
+            if (gw.active) {
+                const double sg12 = gw.sigma(t1, t2);
+                for (int aa = 0; aa < C; ++aa) q[aa] -= sg12 * trKgwA[aa];
+                q[env] -= sg12 * gw.trK;
+            }
             Eigen::VectorXd s12;
             if (off_diag) {
                 Eigen::VectorXd y12 = Y.col(t1).array() * Y.col(t2).array();
@@ -1695,7 +1927,11 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
         Eigen::VectorXd s0v = sigma.head(C);
         for (int a = 0; a < C; ++a) if (s0v[a] < 0.0) s0v[a] = 0.0;
         s0v[0] = 0.0;
+        // K_gw also sits in the NULL covariance. It is diagonal-dominated, so to
+        // first order it adds sigma_gw to the environment term; the neglected
+        // part is R = K_gw - I, whose weight is reported at load time.
         double sigma_env0 = std::max(sigma[env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
+        if (gw.active && gw.sigma(t, t) > 0.0) sigma_env0 += gw.sigma(t, t);
 
         const double c_env = Tinv(0,env);
         for (int a = 0; a < C; ++a) { d0v[a] = s0v[a] * g[a]; dmv[a] = Tinv(0,a) * g[a]; }
@@ -2076,7 +2312,7 @@ struct ChunkWorker : public RcppParallel::Worker {
                             flank_snps, pr.common_bp, pr.common_window_given,
                             pr.max_common_snps, cd)) { ok[w] = 0; continue; }
             test_chunk(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, pr.off_diag,
-                       pr.cov_df, pr.coher, pr.pairs, pr.ycross, out[w]);
+                       pr.cov_df, ctx.gw, pr.coher, pr.pairs, pr.ycross, out[w]);
             ok[w] = 1;
         }
     }
@@ -2454,7 +2690,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                              const std::vector<double>& Vp, const std::vector<double>& yty,
                              const std::vector<double>& kur, bool binary,
                              bool spa, double spa_thresh, bool off_diag, int cov_df,
-                             bool coher,
+                             const GwBackground& gw, bool coher,
                              const std::vector< std::pair<int,int> >& pairs,
                              const std::vector<double>& ycross,
                              ChunkResultA& cr) {
@@ -2535,6 +2771,22 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
         Tcod_off.compute(Toff);
     }
 
+
+
+    // ---- tr(K_a K_gw) for the genome-wide background -----------------------
+    // tr(K_a K_gw) = tr(K_a) + tr(K_a R) = n + tr(K_a R), R = K_gw - I. Only the
+    // small part is probed (Ur = R Z), which is why B = 32 suffices.
+    std::vector<double> trKgwA;
+    if (gw.active) {
+        trKgwA.assign(C, 0.0);
+        Eigen::MatrixXd Pz = (cd.V.transpose() * gw.Z ).cast<double>();   // K x B
+        Eigen::MatrixXd Qu = (cd.V.transpose() * gw.Ur).cast<double>();   // K x B
+        for (int a = 0; a < C; ++a) {
+            double s2 = 0.0;
+            for (int j = off[a]; j < off[a + 1]; ++j) s2 += Pz.row(j).dot(Qu.row(j));
+            trKgwA[a] = (double) n + g[a] * s2 / (double) gw.B;
+        }
+    }
 
     Eigen::MatrixXd L; bool have_L = false;
     if (spa) {
@@ -2661,6 +2913,11 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                 qu[cc] = g[cc] * qa;
             }
             qu[env] = yty[t];
+            if (gw.active) {
+                const double s0 = gw.sigma(t, t);
+                for (int aa = 0; aa < C; ++aa) qu[aa] -= s0 * trKgwA[aa];
+                qu[env] -= s0 * gw.trK;
+            }
             sg[t] = Tcod.solve(qu);
         }
         std::vector<Eigen::MatrixXd> Acat(A);
@@ -2683,6 +2940,11 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                 q[cc] = g[cc] * qa;
             }
             q[env] = ycross[pi];
+            if (gw.active) {
+                const double sg12 = gw.sigma(t1, t2);
+                for (int aa = 0; aa < C; ++aa) q[aa] -= sg12 * trKgwA[aa];
+                q[env] -= sg12 * gw.trK;
+            }
             Eigen::VectorXd s12;
             if (off_diag) {
                 Eigen::VectorXd y12 = Y.col(t1).array() * Y.col(t2).array();
@@ -2744,6 +3006,11 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
             q[c] = g[c] * qc;
         }
         q[env] = yty[t];
+        if (gw.active) {
+            const double sg = gw.sigma(t, t);
+            for (int aa = 0; aa < C; ++aa) q[aa] -= sg * trKgwA[aa];
+            q[env] -= sg * gw.trK;
+        }
         Eigen::VectorXd sigma;
         if (off_diag) {
             Eigen::VectorXd y2 = Y.col(t).array().square();
@@ -2770,6 +3037,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
         if (!spa || !have_L) continue;
 
         double sigma_env0 = std::max(sigma[env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
+        if (gw.active && gw.sigma(t, t) > 0.0) sigma_env0 += gw.sigma(t, t);
         Eigen::VectorXd s0base = sigma.head(C);
         for (int a = 0; a < C; ++a) if (s0base[a] < 0.0) s0base[a] = 0.0;
 
@@ -2907,8 +3175,8 @@ struct ChunkWorkerA : public RcppParallel::Worker {
                                   flank_snps, pr.common_bp, pr.common_window_given,
                                   pr.max_common_snps, cd)) { ok[w] = 0; continue; }
             test_chunk_annot(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh,
-                             pr.off_diag, pr.cov_df, pr.coher, pr.pairs, pr.ycross,
-                             out[w]);
+                             pr.off_diag, pr.cov_df, ctx.gw, pr.coher, pr.pairs,
+                             pr.ycross, out[w]);
             ok[w] = 1;
         }
     }
@@ -3072,7 +3340,10 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         bool off_diag = false,
                         double cov_df = NA_REAL,
                         bool coher = false,
-                        Rcpp::Nullable<Rcpp::IntegerMatrix> pairs = R_NilValue) {
+                        Rcpp::Nullable<Rcpp::IntegerMatrix> pairs = R_NilValue,
+                        Rcpp::Nullable<Rcpp::String> grm_prefix = R_NilValue,
+                        int grm_probes = 64,
+                        unsigned int grm_seed = 1) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (flank_chunks < 0) stop("flank_chunks must be >= 0");
     ChunkContext ctx = setup_chunk_context(filename, pheno_mat, alpha, alpha_common,
@@ -3135,6 +3406,47 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     if (pr.cov_df >= ctx.n_inds) stop("cov_df must be smaller than the sample size");
     Rcout << "Environment moment uses tr(I - P) correction: T(env,env) = n - "
           << pr.cov_df << " (n = " << ctx.n_inds << ").\n";
+
+
+    // ---- genome-wide background component ---------------------------------
+    if (grm_prefix.isNotNull()) {
+        Rcpp::CharacterVector gp(grm_prefix.get());
+        const std::string gpre = Rcpp::as<std::string>(gp[0]);
+        if (grm_probes < 4) stop("grm_probes must be at least 4");
+        load_gw_background(gpre, ctx.analysis_iid_s, ctx.Y, grm_probes, grm_seed, ctx.gw);
+
+        // sigma_gw ONCE, genome-wide, from the exact 2x2 moment system:
+        //   [ tr(K^2)  tr(K)   ] [ sigma_gw ]   [ y_s' K y_t ]
+        //   [ tr(K)    n-cov_df] [ sigma_e  ] = [ y_s' y_t   ]
+        // Every entry is exact -- no probes -- so this is far better determined
+        // than any single window could manage, which is what justifies treating
+        // sigma_gw as KNOWN downstream.
+        const int P = ctx.n_pheno, nn = ctx.n_inds;
+        Eigen::Matrix2d A;
+        A << ctx.gw.trK2, ctx.gw.trK,
+             ctx.gw.trK,  (double)(nn - pr.cov_df);
+        ctx.gw.sigma.setZero(P, P);
+        for (int a = 0; a < P; ++a)
+            for (int b = 0; b < P; ++b) {
+                Eigen::Vector2d r(ctx.gw.qgw(a, b), ctx.Y.col(a).dot(ctx.Y.col(b)));
+                ctx.gw.sigma(a, b) = A.colPivHouseholderQr().solve(r)(0);
+            }
+        // Hutchinson precision: tr(K_a K_gw) = n + tr(K_a R), and only tr(K_a R)
+        // is probed. Report how big R is so the probe count can be judged.
+        const double rw = (ctx.gw.trK2 - ctx.gw.trK) / ctx.gw.trK;
+        Rcout << "Genome-wide background active (" << grm_probes << " probes).\n"
+              << "  tr(K_gw^2)/tr(K_gw) = " << ctx.gw.trK2 / ctx.gw.trK
+              << "   =>  ||K_gw - I||_F^2 / n = " << rw << "\n"
+              << "  sigma_gw per trait:";
+        for (int a = 0; a < P; ++a) Rcout << " " << ctx.gw.sigma(a, a);
+        Rcout << "\n  approx SE(sigma_gw) = "
+              << std::sqrt(2.0 / std::max(1.0, ctx.gw.trK2 - ctx.gw.trK))
+              << " (exact moments, no probes)\n"
+              << "  T is unchanged; sigma_gw enters as a known offset on q.\n";
+        if (rw > 5.0)
+            Rcpp::warning("K_gw is far from diagonal-dominated (||K_gw - I||_F^2 / n = %.1f); "
+                          "consider raising grm_probes and check the SPA null", rw);
+    }
 
     // ---- co-heritability mode ---------------------------------------------
     pr.coher = coher;
