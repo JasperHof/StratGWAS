@@ -525,6 +525,7 @@ static void gw_cache_write(const std::string& path, const GwBackground& gw,
 struct ChunkContext {
     std::string wes_prefix; int wes_n_total, wes_n_snps; BimInfo wes_bim;
     std::vector<int> geno_keep;
+    std::vector<int> pheno_keep;    // analysis row -> phenotype-matrix row
     Eigen::MatrixXd Y;
     CharacterVector trait_names;
     int n_inds, n_pheno;
@@ -819,6 +820,7 @@ static ChunkContext setup_chunk_context(const std::string& filename, const SEXP 
     ctx.n_inds = (int) ctx.geno_keep.size();
     Rcout << "Individuals with complete data: " << ctx.n_inds << "\n";
 
+    ctx.pheno_keep = pheno_keep;
     ctx.Y.resize(ctx.n_inds, ctx.n_pheno);
     for (int i = 0; i < ctx.n_inds; ++i)
         for (int j = 0; j < ctx.n_pheno; ++j) ctx.Y(i, j) = pheno(pheno_keep[i], j);
@@ -1363,6 +1365,138 @@ static QuadSpaResult quad_spa_solve(
 
 
 
+
+// ===========================================================================
+// BINARY CO-HERITABILITY:  exact conditional saddlepoint
+// ===========================================================================
+// Q = y_1' M_c y_2 is LINEAR in y_2. Hold trait 1 fixed, put w = M_c y_1, and
+//     Q = w' y_2
+// is a weighted sum of the second trait's 0/1 outcomes -- which has an EXACT
+// closed-form cumulant generating function. No chi-square mixture, no cumulant
+// truncation, no normality. This is the Dey/SAIGE saddlepoint, and it is the
+// reason the bivariate binary problem is EASIER than the univariate one:
+// y' M y has the same y on both sides and cannot be linearised.
+//
+// The analysis phenotype is the covariate residual of the 0/1 trait, rescaled:
+//     y_i = (b_i - yhat_i) / s ,   b_i in {0,1}
+// so it still takes exactly TWO values per individual, a gap of delta = 1/s
+// apart. Writing y_i = ylo_i + delta * b_i,
+//     Q = A + sum_i c_i b_i ,   A = w' ylo ,  c_i = delta * w_i
+// with b_i ~ Bernoulli(pi_i) independent given trait 1. Hence
+//     K(t) = A t + sum_i log(1 - pi_i + pi_i e^{c_i t})
+// exactly.
+//
+// s is recovered without extra input: y = (I-H)b/s and b'(I-H)b = ||(I-H)b||^2,
+// so b'y = (n-1)s, i.e. delta = (n-1) / (b'y).
+//
+// Validated by simulation against the Gaussian spectrum SPA. At two binary
+// traits with prevalence 2% and correlation 0.3 the Gaussian null gives
+// 0.0994 / 0.0384 / 0.0156 at alpha = 0.05 / 0.01 / 0.001 (a 16-fold excess in
+// the tail); the conditional Bernoulli saddlepoint gives 0.0498 / 0.0096 /
+// 0.0012.
+// ===========================================================================
+static QuadSpaResult bern_spa_solve(double q_obs, const std::vector<double>& cc,
+                                    const std::vector<float>& pi, double A,
+                                    int max_iter = 100, double tol = 1e-10) {
+    QuadSpaResult res; res.p = NA_REAL; res.converged = false;
+    const int n = (int) cc.size();
+    double mean0 = A, var0 = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double pv = pi[i];
+        mean0 += cc[i] * pv;
+        var0  += cc[i] * cc[i] * pv * (1.0 - pv);
+    }
+    if (!(var0 > 0.0) || !std::isfinite(var0)) return res;
+    // Same scale normalisation as quad_spa_solve: work in units where Var = 1,
+    // otherwise every tolerance below is compared against the wrong magnitude.
+    const double sd = std::sqrt(var0), sc = 1.0 / sd;
+    std::vector<double> c(n);
+    for (int i = 0; i < n; ++i) c[i] = cc[i] * sc;
+    const double An = A * sc, qn = q_obs * sc;
+
+    double t = 0.0, Kv = 0.0, K1 = 0.0, K2 = 0.0;
+    bool conv = false;
+    for (int it = 0; it < max_iter; ++it) {
+        Kv = An * t; K1 = An; K2 = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double z = c[i] * t, pv = pi[i];
+            const double m = (z > 0.0) ? z : 0.0;          // log-sum-exp shift
+            const double e0 = (1.0 - pv) * std::exp(-m), e1 = pv * std::exp(z - m);
+            const double den = e0 + e1;
+            Kv += m + std::log(den);
+            const double r = e1 / den;
+            K1 += c[i] * r;
+            K2 += c[i] * c[i] * r * (1.0 - r);
+        }
+        const double diff = K1 - qn;
+        if (std::abs(diff) < tol * std::max(1.0, std::abs(qn - An))) { conv = true; break; }
+        if (!(K2 > 1e-14)) break;
+        double step = diff / K2;
+        if (step >  2.0) step =  2.0;                       // the domain is all of R,
+        if (step < -2.0) step = -2.0;                       // but keep exp() in range
+        t -= step;
+    }
+    if (!conv) return res;
+    if (!(K2 > 0.0)) return res;
+
+    if (std::abs(t) < 1e-9) {                               // removable singularity
+        const double z = (qn - (An + K1 - An)) / std::sqrt(K2);
+        res.p = std::erfc(std::abs(z) / std::sqrt(2.0));
+        res.converged = true; return res;
+    }
+    const double w = ((t > 0) ? 1.0 : -1.0)
+                   * std::sqrt(std::max(0.0, 2.0 * (t * qn - Kv)));
+    const double u = t * std::sqrt(K2);
+    const double Phi_w = 0.5 * std::erfc(-w / std::sqrt(2.0));
+    const double phi_w = std::exp(-0.5 * w * w) / std::sqrt(2.0 * M_PI);
+    double p_one = (w >= 0) ? (1.0 - Phi_w) + phi_w * (1.0 / u - 1.0 / w)
+                            : Phi_w - phi_w * (1.0 / u - 1.0 / w);
+    if (p_one < 0.0) p_one = 0.0;
+    if (p_one > 1.0) p_one = 1.0;
+    res.p = std::min(1.0, 2.0 * p_one);
+    res.converged = true;
+    return res;
+}
+
+
+
+// diag(M_c): needed for the binary variance correction, sum_i M_ii^2.
+static void coher_mdiag(const GenoMat& V, const std::vector<int>& off, int C,
+                        const std::vector<double>& g, const Eigen::MatrixXd& Tinv,
+                        int c, int env, int n, Eigen::VectorXd& md) {
+    md = Eigen::VectorXd::Constant(n, Tinv(c, env));
+    for (int a = 0; a < C; ++a) {
+        const double dm = Tinv(c, a) * g[a];
+        if (dm == 0.0) continue;
+        for (int j = off[a]; j < off[a + 1]; ++j)
+            md.array() += dm * V.col(j).cast<double>().array().square();
+    }
+}
+
+// w = M_c y, from the chunk's V and the already-computed u = V' y. One GEMV.
+static void coher_wvec(const GenoMat& V, const std::vector<int>& off, int C, int K,
+                       const std::vector<double>& g, const Eigen::MatrixXd& Tinv,
+                       int c, int env, const Eigen::VectorXd& u,
+                       const Eigen::VectorXd& y, Eigen::VectorXd& w) {
+    GenoMat d(K, 1);
+    for (int a = 0; a < C; ++a) {
+        const double dm = Tinv(c, a) * g[a];
+        for (int j = off[a]; j < off[a + 1]; ++j) d(j, 0) = (float)(dm * u[j]);
+    }
+    w = (V * d).col(0).cast<double>() + Tinv(c, env) * y;
+}
+
+// Per-pair inputs for the exact conditional saddlepoint (binary coher).
+struct CoherBin {
+    std::vector<double> k22;                 // joint 4th cumulant of the pair
+    std::vector<int>    cond_t, rand_t;      // fixed trait / random trait
+    std::vector<double> cdelta;              // gap between the two phenotype values
+    std::vector< std::vector<float> > cpi;   // P(random = case | fixed trait)
+    std::vector< std::vector<float> > cylo;  // phenotype value if a control
+    bool active;
+    CoherBin() : active(false) {}
+};
+
 // ===========================================================================
 // CO-HERITABILITY  (coher = TRUE)
 // ===========================================================================
@@ -1432,7 +1566,7 @@ static void coher_fit(int c, const Eigen::MatrixXd& Tinv, int C, int env,
                       const Eigen::MatrixXd& Ac,
                       const Eigen::VectorXd& sg1, const Eigen::VectorXd& sg2,
                       const Eigen::VectorXd& s12, double Vp1, double Vp2,
-                      CoherFit& F) {
+                      double kappa22, double Sb2c, CoherFit& F) {
     std::vector<double> d1(C), d2(C), d12(C);
     for (int a = 0; a < C; ++a) {
         // DO NOT CLAMP THE TESTED COMPONENT. It is a nuisance here, not the
@@ -1476,6 +1610,16 @@ static void coher_fit(int c, const Eigen::MatrixXd& Tinv, int C, int env,
     const long n_rep = (long) n - K;
     if (n_rep > 0)
         v += (double) n_rep * F.c_env * F.c_env * (F.e1 * F.e2 + F.e12 * F.e12);
+    // BINARY CORRECTION. Working with M directly (not the stacked B, whose
+    // diagonal is zero) the exact variance is
+    //     Var(y1' M y2) = (v1 v2 + v12^2) tr(M^2) + kappa_22 * sum_i M_ii^2
+    // which collapses to the univariate 2 v^2 tr(M^2) + kappa_4 sum M_ii^2 when
+    // y1 = y2. So the diagonal term survives, with the JOINT fourth cumulant in
+    // place of kappa_4, and it reuses the same sum_i M_ii^2 (Sb2).
+    // Note kappa_22 = 0 when the traits are independent, whatever their
+    // marginals: binarity enters a covariance null only through trait-trait
+    // dependence, and only appreciably when BOTH traits are rare.
+    if (kappa22 != 0.0 && Sb2c > 0.0) v += kappa22 * Sb2c;
     F.var0 = v;
     F.ok = (v > 0.0) && std::isfinite(v);
 }
@@ -1603,6 +1747,7 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
                        const GwBackground& gw, bool coher,
                        const std::vector< std::pair<int,int> >& pairs,
                        const std::vector<double>& ycross,
+                       const CoherBin& cb,
                        ChunkResult& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
     const int K = cd.K, m_t = cd.m_t, m_f = cd.m_f, m_c = cd.m_c;
@@ -1910,12 +2055,36 @@ static void test_chunk(const ChunkData& cd, const Eigen::MatrixXd& Y, const Geno
             if (!spa || !have_L) continue;
 
             CoherFit F;
+            double Sb2c = 0.0;
+            if (binary && cb.active) {
+                Eigen::VectorXd md; coher_mdiag(cd.V, off, C, g, Tinv, 0, env, n, md);
+                Sb2c = md.squaredNorm();
+            }
             coher_fit(0, Tinv, C, env, g, off, K, n, L, W, use_wcache, Ac,
-                      sg[t1], sg[t2], s12, Vp[t1], Vp[t2], F);
+                      sg[t1], sg[t2], s12, Vp[t1], Vp[t2],
+                      (binary && cb.active) ? cb.k22[pi] : 0.0, Sb2c, F);
             if (!F.ok) continue;
             cr.se_vg[pi] = std::sqrt(F.var0);
             const double p_wald =
                 std::erfc(std::abs(s12[0] / cr.se_vg[pi]) / std::sqrt(2.0));
+            // ---- BINARY: exact conditional saddlepoint ------------------
+            if (binary && cb.active) {
+                const int tc = cb.cond_t[pi], trd = cb.rand_t[pi];
+                Eigen::VectorXd wv;
+                coher_wvec(cd.V, off, C, K, g, Tinv, 0, env, U.col(tc),
+                           Y.col(tc), wv);
+                std::vector<double> cvec(n);
+                double A = 0.0;
+                const double dl = cb.cdelta[pi];
+                for (int i = 0; i < n; ++i) {
+                    A += wv[i] * cb.cylo[pi][i];
+                    cvec[i] = dl * wv[i];
+                }
+                QuadSpaResult br = bern_spa_solve(s12[0], cvec, cb.cpi[pi], A);
+                if (br.converged) { cr.p_spa[pi] = br.p; cr.spa_used[pi] = 4; }
+                else              { cr.p_spa[pi] = p_wald; cr.spa_used[pi] = 0; }
+                continue;
+            }
             if (p_wald >= spa_thresh || !spec_ok) {
                 cr.p_spa[pi] = p_wald; cr.spa_used[pi] = 0; continue;
             }
@@ -2132,6 +2301,10 @@ struct ChunkParams {
     std::vector< std::pair<int,int> > pairs;   // 0-based trait indices
     std::vector<std::string> pair_names;       // "trait1_trait2"
     std::vector<double> ycross;                // y_t1' y_t2, one per pair
+    // binary coher: everything the exact conditional saddlepoint needs, per pair.
+    // cond[p] is the trait held FIXED (the rarer one, so the random trait has the
+    // most cases and is least discrete); rand[p] is the one that stays random.
+    CoherBin cb;
 };
 
 static void common_chr_range(const ChunkContext& ctx, const std::string& chr, int& lo, int& hi) {
@@ -2354,7 +2527,7 @@ struct ChunkWorker : public RcppParallel::Worker {
                             flank_snps, pr.common_bp, pr.common_window_given,
                             pr.max_common_snps, cd)) { ok[w] = 0; continue; }
             test_chunk(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh, pr.off_diag,
-                       pr.cov_df, ctx.gw, pr.coher, pr.pairs, pr.ycross, out[w]);
+                       pr.cov_df, ctx.gw, pr.coher, pr.pairs, pr.ycross, pr.cb, out[w]);
             ok[w] = 1;
         }
     }
@@ -2738,6 +2911,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
                              const GwBackground& gw, bool coher,
                              const std::vector< std::pair<int,int> >& pairs,
                              const std::vector<double>& ycross,
+                             const CoherBin& cb,
                              ChunkResultA& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
     const int A = (int) cd.cat_m.size();
@@ -3022,12 +3196,36 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
 
             for (int c = 0; c < A; ++c) {
                 CoherFit F;
+                double Sb2c = 0.0;
+                if (binary && cb.active) {
+                    Eigen::VectorXd md; coher_mdiag(cd.V, off, C, g, Tinv, c, env, n, md);
+                    Sb2c = md.squaredNorm();
+                }
                 coher_fit(c, Tinv, C, env, g, off, K, n, L, W, use_wcache, Acat[c],
-                          sg[t1], sg[t2], s12, Vp[t1], Vp[t2], F);
+                          sg[t1], sg[t2], s12, Vp[t1], Vp[t2],
+                          (binary && cb.active) ? cb.k22[pi] : 0.0, Sb2c, F);
                 if (!F.ok) continue;
                 cr.se_vg[c][pi] = std::sqrt(F.var0);
                 const double p_wald =
                     std::erfc(std::abs(s12[c] / cr.se_vg[c][pi]) / std::sqrt(2.0));
+                // ---- BINARY: exact conditional saddlepoint ------------------
+                if (binary && cb.active) {
+                    const int tc = cb.cond_t[pi], trd = cb.rand_t[pi];
+                    Eigen::VectorXd wv;
+                    coher_wvec(cd.V, off, C, K, g, Tinv, c, env, U.col(tc),
+                                   Y.col(tc), wv);
+                    std::vector<double> cvec(n);
+                    double A = 0.0;
+                    const double dl = cb.cdelta[pi];
+                    for (int i = 0; i < n; ++i) {
+                        A += wv[i] * cb.cylo[pi][i];
+                        cvec[i] = dl * wv[i];
+                    }
+                    QuadSpaResult br = bern_spa_solve(s12[c], cvec, cb.cpi[pi], A);
+                    if (br.converged) { cr.p_spa[c][pi] = br.p; cr.spa_used[c][pi] = 4; }
+                    else                  { cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; }
+                    continue;
+                }
                 if (p_wald >= spa_thresh || !spec_ok) {
                     cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; continue;
                 }
@@ -3223,7 +3421,7 @@ struct ChunkWorkerA : public RcppParallel::Worker {
                                   pr.max_common_snps, cd)) { ok[w] = 0; continue; }
             test_chunk_annot(cd, Y, Yf, Vp, yty, kur, pr.binary, pr.spa, pr.spa_thresh,
                              pr.off_diag, pr.cov_df, ctx.gw, pr.coher, pr.pairs,
-                             pr.ycross, out[w]);
+                             pr.ycross, pr.cb, out[w]);
             ok[w] = 1;
         }
     }
@@ -3390,6 +3588,7 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         double cov_df = NA_REAL,
                         bool coher = false,
                         Rcpp::Nullable<Rcpp::IntegerMatrix> pairs = R_NilValue,
+                        Rcpp::Nullable<Rcpp::NumericMatrix> binary_raw = R_NilValue,
                         Rcpp::Nullable<Rcpp::String> grm_prefix = R_NilValue,
                         int grm_probes = 64,
                         unsigned int grm_seed = 1) {
@@ -3510,11 +3709,12 @@ Rcpp::List he_chunk_spa(const std::string& filename,
     if (coher) {
         if (ctx.n_pheno < 2)
             stop("coher = TRUE needs at least 2 phenotype columns; got %d", ctx.n_pheno);
-        if (binary)
-            stop("coher = TRUE is not supported with binary = TRUE: the cumulant "
-                 "machinery that corrects a binary null is univariate. Use "
-                 "binary = FALSE (the point estimates stay valid; only the tail "
-                 "calibration assumes normality).");
+        if (binary && binary_raw.isNull())
+            stop("binary = TRUE with coher = TRUE needs binary_raw: the original "
+                 "0/1 phenotype matrix (same rows as pheno, one column per trait). "
+                 "The analysis phenotype is its covariate residual, so the code "
+                 "recovers the two values each individual can take and uses the "
+                 "EXACT conditional Bernoulli saddlepoint.");
         if (pairs.isNotNull()) {
             Rcpp::IntegerMatrix pm(pairs.get());
             if (pm.ncol() != 2) stop("pairs must be a two-column matrix of 1-based trait indices");
@@ -3551,6 +3751,77 @@ Rcpp::List he_chunk_spa(const std::string& filename,
             Rcout << "  The null spectrum is indefinite (eigenvalues of both signs) and is\n"
                   << "  solved on a 2K x 2K problem, so significant chunks cost ~8x the\n"
                   << "  univariate eigensolve. The Wald screen still skips the rest.\n";
+    }
+
+    // ---- binary co-heritability: build the exact conditional saddlepoint ----
+    if (coher && binary) {
+        Rcpp::NumericMatrix braw(binary_raw.get());
+        if (braw.nrow() != (int) ctx.pheno_keep.size() && braw.nrow() < ctx.n_inds)
+            stop("binary_raw must have one row per row of the phenotype matrix");
+        const int n = ctx.n_inds, P = ctx.n_pheno;
+        if (braw.ncol() != P) stop("binary_raw must have one column per phenotype");
+        std::vector< std::vector<unsigned char> > B(P, std::vector<unsigned char>(n, 0));
+        std::vector<double> prev(P, 0.0), delta(P, 0.0);
+        for (int t = 0; t < P; ++t) {
+            double sumb = 0.0, bty = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const double v = braw(ctx.pheno_keep[i], t);
+                if (!(v == 0.0 || v == 1.0))
+                    stop("binary_raw must contain only 0 and 1 (column %d)", t + 1);
+                B[t][i] = (unsigned char) v;
+                sumb += v; bty += v * ctx.Y(i, t);
+            }
+            prev[t] = sumb / n;
+            if (!(bty > 0.0)) stop("binary_raw column %d does not match the phenotype", t + 1);
+            // y = (I-H) b / s  =>  b'y = (n-1) s, so the gap between the two
+            // values an individual's phenotype can take is delta = 1/s.
+            delta[t] = (double)(n - 1) / bty;
+        }
+        const int NP = (int) pr.pairs.size();
+        pr.cb.k22.assign(NP, 0.0); pr.cb.cdelta.assign(NP, 0.0);
+        pr.cb.cond_t.assign(NP, 0); pr.cb.rand_t.assign(NP, 0);
+        pr.cb.cpi.assign(NP, std::vector<float>(n, 0.f));
+        pr.cb.cylo.assign(NP, std::vector<float>(n, 0.f));
+        for (int q = 0; q < NP; ++q) {
+            const int a = pr.pairs[q].first, b = pr.pairs[q].second;
+            // joint 4th cumulant on the ANALYSIS scale (already centred):
+            //   kappa_22 = m22 - m20 m02 - 2 m11^2
+            double m22 = 0, m20 = 0, m02 = 0, m11 = 0, p11 = 0;
+            for (int i = 0; i < n; ++i) {
+                const double x = ctx.Y(i, a), y = ctx.Y(i, b);
+                m22 += x * x * y * y; m20 += x * x; m02 += y * y; m11 += x * y;
+                if (B[a][i] && B[b][i]) p11 += 1.0;
+            }
+            m22 /= n; m20 /= n; m02 /= n; m11 /= n; p11 /= n;
+            pr.cb.k22[q] = m22 - m20 * m02 - 2.0 * m11 * m11;
+            // Condition on the RARER trait, so the trait left random has the most
+            // cases and the statistic is least discrete.
+            const int tc = (prev[a] <= prev[b]) ? a : b;
+            const int tr = (tc == a) ? b : a;
+            pr.cb.cond_t[q] = tc; pr.cb.rand_t[q] = tr;
+            pr.cb.cdelta[q] = delta[tr];
+            const double pc = prev[tc], prr = prev[tr];
+            const double pi1 = (pc > 0.0)       ? p11 / pc               : prr;
+            const double pi0 = (pc < 1.0)       ? (prr - p11) / (1.0 - pc) : prr;
+            for (int i = 0; i < n; ++i) {
+                double pv = B[tc][i] ? pi1 : pi0;
+                if (pv < 1e-8) pv = 1e-8; if (pv > 1.0 - 1e-8) pv = 1.0 - 1e-8;
+                pr.cb.cpi[q][i]  = (float) pv;
+                pr.cb.cylo[q][i] = (float)(ctx.Y(i, tr) - (double) B[tr][i] * delta[tr]);
+            }
+        }
+        pr.cb.active = true;
+        Rcout << "Binary co-heritability: EXACT conditional saddlepoint.\n"
+              << "  Q = y1' M y2 is linear in y2, so holding the rarer trait fixed\n"
+              << "  makes Q a weighted sum of 0/1 outcomes with a closed-form CGF --\n"
+              << "  no chi-square mixture and no cumulant truncation.\n"
+              << "  se_vg additionally carries the joint-cumulant term kappa_22 * sum_i M_ii^2\n"
+              << "  (kappa_22 = 0 for independent traits, large only when BOTH are rare).\n";
+        for (int q = 0; q < NP && q < 6; ++q)
+            Rcout << "    " << pr.pair_names[q] << ": prevalence "
+                  << prev[pr.pairs[q].first] << " / " << prev[pr.pairs[q].second]
+                  << ", conditioning on " << as<std::string>(ctx.trait_names[pr.cb.cond_t[q]])
+                  << ", kappa_22 = " << pr.cb.k22[q] << "\n";
     }
     if (off_diag) {
         if (SPA) stop("off_diag = TRUE is not supported with SPA = TRUE: the null "
