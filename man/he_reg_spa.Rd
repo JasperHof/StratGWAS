@@ -31,7 +31,8 @@ he_reg_spa(
   cov_df = NA,
   coher = F,
   grm_prefix = NULL,
-  grm_probes = 64
+  grm_probes = 64,
+  binary_raw = NULL
 )
 }
 \description{
