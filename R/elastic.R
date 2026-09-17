@@ -178,7 +178,7 @@ he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
   }
   # Create multivariate phenotype
   multi <- pheno
-  colnames(multi) <- c("FID", "IID", "Pheno")
+  colnames(multi) <- c("FID", "IID", paste0("Pheno", seq_len(ncol(multi) - 2)))
 
   # HE regression on the phenotype
   multi_he <- as.matrix(multi[, -c(1, 2), drop = FALSE])
