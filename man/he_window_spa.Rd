@@ -21,7 +21,7 @@ he_window_spa(
   SPA = T,
   spa_pval_threshold = 0.1,
   binary = F,
-  binary_raw = binary_raw,
+  binary_raw = NULL,
   coher = F,
   chr = NULL,
   batch_size = 64,
