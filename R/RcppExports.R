@@ -61,6 +61,10 @@ he_chunk_spa <- function(filename, pheno_mat, chunk_size = 256L, flank_chunks = 
     .Call(`_StratGWAS_he_chunk_spa`, filename, pheno_mat, chunk_size, flank_chunks, min_chunk_snps, alpha, alpha_common, common_filename, common_window, max_common_snps, out_file, batch_size, n_threads, weights, covariates, SPA, spa_pval_threshold, binary, annotation, annot_names, chr, flank_categories, project_common, off_diag, cov_df, coher, pairs, binary_raw, binary_gap, grm_prefix, grm_probes, grm_seed)
 }
 
+stratgwas_run <- function(filename, pheno_mat, annotation = NULL, annot_names = NULL, loco_prs = NULL, prs_mask = NULL, chunk_size = 256L, window_bp = 1e6, do_windows = TRUE, alpha = -1.0, covariates = NULL, cov_df = NA_real_, SPA = TRUE, spa_pval_threshold = 0.1, binary = FALSE, binary_raw = NULL, coher = FALSE, chr = NULL, out_file = "", batch_size = 64L, n_threads = 0L) {
+    .Call(`_StratGWAS_stratgwas_run`, filename, pheno_mat, annotation, annot_names, loco_prs, prs_mask, chunk_size, window_bp, do_windows, alpha, covariates, cov_df, SPA, spa_pval_threshold, binary, binary_raw, coher, chr, out_file, batch_size, n_threads)
+}
+
 computeLDscoresFromBED <- function(file_prefix, geno_set) {
     .Call(`_StratGWAS_computeLDscoresFromBED`, file_prefix, geno_set)
 }

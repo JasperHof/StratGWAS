@@ -295,6 +295,37 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// stratgwas_run
+Rcpp::List stratgwas_run(const std::string& filename, const SEXP pheno_mat, Rcpp::Nullable<Rcpp::IntegerMatrix> annotation, Rcpp::Nullable<Rcpp::CharacterVector> annot_names, Rcpp::Nullable<Rcpp::CharacterMatrix> loco_prs, Rcpp::Nullable<Rcpp::IntegerMatrix> prs_mask, int chunk_size, double window_bp, bool do_windows, double alpha, Rcpp::Nullable<Rcpp::NumericMatrix> covariates, double cov_df, bool SPA, double spa_pval_threshold, bool binary, Rcpp::Nullable<Rcpp::NumericMatrix> binary_raw, bool coher, SEXP chr, std::string out_file, int batch_size, int n_threads);
+RcppExport SEXP _StratGWAS_stratgwas_run(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP annotationSEXP, SEXP annot_namesSEXP, SEXP loco_prsSEXP, SEXP prs_maskSEXP, SEXP chunk_sizeSEXP, SEXP window_bpSEXP, SEXP do_windowsSEXP, SEXP alphaSEXP, SEXP covariatesSEXP, SEXP cov_dfSEXP, SEXP SPASEXP, SEXP spa_pval_thresholdSEXP, SEXP binarySEXP, SEXP binary_rawSEXP, SEXP coherSEXP, SEXP chrSEXP, SEXP out_fileSEXP, SEXP batch_sizeSEXP, SEXP n_threadsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< const std::string& >::type filename(filenameSEXP);
+    Rcpp::traits::input_parameter< const SEXP >::type pheno_mat(pheno_matSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::IntegerMatrix> >::type annotation(annotationSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::CharacterVector> >::type annot_names(annot_namesSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::CharacterMatrix> >::type loco_prs(loco_prsSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::IntegerMatrix> >::type prs_mask(prs_maskSEXP);
+    Rcpp::traits::input_parameter< int >::type chunk_size(chunk_sizeSEXP);
+    Rcpp::traits::input_parameter< double >::type window_bp(window_bpSEXP);
+    Rcpp::traits::input_parameter< bool >::type do_windows(do_windowsSEXP);
+    Rcpp::traits::input_parameter< double >::type alpha(alphaSEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::NumericMatrix> >::type covariates(covariatesSEXP);
+    Rcpp::traits::input_parameter< double >::type cov_df(cov_dfSEXP);
+    Rcpp::traits::input_parameter< bool >::type SPA(SPASEXP);
+    Rcpp::traits::input_parameter< double >::type spa_pval_threshold(spa_pval_thresholdSEXP);
+    Rcpp::traits::input_parameter< bool >::type binary(binarySEXP);
+    Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::NumericMatrix> >::type binary_raw(binary_rawSEXP);
+    Rcpp::traits::input_parameter< bool >::type coher(coherSEXP);
+    Rcpp::traits::input_parameter< SEXP >::type chr(chrSEXP);
+    Rcpp::traits::input_parameter< std::string >::type out_file(out_fileSEXP);
+    Rcpp::traits::input_parameter< int >::type batch_size(batch_sizeSEXP);
+    Rcpp::traits::input_parameter< int >::type n_threads(n_threadsSEXP);
+    rcpp_result_gen = Rcpp::wrap(stratgwas_run(filename, pheno_mat, annotation, annot_names, loco_prs, prs_mask, chunk_size, window_bp, do_windows, alpha, covariates, cov_df, SPA, spa_pval_threshold, binary, binary_raw, coher, chr, out_file, batch_size, n_threads));
+    return rcpp_result_gen;
+END_RCPP
+}
 // computeLDscoresFromBED
 DataFrame computeLDscoresFromBED(std::string file_prefix, IntegerVector geno_set);
 RcppExport SEXP _StratGWAS_computeLDscoresFromBED(SEXP file_prefixSEXP, SEXP geno_setSEXP) {
@@ -383,6 +414,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_he_sliding_window_part", (DL_FUNC) &_StratGWAS_he_sliding_window_part, 20},
     {"_StratGWAS_reml_sliding_window_part", (DL_FUNC) &_StratGWAS_reml_sliding_window_part, 20},
     {"_StratGWAS_he_chunk_spa", (DL_FUNC) &_StratGWAS_he_chunk_spa, 32},
+    {"_StratGWAS_stratgwas_run", (DL_FUNC) &_StratGWAS_stratgwas_run, 21},
     {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 2},
     {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},
     {"_StratGWAS_linear_gwas_parallel", (DL_FUNC) &_StratGWAS_linear_gwas_parallel, 4},

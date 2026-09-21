@@ -226,3 +226,61 @@ he_reg_spa <- function (filename, pheno, chunk_size = 256, flank_chunks = 1,
 
   return(NULL)
 }
+
+#' SPA solver for HE-based variance components with correction
+#'
+#' @export
+he_window_spa <- function (filename, pheno, out_file, annotation = NULL, annot_names = NULL,
+                          loco_prs = NULL, prs_mask = NULL, chunk_size = 256,
+                          window_bp = 1e6, do_windows = T, alpha = -1,
+                          covariates = NULL, cov_df = NA, SPA = T,
+                          spa_pval_threshold = 0.1, binary = F,
+                          binary_raw = binary_raw, coher = F, chr = NULL,
+                          batch_size = 64, n_threads = 0
+                          ) {
+
+  #storage.mode(snp_cat) <- "integer"          # <- force integer
+  #snp_cat <- as.matrix(snp_cat)               # ensure it's a matrix, not df
+  #cat_names <- as.character(cat_names)
+
+  # Stadardize
+  for (j in 3:ncol(pheno)) pheno[, j] <- as.numeric(scale(pheno[, j]))
+  for (j in 3:ncol(pheno)) {
+    if (any(is.na(pheno[, j]))) {
+      pheno[which(is.na(pheno[, j])), j] <- mean(pheno[, j], na.rm = T)
+    }
+  }
+  # Create multivariate phenotype
+  multi <- pheno
+  colnames(multi) <- c("FID", "IID", paste0("Pheno", seq_len(ncol(multi) - 2)))
+
+  # HE regression on the phenotype
+  multi_he <- as.matrix(multi[, -c(1, 2), drop = FALSE])
+  rownames(multi_he) <- multi[, 2]
+
+  stratgwas_run(
+    filename = filename,
+    pheno_mat = multi_he,
+    annotation = annotation,
+    annot_names = annot_names,
+    loco_prs = loco_prs,
+    prs_mask = prs_mask,
+    chunk_size = chunk_size,
+    window_bp = window_bp,
+    do_windows = do_windows,
+    alpha = alpha,
+    covariates = covariates,
+    cov_df = cov_df,
+    SPA = SPA,
+    spa_pval_threshold = spa_pval_threshold,
+    binary = binary,
+    binary_raw = binary_raw,
+    coher = coher,
+    chr = chr,
+    out_file = out_file,
+    batch_size = batch_size,
+    n_threads = n_threads
+  )
+
+  return(NULL)
+}
