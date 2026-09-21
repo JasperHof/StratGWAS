@@ -1351,8 +1351,11 @@ static QuadSpaResult quad_spa_solve(
     double Phi_w = 0.5 * std::erfc(-w / std::sqrt(2.0));
     double phi_w = std::exp(-0.5 * w * w) / std::sqrt(2.0 * M_PI);
 
+    // Upper tail computed DIRECTLY as 0.5*erfc(w/sqrt2). Writing it as
+    // 1 - Phi(w) cancels catastrophically: past w ~ 8.3 it returns exactly 0,
+    // which is where p_spa = 0 comes from. The lower branch has no cancellation.
     double p_one = (w >= 0)
-        ? (1.0 - Phi_w) + phi_w * (1.0 / u - 1.0 / w)
+        ? 0.5 * std::erfc(w / std::sqrt(2.0)) + phi_w * (1.0 / u - 1.0 / w)
         : Phi_w - phi_w * (1.0 / u - 1.0 / w);
     if (p_one < 0.0) p_one = 0.0;
     if (p_one > 1.0) p_one = 1.0;
@@ -1449,7 +1452,9 @@ static QuadSpaResult bern_spa_solve(double q_obs, const std::vector<double>& cc,
     const double u = t * std::sqrt(K2);
     const double Phi_w = 0.5 * std::erfc(-w / std::sqrt(2.0));
     const double phi_w = std::exp(-0.5 * w * w) / std::sqrt(2.0 * M_PI);
-    double p_one = (w >= 0) ? (1.0 - Phi_w) + phi_w * (1.0 / u - 1.0 / w)
+    // see quad_spa_solve: the upper tail must not be written as 1 - Phi(w)
+    double p_one = (w >= 0) ? 0.5 * std::erfc(w / std::sqrt(2.0))
+                              + phi_w * (1.0 / u - 1.0 / w)
                             : Phi_w - phi_w * (1.0 / u - 1.0 / w);
     if (p_one < 0.0) p_one = 0.0;
     if (p_one > 1.0) p_one = 1.0;
@@ -3589,6 +3594,7 @@ Rcpp::List he_chunk_spa(const std::string& filename,
                         bool coher = false,
                         Rcpp::Nullable<Rcpp::IntegerMatrix> pairs = R_NilValue,
                         Rcpp::Nullable<Rcpp::NumericMatrix> binary_raw = R_NilValue,
+                        Rcpp::Nullable<Rcpp::NumericVector> binary_gap = R_NilValue,
                         Rcpp::Nullable<Rcpp::String> grm_prefix = R_NilValue,
                         int grm_probes = 64,
                         unsigned int grm_seed = 1) {
@@ -3773,9 +3779,28 @@ Rcpp::List he_chunk_spa(const std::string& filename,
             }
             prev[t] = sumb / n;
             if (!(bty > 0.0)) stop("binary_raw column %d does not match the phenotype", t + 1);
-            // y = (I-H) b / s  =>  b'y = (n-1) s, so the gap between the two
-            // values an individual's phenotype can take is delta = 1/s.
+            // y = (I-H) b / s  =>  b'y = (n-1) s, so the gap between the two values
+            // an individual's phenotype can take is delta = 1/s. This identity needs
+            // H to be a PROJECTION. An lm() on PCs is one; a RIDGE PRS is not --
+            // (I-S)^2 <= (I-S), so b'(I-S)b > ||(I-S)b||^2, the recovered delta comes
+            // out too SMALL, and the p-values would be anti-conservative. Supply
+            // binary_gap = 1 / sd(residual before scaling) whenever anything other
+            // than a linear projection was removed from the phenotype.
             delta[t] = (double)(n - 1) / bty;
+        }
+        if (binary_gap.isNotNull()) {
+            Rcpp::NumericVector gv(binary_gap.get());
+            if (gv.size() != P) stop("binary_gap must have one entry per phenotype");
+            for (int t = 0; t < P; ++t) {
+                if (!(gv[t] > 0.0)) stop("binary_gap entries must be positive");
+                const double rat = gv[t] / delta[t];
+                if (rat < 0.9 || rat > 1.1)
+                    Rcout << "  note: supplied binary_gap for trait " << (t + 1)
+                          << " is " << rat << "x the projection-implied value"
+                          << " (expected if a ridge/PRS residual was used)\n";
+                delta[t] = gv[t];
+            }
+            Rcout << "  using supplied binary_gap\n";
         }
         const int NP = (int) pr.pairs.size();
         pr.cb.k22.assign(NP, 0.0); pr.cb.cdelta.assign(NP, 0.0);
@@ -3786,13 +3811,21 @@ Rcpp::List he_chunk_spa(const std::string& filename,
             const int a = pr.pairs[q].first, b = pr.pairs[q].second;
             // joint 4th cumulant on the ANALYSIS scale (already centred):
             //   kappa_22 = m22 - m20 m02 - 2 m11^2
+            // CENTRE explicitly: kappa_22 = m22 - m20 m02 - 2 m11^2 is a statement
+            // about CENTRAL moments. Y is centred in the intended pipeline, but a
+            // raw 0/1 phenotype would silently give a meaningless kappa_22.
+            double ma = 0, mb = 0;
+            for (int i = 0; i < n; ++i) { ma += ctx.Y(i, a); mb += ctx.Y(i, b); }
+            ma /= n; mb /= n;
             double m22 = 0, m20 = 0, m02 = 0, m11 = 0, p11 = 0;
             for (int i = 0; i < n; ++i) {
-                const double x = ctx.Y(i, a), y = ctx.Y(i, b);
+                const double x = ctx.Y(i, a) - ma, y = ctx.Y(i, b) - mb;
                 m22 += x * x * y * y; m20 += x * x; m02 += y * y; m11 += x * y;
                 if (B[a][i] && B[b][i]) p11 += 1.0;
             }
             m22 /= n; m20 /= n; m02 /= n; m11 /= n; p11 /= n;
+            // kappa_22 multiplies sum_i M_ii^2, which is on the phenotype scale,
+            // so kappa_22 must be too: no standardisation of the moments here.
             pr.cb.k22[q] = m22 - m20 * m02 - 2.0 * m11 * m11;
             // Condition on the RARER trait, so the trait left random has the most
             // cases and the statistic is least discrete.
