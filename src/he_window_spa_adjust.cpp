@@ -1460,20 +1460,142 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
 }
 
 
-static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, const GenoMat& Yf,
-                             const std::vector<double>& Vp, const std::vector<double>& yty,
-                             const std::vector<double>& kur, bool binary,
-                             bool spa, double spa_thresh, int cov_df, bool coher,
-                             const std::vector< std::pair<int,int> >& pairs,
-                             const std::vector<double>& ycross,
-                             const CoherBin& cb,
-                             ChunkResultA& cr) {
-    const int n = (int) Y.rows(), P = (int) Y.cols(), K = cd.K;
+// ===========================================================================
+// Chunk geometry: everything that depends on the GENOTYPES and cov_df but NOT
+// on the phenotype -- the Gram, G^2, the moment matrix T and its decomposition,
+// and (when SPA is on) the Cholesky factor L, the block outer products W and
+// the binary diagonal Sb2.
+//
+// This is ~97% of the cost of a window at K ~ 3000: the Gram alone is nK^2/2
+// flops against nKP for q = V'y. Building it once and sweeping the phenotype
+// variants (distinct prs_mask rows) over it is what makes pass 2 cost ONE
+// traversal of the window list instead of one per variant. Results are
+// unchanged: the same operations in the same order, just not repeated.
+// ===========================================================================
+struct ChunkGeom {
+    bool ok;
+    int K, A, C, env;
+    bool has_f;
+    std::vector<int> off;            // component column offsets in V
+    std::vector<double> g;           // trace normalisers n / tr(S_a)
+    Eigen::MatrixXd Tinv;
+    Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod;
+    // SPA scaffolding -- also phenotype-independent
+    bool have_L, use_wcache;
+    Eigen::MatrixXd L;
+    std::vector<Eigen::MatrixXd> W;
+    std::vector<double> Sb2;
+    // lazy 4-cumulant cache, per tested category; filled on first use and then
+    // shared by every variant, since none of it involves y either
+    std::vector<char> cum4_tried, have_cum4;
+    std::vector<Eigen::VectorXd> lamB;
+    std::vector<Eigen::MatrixXd> Spow;
+    ChunkGeom() : ok(false), K(0), A(0), C(0), env(0), has_f(false),
+                  have_L(false), use_wcache(false) {}
+};
+
+static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
+                       ChunkGeom& gm) {
+    gm = ChunkGeom();
+    const int n = (int) cd.V.rows(), K = cd.K;
     const int A = (int) cd.cat_m.size();
+    if (A <= 0 || K <= 0 || n <= 0) return;
     const bool has_f = (cd.m_flank > 0);
     // Components: the A tested categories, then the flank ONLY if present. With no
     // flank (pass 1) the model is { cat_0, ..., cat_{A-1}, sigma_e I }.
     const int C = A + (has_f ? 1 : 0), env = C;
+    gm.K = K; gm.A = A; gm.C = C; gm.env = env; gm.has_f = has_f;
+
+    gm.off.assign(C + 1, 0);
+    for (int c = 0; c < A; ++c) gm.off[c + 1] = gm.off[c] + cd.cat_m[c];
+    if (has_f) gm.off[A + 1] = gm.off[A] + cd.m_flank;
+
+    GenoMat Gf = GenoMat::Zero(K, K);
+    Gf.selfadjointView<Eigen::Upper>().rankUpdate(cd.V.transpose());
+    Eigen::MatrixXd G = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
+
+    {
+        Eigen::MatrixXd G2 = G.array().square();
+        std::vector<double> tr(C, 0.0);
+        gm.g.assign(C, 0.0);
+        for (int c = 0; c < C; ++c) {
+            for (int j = gm.off[c]; j < gm.off[c + 1]; ++j) tr[c] += cd.cj[j];
+            if (!(tr[c] > 0.0)) return;          // gm.ok stays false
+            gm.g[c] = (double) n / tr[c];
+        }
+        Eigen::MatrixXd T = Eigen::MatrixXd::Zero(C + 1, C + 1);
+        for (int a = 0; a < C; ++a)
+            for (int b = a; b < C; ++b) {
+                double v = gm.g[a] * gm.g[b] *
+                    G2.block(gm.off[a], gm.off[b],
+                             gm.off[a+1] - gm.off[a], gm.off[b+1] - gm.off[b]).sum();
+                T(a, b) = v; T(b, a) = v;
+            }
+        // See test_chunk: tr(P) = n - cov_df, not n, once covariates are regressed out.
+        for (int a = 0; a < C; ++a) { T(a, env) = (double) n; T(env, a) = (double) n; }
+        T(env, env) = (double) (n - cov_df);
+        gm.Tcod.compute(T);
+        gm.Tinv = gm.Tcod.pseudoInverse();
+    }
+
+    if (spa) {
+        double gscale = G.trace() / K;
+        Eigen::MatrixXd Gj = G; double applied = 0.0;
+        for (double r = 1e-4; r <= 1e-1; r *= 10.0) {
+            Gj.diagonal().array() += (r - applied) * gscale; applied = r;
+            Eigen::LLT<Eigen::MatrixXd> llt(Gj);
+            if (llt.info() == Eigen::Success) { gm.L = llt.matrixL(); gm.have_L = true; break; }
+        }
+    }
+
+    // ---- block outer products, once per chunk (shared across traits AND
+    // categories -- the saving is A x P fold here, not just P fold) ----------
+    gm.use_wcache = spa && gm.have_L && ((double) C * K * K * 8.0 <= 6e8);
+    if (gm.use_wcache) {
+        gm.W.resize(C);
+        for (int a = 0; a < C; ++a) {
+            const int ma = gm.off[a + 1] - gm.off[a];
+            gm.W[a].noalias() = gm.L.middleRows(gm.off[a], ma).transpose()
+                              * gm.L.middleRows(gm.off[a], ma);
+        }
+    }
+
+    // ---- binary: sum_i B_ii^2 per TESTED CATEGORY, once per chunk ----------
+    // M_0 differs between categories (row c of Tinv), so one diagonal per
+    // category -- but still independent of the trait, so A passes not A*P.
+    // Sb2 must be EAGER: it corrects var0, which feeds the Wald screen itself.
+    // It is only O(nK), so that is cheap.
+    gm.Sb2.assign(A, 0.0);
+    if (binary && spa && gm.have_L) {
+        for (int c = 0; c < A; ++c) {
+            Eigen::VectorXd bdiag = Eigen::VectorXd::Constant(n, gm.Tinv(c, env));
+            for (int a = 0; a < C; ++a) {
+                const double dm = gm.Tinv(c, a) * gm.g[a];
+                if (dm == 0.0) continue;
+                for (int j = gm.off[a]; j < gm.off[a + 1]; ++j)
+                    bdiag.array() += dm * cd.V.col(j).cast<double>().array().square();
+            }
+            gm.Sb2[c] = bdiag.squaredNorm();
+        }
+    }
+
+    gm.cum4_tried.assign(A, 0); gm.have_cum4.assign(A, 0);
+    gm.lamB.resize(A); gm.Spow.resize(A);
+    gm.ok = true;
+}
+
+
+static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
+                             const Eigen::MatrixXd& Y, const GenoMat& Yf,
+                             const std::vector<double>& Vp, const std::vector<double>& yty,
+                             const std::vector<double>& kur, bool binary,
+                             bool spa, double spa_thresh, bool coher,
+                             const std::vector< std::pair<int,int> >& pairs,
+                             const std::vector<double>& ycross,
+                             const CoherBin& cb,
+                             ChunkResultA& cr) {
+    const int n = (int) Y.rows(), P = (int) Y.cols();
+    const int A = (int) cd.cat_m.size();
 
     cr.chr = cd.chr; cr.start = cd.start; cr.end = cd.end;
     cr.m_flank = cd.m_flank;
@@ -1489,59 +1611,20 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
     cr.vg_t1.assign(A, std::vector<double>(NO, NA_REAL));
     cr.vg_t2.assign(A, std::vector<double>(NO, NA_REAL));
     if (A <= 0) return;
+    if (!gm.ok) return;          // degenerate geometry: metadata + NAs only
 
-    // component column offsets in V: cats, then flank (if any), then common (if any)
-    std::vector<int> off(C + 1, 0);
-    for (int c = 0; c < A; ++c) off[c + 1] = off[c] + cd.cat_m[c];
-    int nx = A;
-    if (has_f) { off[nx + 1] = off[nx] + cd.m_flank;  ++nx; }
+    // Aliases onto the prebuilt geometry. Everything below is exactly as it was
+    // when these were local; they are simply not recomputed per variant.
+    const int K = gm.K, C = gm.C, env = gm.env;
+    const bool has_f = gm.has_f, have_L = gm.have_L, use_wcache = gm.use_wcache;
+    const std::vector<int>& off = gm.off;
+    const std::vector<double>& g = gm.g;
+    const Eigen::MatrixXd& Tinv = gm.Tinv;
+    const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd>& Tcod = gm.Tcod;
+    const Eigen::MatrixXd& L = gm.L;
+    const std::vector<Eigen::MatrixXd>& W = gm.W;
+    const std::vector<double>& Sb2 = gm.Sb2;
 
-    GenoMat Gf = GenoMat::Zero(K, K);
-    Gf.selfadjointView<Eigen::Upper>().rankUpdate(cd.V.transpose());
-    Eigen::MatrixXd G = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
-    Eigen::MatrixXd G2 = G.array().square();
-
-    std::vector<double> tr(C, 0.0), g(C, 0.0);
-    for (int c = 0; c < C; ++c) {
-        for (int j = off[c]; j < off[c + 1]; ++j) tr[c] += cd.cj[j];
-        if (!(tr[c] > 0.0)) return;
-        g[c] = (double) n / tr[c];
-    }
-
-    Eigen::MatrixXd T = Eigen::MatrixXd::Zero(C + 1, C + 1);
-    for (int a = 0; a < C; ++a)
-        for (int b = a; b < C; ++b) {
-            double v = g[a] * g[b] * G2.block(off[a], off[b], off[a+1]-off[a], off[b+1]-off[b]).sum();
-            T(a, b) = v; T(b, a) = v;
-        }
-    // See test_chunk: tr(P) = n - cov_df, not n, once covariates are regressed out.
-    for (int a = 0; a < C; ++a) { T(a, env) = (double) n; T(env, a) = (double) n; }
-    T(env, env) = (double) (n - cov_df);
-    Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd> Tcod(T);
-    Eigen::MatrixXd Tinv = Tcod.pseudoInverse();
-
-    Eigen::MatrixXd L; bool have_L = false;
-    if (spa) {
-        double gscale = G.trace() / K;
-        Eigen::MatrixXd Gj = G; double applied = 0.0;
-        for (double r = 1e-4; r <= 1e-1; r *= 10.0) {
-            Gj.diagonal().array() += (r - applied) * gscale; applied = r;
-            Eigen::LLT<Eigen::MatrixXd> llt(Gj);
-            if (llt.info() == Eigen::Success) { L = llt.matrixL(); have_L = true; break; }
-        }
-    }
-
-    // ---- block outer products, once per chunk (shared across traits AND
-    // categories -- the saving is A x P fold here, not just P fold) ----------
-    std::vector<Eigen::MatrixXd> W;
-    bool use_wcache = spa && have_L && ((double) C * K * K * 8.0 <= 6e8);
-    if (use_wcache) {
-        W.resize(C);
-        for (int a = 0; a < C; ++a) {
-            const int ma = off[a + 1] - off[a];
-            W[a].noalias() = L.middleRows(off[a], ma).transpose() * L.middleRows(off[a], ma);
-        }
-    }
     std::vector<double> d0v(C), dmv(C);
     Eigen::MatrixXd Smat, Amat;
     auto build_SA = [&]() {
@@ -1560,39 +1643,24 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
         }
     };
 
-    // ---- binary: sum_i B_ii^2 per TESTED CATEGORY, once per chunk ----------
-    // M_0 differs between categories (row c of Tinv), so one diagonal per
-    // category -- but still independent of the trait, so A passes not A*P.
-    std::vector<double> Sb2(A, 0.0);
-    // Sb2 must be EAGER: it corrects var0, which feeds the Wald screen itself.
-    // It is only O(nK), so that is cheap.
-    if (binary && spa && have_L) {
-        for (int c = 0; c < A; ++c) {
-            Eigen::VectorXd bdiag = Eigen::VectorXd::Constant(n, Tinv(c, env));
-            for (int a = 0; a < C; ++a) {
-                const double dm = Tinv(c, a) * g[a];
-                if (dm == 0.0) continue;
-                for (int j = off[a]; j < off[a + 1]; ++j)
-                    bdiag.array() += dm * cd.V.col(j).cast<double>().array().square();
-            }
-            Sb2[c] = bdiag.squaredNorm();
-        }
-    }
     // The 4-cumulant setup is LAZY and PER CATEGORY: an eigensolve with vectors
     // plus an O(nK^2) product, so doing it eagerly for every category of every
     // chunk multiplied the run time by roughly (1 + A). Now a category pays it
     // only when one of its tests actually reaches the saddlepoint.
     // Six cumulants of Q are matched, which needs cumulants of u_k^2 up to order
     // 6, hence moments of u_k up to order 12, hence power sums to order 12.
+    // The cache lives in the geometry, so it is also shared across variants.
     const int NPOW = 12;
     const int NCUM = 6;
-    std::vector<char> cum4_tried(A, 0), have_cum4(A, 0);
-    std::vector<Eigen::VectorXd> lamB(A);
-    std::vector<Eigen::MatrixXd> Spow(A);
+    std::vector<char>& cum4_tried = gm.cum4_tried;
+    std::vector<char>& have_cum4  = gm.have_cum4;
+    std::vector<Eigen::VectorXd>& lamB = gm.lamB;
+    std::vector<Eigen::MatrixXd>& Spow = gm.Spow;
     auto ensure_cum4 = [&](int c) -> bool {
         if (cum4_tried[c]) return have_cum4[c] != 0;
         cum4_tried[c] = 1;
         if (!(binary && spa && have_L) || kur.empty()) return false;
+        if (!use_wcache) return false;   // Qm below indexes W; empty without the cache
         {
             Eigen::MatrixXd Qm = Eigen::MatrixXd::Zero(K, K);
             for (int a = 0; a < C; ++a) {
@@ -1866,7 +1934,7 @@ static void test_chunk_annot(const ChunkDataA& cd, const Eigen::MatrixXd& Y, con
 // Driver
 // ===========================================================================
 struct ChunkParams {
-    int chunk_size; long window_bp; bool do_windows;
+    int chunk_size; long window_bp; bool do_windows; int max_window_chunks;
     bool spa; double spa_thresh; bool binary;
     int  cov_df;
     std::string out_file; int batch_size, n_threads;
@@ -1880,39 +1948,52 @@ struct ChunkParams {
 // index of the window a pass-1 chunk belongs to (or of the window itself).
 struct Job { size_t ci; int a, b, fL0, fL1, fR0, fR1; int win; };
 
+// The worker takes a VECTOR of phenotype variants (distinct prs_mask rows).
+// Each job is read from disk and its geometry built ONCE; the variants are then
+// swept over that geometry. Pass 1 passes a single variant, so it is unaffected.
 struct Worker : public RcppParallel::Worker {
     const ChunkContext& ctx; const std::vector<Job>& jobs; size_t job0;
-    const PhenoStats& S; const ChunkParams& pr; bool spa;
-    std::vector<ChunkResultA>& out; std::vector<char>& ok;
+    const std::vector<PhenoStats>& S; const ChunkParams& pr; bool spa;
+    std::vector< std::vector<ChunkResultA> >& out;      // [variant][slot]
+    std::vector<char>& ok;
     Worker(const ChunkContext& ctx, const std::vector<Job>& jobs, size_t job0,
-           const PhenoStats& S, const ChunkParams& pr, bool spa,
-           std::vector<ChunkResultA>& out, std::vector<char>& ok)
+           const std::vector<PhenoStats>& S, const ChunkParams& pr, bool spa,
+           std::vector< std::vector<ChunkResultA> >& out, std::vector<char>& ok)
         : ctx(ctx), jobs(jobs), job0(job0), S(S), pr(pr), spa(spa), out(out), ok(ok) {}
     void operator()(std::size_t begin, std::size_t end) {
         for (std::size_t w = begin; w < end; ++w) {
             const Job& j = jobs[job0 + w];
             ChunkDataA cd;
             if (!make_chunk(ctx, j.ci, j.a, j.b, j.fL0, j.fL1, j.fR0, j.fR1, cd)) { ok[w] = 0; continue; }
-            test_chunk_annot(cd, S.Y, S.Yf, S.Vp, S.yty, S.kur, pr.binary, spa, pr.spa_thresh,
-                             pr.cov_df, pr.coher, pr.pairs, S.ycross, S.cb, out[w]);
+            ChunkGeom gm;
+            build_geom(cd, pr.cov_df, spa, pr.binary, gm);   // may leave gm.ok false
+            for (size_t v = 0; v < S.size(); ++v)
+                test_chunk_annot(cd, gm, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
+                                 pr.binary, spa, pr.spa_thresh, pr.coher, pr.pairs,
+                                 S[v].ycross, S[v].cb, out[v][w]);
             ok[w] = 1;
         }
     }
 };
 
-static void run_jobs(const ChunkContext& ctx, const ChunkParams& pr, const PhenoStats& S,
+static void run_jobs(const ChunkContext& ctx, const ChunkParams& pr,
+                     const std::vector<PhenoStats>& S,
                      bool spa, const std::vector<Job>& jobs, size_t j0, size_t j1,
-                     std::vector<ChunkResultA>& res, std::vector<char>& ok,
-                     const char* tag, long& done_total, long total) {
+                     std::vector< std::vector<ChunkResultA> >& res, std::vector<char>& ok,
+                     const char* tag, long& done_total, long total, int batch,
+                     const std::chrono::steady_clock::time_point& t0) {
     typedef std::chrono::steady_clock clk;
-    static clk::time_point t0 = clk::now();
+    const size_t NV = S.size();
     size_t idx = j0;
     while (idx < j1) {
-        const size_t nb = std::min((size_t) std::max(1, pr.batch_size), j1 - idx);
-        std::vector<ChunkResultA> tmp(nb); std::vector<char> tok(nb, 0);
+        const size_t nb = std::min((size_t) std::max(1, batch), j1 - idx);
+        std::vector< std::vector<ChunkResultA> > tmp(NV, std::vector<ChunkResultA>(nb));
+        std::vector<char> tok(nb, 0);
         Worker wk(ctx, jobs, idx, S, pr, spa, tmp, tok);
         RcppParallel::parallelFor(0, nb, wk);
-        for (size_t b = 0; b < nb; ++b) { res[idx + b] = tmp[b]; ok[idx + b] = tok[b]; }
+        for (size_t v = 0; v < NV; ++v)
+            for (size_t b = 0; b < nb; ++b) res[v][idx + b] = tmp[v][b];
+        for (size_t b = 0; b < nb; ++b) ok[idx + b] = tok[b];
         idx += nb; done_total += (long) nb;
         double el = std::chrono::duration<double>(clk::now() - t0).count();
         double eta = (done_total > 0) ? el * ((double) total - done_total) / done_total : 0.0;
@@ -1966,24 +2047,33 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         chr_c0.push_back(cj.size());
         // windows: consecutive whole chunks until the bp span reaches window_bp
         std::vector< std::pair<int,int> > wr;    // [a, b) of each window
-        int wa = lo;
+        int wa = lo, wn = 0;                     // window start, chunks in it so far
         for (int a = lo; a <= hi; ) {
             const int b = std::min(hi + 1, a + pr.chunk_size);
             Job j; j.ci = ci; j.a = a; j.b = b; j.fL0 = j.fL1 = j.fR0 = j.fR1 = 0;
             j.win = (int) wj.size() + (int) wr.size();
-            cj.push_back(j);
+            cj.push_back(j); ++wn;
             const bool last = (b > hi);
-            if (last || ctx.bim.bp[b - 1] - ctx.bim.bp[wa] + 1 >= pr.window_bp) {
-                wr.push_back(std::make_pair(wa, b)); wa = b;
+            // Windows close on bp span OR on the chunk cap, whichever comes
+            // first. Without the cap a gene-dense megabase can reach tens of
+            // thousands of columns, and both the Gram (nK^2/2) and the memory
+            // (n*K floats for V, K^2 for the Gram) blow up with it.
+            if (last || wn >= pr.max_window_chunks ||
+                ctx.bim.bp[b - 1] - ctx.bim.bp[wa] + 1 >= pr.window_bp) {
+                wr.push_back(std::make_pair(wa, b)); wa = b; wn = 0;
             }
             a = b;
         }
         // A trailing remainder shorter than half a window is absorbed into its
         // predecessor (as the old build_cells did), so no window-level estimate
         // rests on a sliver. The chunks it held are re-pointed accordingly.
+        // Skipped when the merge would push the predecessor past the cap.
         if (wr.size() >= 2) {
             const std::pair<int,int>& lastw = wr.back();
-            if (ctx.bim.bp[lastw.second - 1] - ctx.bim.bp[lastw.first] + 1 < pr.window_bp / 2) {
+            const int merged = ((lastw.second - wr[wr.size() - 2].first)
+                                + pr.chunk_size - 1) / pr.chunk_size;
+            if (ctx.bim.bp[lastw.second - 1] - ctx.bim.bp[lastw.first] + 1 < pr.window_bp / 2
+                && merged <= pr.max_window_chunks) {
                 const int wlast = (int) wj.size() + (int) wr.size() - 1;
                 wr[wr.size() - 2].second = lastw.second; wr.pop_back();
                 for (size_t k = chr_c0.back(); k < cj.size(); ++k) if (cj[k].win == wlast) cj[k].win = wlast - 1;
@@ -2001,16 +2091,26 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
           << ctx.n_cat << " categories, phenotype = y - LOCO PRS of the tested chromosome.\n";
     report_plan(ctx, pr, pr.chunk_size, "pass 1");
     if (pr.do_windows) {
-        int Kmax = 0; for (size_t w = 0; w < wj.size(); ++w)
-            Kmax = std::max(Kmax, (wj[w].b - wj[w].a) + (wj[w].fL1 - wj[w].fL0) + (wj[w].fR1 - wj[w].fR0));
+        int Kmax = 0; double Kmean = 0.0;
+        for (size_t w = 0; w < wj.size(); ++w) {
+            const int Kw = (wj[w].b - wj[w].a) + (wj[w].fL1 - wj[w].fL0) + (wj[w].fR1 - wj[w].fR0);
+            Kmax = std::max(Kmax, Kw); Kmean += Kw;
+        }
+        if (!wj.empty()) Kmean /= (double) wj.size();
         Rcout << "Pass 2: " << wj.size() << " windows of ~" << pr.window_bp
-              << " bp with neighbouring windows as flanks, phenotype = y - full PRS per prs_mask.\n";
+              << " bp (at most " << pr.max_window_chunks << " chunks) with neighbouring "
+              << "windows as flanks, phenotype = y - full PRS per prs_mask.\n";
+        Rcout << "  mean K ~ " << (int) Kmean << ", worst case " << Kmax
+              << "; cost per window scales as K^2.\n";
         report_plan(ctx, pr, Kmax, "pass 2");
     }
 
     // ---- PASS 1: association, one phenotype variant per chromosome ---------
-    std::vector<ChunkResultA> r1(cj.size()); std::vector<char> ok1(cj.size(), 0);
+    std::vector< std::vector<ChunkResultA> > r1v(1, std::vector<ChunkResultA>(cj.size()));
+    std::vector<ChunkResultA>& r1 = r1v[0];
+    std::vector<char> ok1(cj.size(), 0);
     long done = 0;
+    const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
     for (size_t k = 0; k < chr_c0.size(); ++k) {
         if (chr_c1[k] == chr_c0[k]) continue;
         const size_t ci = cj[chr_c0[k]].ci;
@@ -2025,8 +2125,10 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                 if (col >= 0) off.col(t) += S.loco.col(col);
                 else          off.col(t) += S.full;     // chromosome absent from the fit
             }
-        PhenoStats S; build_pheno_stats(ctx, off, pr.binary, pr.coher, pr.pairs, S);
-        run_jobs(ctx, pr, S, pr.spa, cj, chr_c0[k], chr_c1[k], r1, ok1, "pass1", done, (long) cj.size());
+        std::vector<PhenoStats> S(1);
+        build_pheno_stats(ctx, off, pr.binary, pr.coher, pr.pairs, S[0]);
+        run_jobs(ctx, pr, S, pr.spa, cj, chr_c0[k], chr_c1[k], r1v, ok1, "pass1",
+                 done, (long) cj.size(), pr.batch_size, t1);
     }
     Rcout << "\n";
 
@@ -2044,15 +2146,22 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     std::vector< std::vector<ChunkResultA> > r2(variants.size(), std::vector<ChunkResultA>(wj.size()));
     std::vector< std::vector<char> > ok2(variants.size(), std::vector<char>(wj.size(), 0));
     if (pr.do_windows && !wj.empty()) {
-        long done2 = 0; const long tot2 = (long) (wj.size() * variants.size());
+        // All variants are built up front and swept inside the worker, so each
+        // window is read and its Gram formed once rather than once per variant.
+        std::vector<PhenoStats> S(variants.size());
         for (size_t v = 0; v < variants.size(); ++v) {
             Eigen::MatrixXd off = Eigen::MatrixXd::Zero(n, P);
             for (int t = 0; t < P; ++t)
                 for (size_t g = 0; g < G; ++g)
                     if (variants[v][g]) off.col(t) += ctx.prs[(size_t) t * G + g].full;
-            PhenoStats S; build_pheno_stats(ctx, off, false, pr.coher, pr.pairs, S);
-            run_jobs(ctx, pr, S, false, wj, 0, wj.size(), r2[v], ok2[v], "pass2", done2, tot2);
+            build_pheno_stats(ctx, off, false, pr.coher, pr.pairs, S[v]);
         }
+        std::vector<char> okw(wj.size(), 0);
+        long done2 = 0; const long tot2 = (long) wj.size();
+        const std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+        const int b2 = std::max(1, std::min(pr.batch_size, 4));   // windows are slow: report often
+        run_jobs(ctx, pr, S, false, wj, 0, wj.size(), r2, okw, "pass2", done2, tot2, b2, t2);
+        for (size_t v = 0; v < variants.size(); ++v) ok2[v] = okw;
         Rcout << "\n";
     }
 
@@ -2178,6 +2287,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          int chunk_size = 256,
                          double window_bp = 1e6,
                          bool do_windows = true,
+                         int max_window_chunks = 8,
                          double alpha = -1.0,
                          Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                          double cov_df = NA_REAL,
@@ -2188,15 +2298,17 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          bool coher = false,
                          SEXP chr = R_NilValue,
                          std::string out_file = "",
-                         int batch_size = 64,
+                         int batch_size = 16,
                          int n_threads = 0) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (window_bp < chunk_size) stop("window_bp is smaller than one chunk");
+    if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     ChunkContext ctx = setup_context(filename, pheno_mat, alpha, covariates, annotation, annot_names);
     const int P = ctx.n_pheno;
 
     ChunkParams pr;
     pr.chunk_size = chunk_size; pr.window_bp = (long) window_bp; pr.do_windows = do_windows;
+    pr.max_window_chunks = max_window_chunks;
     pr.spa = SPA; pr.spa_thresh = spa_pval_threshold; pr.binary = binary;
     pr.cov_df = ISNAN(cov_df) ? ((int) ctx.covZ.cols() + 1) : (int) cov_df;
     if (pr.cov_df < 0) pr.cov_df = 0;

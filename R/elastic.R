@@ -236,7 +236,7 @@ he_window_spa <- function (filename, pheno, out_file, annotation = NULL, annot_n
                           covariates = NULL, cov_df = NA, SPA = T,
                           spa_pval_threshold = 0.1, binary = F,
                           binary_raw = NULL, coher = F, chr = NULL,
-                          batch_size = 64, n_threads = 0
+                          batch_size = 64, n_threads = 0, max_window_chunks = 8
                           ) {
 
   #storage.mode(snp_cat) <- "integer"          # <- force integer
@@ -279,7 +279,8 @@ he_window_spa <- function (filename, pheno, out_file, annotation = NULL, annot_n
     chr = chr,
     out_file = out_file,
     batch_size = batch_size,
-    n_threads = n_threads
+    n_threads = n_threads,
+    max_window_chunks = max_window_chunks
   )
 
   return(NULL)

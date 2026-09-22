@@ -25,7 +25,8 @@ he_window_spa(
   coher = F,
   chr = NULL,
   batch_size = 64,
-  n_threads = 0
+  n_threads = 0,
+  max_window_chunks = 8
 )
 }
 \description{
