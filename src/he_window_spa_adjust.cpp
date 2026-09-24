@@ -1135,7 +1135,48 @@ struct ChunkContext {
     // binary raw 0/1 per trait (only when binary && coher), analysis order
     std::vector< std::vector<unsigned char> > braw;
     std::vector<double> prev, bdelta;
+    // gene definitions (optional). Genes may overlap and nest freely -- they are
+    // tested marginally, so the only cost of an overlap is re-reading its SNPs.
+    std::vector<std::string> gene_name, gene_chr;
+    std::vector<long> gene_start, gene_end;
 };
+
+// ---------------------------------------------------------------------------
+// Cauchy (ACAT) combination. Valid under arbitrary dependence between the
+// p-values, which is what we need: the categories and blocks of one gene are
+// measured on the same individuals.
+//
+//   T = sum_j w_j tan((0.5 - p_j) pi),   p = 0.5 - atan(T / sum w_j) / pi
+//
+// BOTH directions are computed through identities that avoid a cancelling
+// subtraction, because gene-based p-values routinely reach 1e-50 and beyond:
+//
+//   tan((0.5 - p) pi) = cot(pi p) = 1 / tan(pi p)
+//       0.5 - p rounds to exactly 0.5 once p < ~1e-17, which would floor every
+//       smaller p-value at the same 1.9e-17 -- silently, and only in the tail.
+//   0.5 - atan(t)/pi = atan(1/t)/pi   for t > 0
+//       the same cancellation on the way back out.
+//
+// Same class of bug as 1 - Phi(w) in the saddlepoint solvers.
+// ---------------------------------------------------------------------------
+static double acat_combine(const std::vector<double>& p, const std::vector<double>& w) {
+    const double PI = 3.14159265358979323846;
+    double T = 0.0, wsum = 0.0;
+    for (size_t i = 0; i < p.size(); ++i) {
+        if (std::isnan(p[i]) || !(w[i] > 0.0)) continue;
+        double pi = p[i];
+        if (pi < 1e-300)        pi = 1e-300;        // 1/tan() would overflow
+        if (pi > 1.0 - 1e-15)   pi = 1.0 - 1e-15;
+        T += w[i] / std::tan(PI * pi);
+        wsum += w[i];
+    }
+    if (!(wsum > 0.0)) return NA_REAL;
+    const double t = T / wsum;
+    double out = (t > 1.0) ? (std::atan(1.0 / t) / PI) : (0.5 - std::atan(t) / PI);
+    if (!(out > 0.0)) out = 1e-300;
+    if (out > 1.0)    out = 1.0;
+    return out;
+}
 
 static std::string strip_chr(const std::string& s) {
     if (s.size() > 3 && (s.compare(0, 3, "Chr") == 0 || s.compare(0, 3, "chr") == 0 ||
@@ -1935,6 +1976,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
 // ===========================================================================
 struct ChunkParams {
     int chunk_size; long window_bp; bool do_windows; int max_window_chunks;
+    int max_gene_snps, min_gene_snps;
     bool spa; double spa_thresh; bool binary;
     int  cov_df;
     std::string out_file; int batch_size, n_threads;
@@ -2105,35 +2147,111 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         report_plan(ctx, pr, Kmax, "pass 2");
     }
 
-    // ---- PASS 1: association, one phenotype variant per chromosome ---------
-    std::vector< std::vector<ChunkResultA> > r1v(1, std::vector<ChunkResultA>(cj.size()));
-    std::vector<ChunkResultA>& r1 = r1v[0];
-    std::vector<char> ok1(cj.size(), 0);
-    long done = 0;
-    const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
-    for (size_t k = 0; k < chr_c0.size(); ++k) {
-        if (chr_c1[k] == chr_c0[k]) continue;
-        const size_t ci = cj[chr_c0[k]].ci;
+    // ---- GENE JOBS ---------------------------------------------------------
+    // One job per gene, or several when a gene exceeds max_gene_snps. Genes are
+    // tested marginally with NO flanks, matching SAIGE-GENE. They may overlap
+    // and nest; nothing downstream assumes they partition anything, which is
+    // exactly why gene results and the agnostic screen stay in separate files.
+    struct GeneRec { std::string name, chr; long start, end; size_t j0, j1; };
+    std::vector<Job> gj; std::vector<GeneRec> grec;
+    std::vector<size_t> chr_g0, chr_g1;
+    const bool has_genes = !ctx.gene_name.empty();
+    long n_gene_drop_small = 0, n_gene_drop_chr = 0;
+    if (has_genes) {
+        std::map<std::string, size_t> chr_of;
+        for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci)
+            chr_of[strip_chr(ctx.chr_order[ci])] = ci;
+        for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
+            if (!pr.chr.empty() && strip_chr(ctx.chr_order[ci]) != strip_chr(pr.chr)) continue;
+            chr_g0.push_back(gj.size());
+            for (size_t g = 0; g < ctx.gene_name.size(); ++g) {
+                std::map<std::string, size_t>::const_iterator it = chr_of.find(strip_chr(ctx.gene_chr[g]));
+                if (it == chr_of.end()) { if (ci == 0) ++n_gene_drop_chr; continue; }
+                if (it->second != ci) continue;
+                const int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
+                const int a = lower_index(ctx.bim.bp, lo, hi, ctx.gene_start[g]);
+                const int b = lower_index(ctx.bim.bp, lo, hi, ctx.gene_end[g] + 1);
+                if (b - a < pr.min_gene_snps) { ++n_gene_drop_small; continue; }
+                GeneRec r; r.name = ctx.gene_name[g]; r.chr = ctx.chr_order[ci];
+                r.start = ctx.gene_start[g]; r.end = ctx.gene_end[g]; r.j0 = gj.size();
+                for (int s = a; s < b; ) {
+                    const int e = std::min(b, s + pr.max_gene_snps);
+                    Job j; j.ci = ci; j.a = s; j.b = e;
+                    j.fL0 = j.fL1 = j.fR0 = j.fR1 = 0;
+                    j.win = (int) grec.size();
+                    gj.push_back(j); s = e;
+                }
+                r.j1 = gj.size(); grec.push_back(r);
+            }
+            chr_g1.push_back(gj.size());
+        }
+        Rcout << "Genes: " << grec.size() << " with >= " << pr.min_gene_snps << " SNPs -> "
+              << gj.size() << " blocks (split at " << pr.max_gene_snps << " SNPs), no flanks, "
+              << "phenotype = y - LOCO PRS.\n";
+        if (n_gene_drop_small) Rcout << "  " << n_gene_drop_small << " genes skipped: fewer than "
+                                     << pr.min_gene_snps << " SNPs in the genotype file.\n";
+        if (n_gene_drop_chr)   Rcout << "  " << n_gene_drop_chr
+                                     << " genes skipped: chromosome not in the genotype file.\n";
+        if (grec.empty()) stop("No gene overlapped the genotype file -- check the genome build of the gene coordinates");
+    }
+    // A genes-only run (genes supplied, do_windows = FALSE) skips the agnostic
+    // chunk pass entirely: the user wants gene p-values, not chunk p-values.
+    // With do_windows = TRUE the chunks are still needed, because the window
+    // correction is defined as (window - sum of its chunks).
+    const bool need_chunks = pr.do_windows || !has_genes;
+
+    // ---- the per-chromosome LOCO offset, shared by the chunk and gene passes -
+    const size_t G = ctx.prs_mask.empty() ? 0 : ctx.prs_mask[0].size();
+    auto loco_stats = [&](size_t ci, std::vector<PhenoStats>& S) {
         Eigen::MatrixXd off = Eigen::MatrixXd::Zero(n, P);
         // ctx.prs is stored trait-major: prs[t * G + g]
-        const size_t G = ctx.prs_mask.empty() ? 0 : ctx.prs_mask[0].size();
         for (int t = 0; t < P; ++t)
             for (size_t g = 0; g < G; ++g) {
-                const PrsSource& S = ctx.prs[(size_t) t * G + g];
+                const PrsSource& src = ctx.prs[(size_t) t * G + g];
                 int col = -1;
-                for (size_t c = 0; c < S.chr_index.size(); ++c) if (S.chr_index[c] == (int) ci) { col = (int) c; break; }
-                if (col >= 0) off.col(t) += S.loco.col(col);
-                else          off.col(t) += S.full;     // chromosome absent from the fit
+                for (size_t c = 0; c < src.chr_index.size(); ++c) if (src.chr_index[c] == (int) ci) { col = (int) c; break; }
+                if (col >= 0) off.col(t) += src.loco.col(col);
+                else          off.col(t) += src.full;     // chromosome absent from the fit
             }
-        std::vector<PhenoStats> S(1);
+        S.resize(1);
         build_pheno_stats(ctx, off, pr.binary, pr.coher, pr.pairs, S[0]);
-        run_jobs(ctx, pr, S, pr.spa, cj, chr_c0[k], chr_c1[k], r1v, ok1, "pass1",
-                 done, (long) cj.size(), pr.batch_size, t1);
+    };
+
+    // ---- PASS 1: association, one phenotype variant per chromosome ---------
+    std::vector< std::vector<ChunkResultA> > r1v(1, std::vector<ChunkResultA>(need_chunks ? cj.size() : 0));
+    std::vector<ChunkResultA>& r1 = r1v[0];
+    std::vector<char> ok1(need_chunks ? cj.size() : 0, 0);
+    if (need_chunks) {
+        long done = 0;
+        const std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+        for (size_t k = 0; k < chr_c0.size(); ++k) {
+            if (chr_c1[k] == chr_c0[k]) continue;
+            std::vector<PhenoStats> S; loco_stats(cj[chr_c0[k]].ci, S);
+            run_jobs(ctx, pr, S, pr.spa, cj, chr_c0[k], chr_c1[k], r1v, ok1, "pass1",
+                     done, (long) cj.size(), pr.batch_size, t1);
+        }
+        Rcout << "\n";
+    } else {
+        Rcout << "Skipping the agnostic chunk pass (genes supplied with do_windows = FALSE).\n";
     }
-    Rcout << "\n";
+
+    // ---- PASS 1G: the same, on genes ---------------------------------------
+    std::vector< std::vector<ChunkResultA> > rgv(1, std::vector<ChunkResultA>(gj.size()));
+    std::vector<ChunkResultA>& rg = rgv[0];
+    std::vector<char> okg(gj.size(), 0);
+    if (has_genes && !gj.empty()) {
+        long doneg = 0;
+        const std::chrono::steady_clock::time_point tg = std::chrono::steady_clock::now();
+        for (size_t k = 0; k < chr_g0.size(); ++k) {
+            if (chr_g1[k] == chr_g0[k]) continue;
+            std::vector<PhenoStats> S; loco_stats(gj[chr_g0[k]].ci, S);
+            run_jobs(ctx, pr, S, pr.spa, gj, chr_g0[k], chr_g1[k], rgv, okg, "genes",
+                     doneg, (long) gj.size(), pr.batch_size, tg);
+        }
+        Rcout << "\n";
+    }
 
     // ---- PASS 2: windows, one phenotype variant per distinct prs_mask row ---
-    const size_t G = ctx.prs_mask.empty() ? 0 : ctx.prs_mask[0].size();
     std::vector<int> cat_variant(ctx.n_cat, 0);
     std::vector< std::vector<unsigned char> > variants;           // distinct mask rows
     for (int c = 0; c < ctx.n_cat; ++c) {
@@ -2167,9 +2285,23 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
 
     // ---- ADJUSTMENT: distribute (window - sum of chunks) over the chunks -----
     // adj[chunk][k][t] for active category k of that chunk; NA if no window value
-    std::vector< std::vector< std::vector<double> > > adj(cj.size());
+    // Under coher the two univariate components are adjusted by the SAME rule, so
+    // a local genetic correlation can be formed with a calibrated numerator AND
+    // calibrated denominators rather than mixing the two scales.
+    std::vector< std::vector< std::vector<double> > > adj(cj.size()), adj1(cj.size()), adj2(cj.size());
     for (size_t k = 0; k < cj.size(); ++k)
-        if (ok1[k]) adj[k].assign(r1[k].cat_m.size(), std::vector<double>(NOUT, NA_REAL));
+        if (ok1[k]) {
+            const size_t nq = r1[k].cat_m.size();
+            adj[k].assign(nq, std::vector<double>(NOUT, NA_REAL));
+            if (pr.coher) {
+                adj1[k].assign(nq, std::vector<double>(NOUT, NA_REAL));
+                adj2[k].assign(nq, std::vector<double>(NOUT, NA_REAL));
+            }
+        }
+    // per-unit-weight correction for each window x category x trait, reused by
+    // the gene writer; NA where the window produced no estimate
+    std::vector< std::vector< std::vector<double> > > delta(
+        wj.size(), std::vector< std::vector<double> >(ctx.n_cat, std::vector<double>(NOUT, NA_REAL)));
     if (pr.do_windows) {
         // chunks of each window
         std::vector< std::vector<size_t> > members(wj.size());
@@ -2183,23 +2315,43 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                 if (kw < 0) continue;
                 // sum over member chunks where c is active
                 double wsum = 0.0;
-                std::vector<double> ssum(NOUT, 0.0);
+                std::vector<double> ssum(NOUT, 0.0), ssum1(NOUT, 0.0), ssum2(NOUT, 0.0);
                 std::vector< std::pair<size_t,int> > hits;
                 for (size_t m = 0; m < members[w].size(); ++m) {
                     const size_t k = members[w][m]; const ChunkResultA& R = r1[k];
                     for (size_t q = 0; q < R.cat_id.size(); ++q) if (R.cat_id[q] == c) {
                         hits.push_back(std::make_pair(k, (int) q)); wsum += R.cat_w[q];
-                        for (int t = 0; t < NOUT; ++t) if (!std::isnan(R.vg[q][t])) ssum[t] += R.vg[q][t];
+                        for (int t = 0; t < NOUT; ++t) {
+                            if (!std::isnan(R.vg[q][t])) ssum[t] += R.vg[q][t];
+                            if (pr.coher) {
+                                if (!std::isnan(R.vg_t1[q][t])) ssum1[t] += R.vg_t1[q][t];
+                                if (!std::isnan(R.vg_t2[q][t])) ssum2[t] += R.vg_t2[q][t];
+                            }
+                        }
                     }
                 }
                 if (hits.empty() || !(wsum > 0.0)) continue;
+                // delta_w: the correction PER UNIT of alpha-model weight. The
+                // chunks below get delta_w * cat_w; a gene inside this window
+                // gets the same rule applied to its own cat_w (see the gene
+                // writer), so both are calibrated by one definition.
+                for (int t = 0; t < NOUT; ++t) {
+                    const double Wv = W.vg[kw][t];
+                    if (!std::isnan(Wv)) delta[w][c][t] = (Wv - ssum[t]) / wsum;
+                }
                 for (size_t h = 0; h < hits.size(); ++h) {
                     const size_t k = hits[h].first; const int q = hits[h].second;
                     const double share = r1[k].cat_w[q] / wsum;
                     for (int t = 0; t < NOUT; ++t) {
                         const double Wv = W.vg[kw][t];
-                        if (std::isnan(Wv) || std::isnan(r1[k].vg[q][t])) continue;
-                        adj[k][q][t] = r1[k].vg[q][t] + (Wv - ssum[t]) * share;
+                        if (!std::isnan(Wv) && !std::isnan(r1[k].vg[q][t]))
+                            adj[k][q][t] = r1[k].vg[q][t] + (Wv - ssum[t]) * share;
+                        if (!pr.coher) continue;
+                        const double W1 = W.vg_t1[kw][t], W2 = W.vg_t2[kw][t];
+                        if (!std::isnan(W1) && !std::isnan(r1[k].vg_t1[q][t]))
+                            adj1[k][q][t] = r1[k].vg_t1[q][t] + (W1 - ssum1[t]) * share;
+                        if (!std::isnan(W2) && !std::isnan(r1[k].vg_t2[q][t]))
+                            adj2[k][q][t] = r1[k].vg_t2[q][t] + (W2 - ssum2[t]) * share;
                     }
                 }
             }
@@ -2209,13 +2361,16 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     // ---- WRITE ---------------------------------------------------------------
     auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
     long n1 = 0, n2 = 0;
-    if (!pr.out_file.empty()) {
+    if (!pr.out_file.empty() && need_chunks) {
         std::ofstream f1(pr.out_file.c_str());
         if (!f1.is_open()) stop("Could not open out_file: " + pr.out_file);
         f1 << "chr\tstart\tend\twindow\tcategory\tm_cat\tm_flank\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_env";
         if (pr.spa)   f1 << "\tp_spa\tspa_used";
         if (pr.coher) f1 << "\tvg_t1\tvg_t2";
-        if (pr.do_windows) f1 << "\tvg_adj\th2_adj";
+        if (pr.do_windows) {
+            f1 << "\tvg_adj\th2_adj";
+            if (pr.coher) f1 << "\tvg_t1_adj\tvg_t2_adj";
+        }
         f1 << "\n";
         for (size_t k = 0; k < cj.size(); ++k) {
             if (!ok1[k]) continue; ++n1;
@@ -2232,6 +2387,10 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     if (pr.do_windows) {
                         const double a = adj[k][q][t];
                         f1 << '\t'; wr(f1, a); f1 << '\t'; wr(f1, (!std::isnan(a) && h2den(t) > 0) ? a / h2den(t) : NA_REAL);
+                        if (pr.coher) {
+                            f1 << '\t'; wr(f1, adj1[k][q][t]);
+                            f1 << '\t'; wr(f1, adj2[k][q][t]);
+                        }
                     }
                     f1 << '\n';
                 }
@@ -2240,7 +2399,9 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         if (pr.do_windows) {
             std::ofstream f2((pr.out_file + ".windows").c_str());
             if (!f2.is_open()) stop("Could not open " + pr.out_file + ".windows");
-            f2 << "chr\tstart\tend\twindow\tn_chunks\tcategory\tm_cat\tm_flank\tprs_variant\tphenotype\tvg\th2\tvg_flank\tvg_env\n";
+            f2 << "chr\tstart\tend\twindow\tn_chunks\tcategory\tm_cat\tm_flank\tprs_variant\tphenotype\tvg\th2\tvg_flank\tvg_env";
+            if (pr.coher) f2 << "\tvg_t1\tvg_t2";
+            f2 << "\n";
             std::vector<int> nchunks(wj.size(), 0);
             for (size_t k = 0; k < cj.size(); ++k) if (ok1[k]) ++nchunks[cj[k].win];
             for (size_t w = 0; w < wj.size(); ++w)
@@ -2258,16 +2419,102 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                            << label(t) << '\t';
                         wr(f2, W.vg[kw][t]); f2 << '\t';
                         wr(f2, h2den(t) > 0 ? W.vg[kw][t] / h2den(t) : NA_REAL);
-                        f2 << '\t'; wr(f2, W.vg_flank[t]); f2 << '\t'; wr(f2, W.vg_env[t]); f2 << '\n';
+                        f2 << '\t'; wr(f2, W.vg_flank[t]); f2 << '\t'; wr(f2, W.vg_env[t]);
+                        if (pr.coher) { f2 << '\t'; wr(f2, W.vg_t1[kw][t]); f2 << '\t'; wr(f2, W.vg_t2[kw][t]); }
+                        f2 << '\n';
                     }
                 }
             f2.close();
         }
     }
-    long skipped = 0; for (size_t k = 0; k < cj.size(); ++k) if (!ok1[k]) ++skipped;
-    Rcout << "Chunks tested: " << n1 << (skipped ? "  (skipped " + std::to_string(skipped) + ")" : "") << "\n";
+
+    // ---- GENE WRITE ----------------------------------------------------------
+    // Per gene: one row per (block, category), then one ACAT row combining every
+    // p-value of that gene. vg_adj applies the window's per-unit-weight offset
+    // delta_w to the gene's own cat_w -- the same rule the chunks get, so gene
+    // and chunk heritabilities are calibrated by one definition rather than two.
+    long ng = 0;
+    if (!pr.out_file.empty() && has_genes) {
+        std::ofstream f3((pr.out_file + ".genes").c_str());
+        if (!f3.is_open()) stop("Could not open " + pr.out_file + ".genes");
+        f3 << "gene\tchr\tstart\tend\tblock\tn_blocks\tcategory\tm_cat\tphenotype\tvg\tse_vg\th2\tvg_env";
+        if (pr.spa)        f3 << "\tp_spa\tspa_used";
+        if (pr.do_windows) f3 << "\tvg_adj\th2_adj";
+        f3 << "\n";
+        // Window overlap per gene block, computed ONCE. Windows tile each
+        // chromosome, so a block's SNP range intersects a short contiguous run
+        // of them; doing this inside the trait loop would be O(windows) a row.
+        std::vector< std::vector< std::pair<size_t,int> > > blk_win(gj.size());
+        if (pr.do_windows)
+            for (size_t b = 0; b < gj.size(); ++b) {
+                if (!okg[b]) continue;
+                for (size_t w = 0; w < wj.size(); ++w) {
+                    if (wj[w].ci != gj[b].ci) continue;
+                    const int lo = std::max(wj[w].a, gj[b].a), hi = std::min(wj[w].b, gj[b].b);
+                    if (hi > lo) blk_win[b].push_back(std::make_pair(w, hi - lo));
+                }
+            }
+        for (size_t gi = 0; gi < grec.size(); ++gi) {
+            const GeneRec& R = grec[gi];
+            const int nb = (int) (R.j1 - R.j0);
+            bool any = false;
+            for (size_t b = R.j0; b < R.j1; ++b) if (okg[b]) any = true;
+            if (!any) continue;
+            ++ng;
+            for (int t = 0; t < NOUT; ++t) {
+                std::vector<double> pv, pw;
+                for (size_t b = R.j0; b < R.j1; ++b) {
+                    if (!okg[b]) continue;
+                    const ChunkResultA& B = rg[b];
+                    for (size_t q = 0; q < B.cat_m.size(); ++q) {
+                        // window-weighted correction for this block x category
+                        double dnum = 0.0, dden = 0.0;
+                        for (size_t z = 0; z < blk_win[b].size(); ++z) {
+                            const double d = delta[blk_win[b][z].first][B.cat_id[q]][t];
+                            if (std::isnan(d)) continue;
+                            dnum += d * (double) blk_win[b][z].second;
+                            dden += (double) blk_win[b][z].second;
+                        }
+                        const double a = (dden > 0.0)
+                            ? B.vg[q][t] + (dnum / dden) * B.cat_w[q] : NA_REAL;
+                        f3 << R.name << '\t' << R.chr << '\t' << R.start << '\t' << R.end << '\t'
+                           << (int) (b - R.j0) + 1 << '\t' << nb << '\t'
+                           << B.cat_name[q] << '\t' << B.cat_m[q] << '\t' << label(t) << '\t';
+                        wr(f3, B.vg[q][t]); f3 << '\t'; wr(f3, B.se_vg[q][t]); f3 << '\t';
+                        wr(f3, h2den(t) > 0 ? B.vg[q][t] / h2den(t) : NA_REAL);
+                        f3 << '\t'; wr(f3, B.vg_env[t]);
+                        if (pr.spa) {
+                            f3 << '\t'; wr(f3, B.p_spa[q][t]); f3 << '\t' << B.spa_used[q][t];
+                            pv.push_back(B.p_spa[q][t]); pw.push_back((double) B.cat_m[q]);
+                        }
+                        if (pr.do_windows) {
+                            f3 << '\t'; wr(f3, a);
+                            f3 << '\t'; wr(f3, (!std::isnan(a) && h2den(t) > 0) ? a / h2den(t) : NA_REAL);
+                        }
+                        f3 << '\n';
+                    }
+                }
+                if (!pr.spa || pv.empty()) continue;
+                int mtot = 0; for (size_t z = 0; z < pw.size(); ++z) mtot += (int) pw[z];
+                f3 << R.name << '\t' << R.chr << '\t' << R.start << '\t' << R.end << '\t'
+                   << "NA\t" << nb << "\tACAT\t" << mtot << '\t' << label(t)
+                   << "\tNA\tNA\tNA\tNA\t";
+                wr(f3, acat_combine(pv, pw)); f3 << "\tNA";
+                if (pr.do_windows) f3 << "\tNA\tNA";
+                f3 << '\n';
+            }
+        }
+        f3.close();
+    }
+
+    if (need_chunks) {
+        long skipped = 0; for (size_t k = 0; k < cj.size(); ++k) if (!ok1[k]) ++skipped;
+        Rcout << "Chunks tested: " << n1 << (skipped ? "  (skipped " + std::to_string(skipped) + ")" : "") << "\n";
+    }
     if (pr.do_windows) Rcout << "Window x category estimates: " << n2 << "\n";
+    if (has_genes)     Rcout << "Genes tested: " << ng << " of " << grec.size() << "\n";
     return List::create(_["n_chunks"] = (double) n1, _["n_windows"] = (double) wj.size(),
+                        _["n_genes"] = (double) ng,
                         _["trait_names"] = ctx.trait_names, _["categories"] = wrap(ctx.cat_names));
 }
 
@@ -2288,6 +2535,9 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          double window_bp = 1e6,
                          bool do_windows = true,
                          int max_window_chunks = 8,
+                         Rcpp::Nullable<Rcpp::CharacterMatrix> genes = R_NilValue,
+                         int max_gene_snps = 512,
+                         int min_gene_snps = 2,
                          double alpha = -1.0,
                          Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                          double cov_df = NA_REAL,
@@ -2298,17 +2548,49 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          bool coher = false,
                          SEXP chr = R_NilValue,
                          std::string out_file = "",
-                         int batch_size = 16,
+                         int batch_size = 64,
                          int n_threads = 0) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (window_bp < chunk_size) stop("window_bp is smaller than one chunk");
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
+    if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
+    if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
     ChunkContext ctx = setup_context(filename, pheno_mat, alpha, covariates, annotation, annot_names);
     const int P = ctx.n_pheno;
+
+    // ---- gene definitions: name, chr, start, end (extra columns ignored) ------
+    // Rows with a missing name or a non-numeric / missing coordinate are dropped
+    // here rather than in the driver, so the count reported is what was usable.
+    if (genes.isNotNull()) {
+        Rcpp::CharacterMatrix gm(genes.get());
+        if (gm.ncol() < 4) stop("genes must have at least 4 columns: name, chr, start, end");
+        long bad = 0;
+        for (int i = 0; i < gm.nrow(); ++i) {
+            const std::string nm = as<std::string>(gm(i, 0));
+            const std::string cs = as<std::string>(gm(i, 1));
+            const std::string ss = as<std::string>(gm(i, 2));
+            const std::string es = as<std::string>(gm(i, 3));
+            if (nm.empty() || nm == "-" || nm == "NA" || cs.empty() || cs == "NA" ||
+                ss.empty() || ss == "NA" || es.empty() || es == "NA") { ++bad; continue; }
+            char* endp = 0;
+            const long s = std::strtol(ss.c_str(), &endp, 10);
+            if (endp == ss.c_str() || *endp != '\0') { ++bad; continue; }
+            const long e = std::strtol(es.c_str(), &endp, 10);
+            if (endp == es.c_str() || *endp != '\0') { ++bad; continue; }
+            if (e < s) { ++bad; continue; }
+            ctx.gene_name.push_back(nm); ctx.gene_chr.push_back(cs);
+            ctx.gene_start.push_back(s); ctx.gene_end.push_back(e);
+        }
+        if (ctx.gene_name.empty()) stop("No usable rows in `genes`");
+        Rcout << "Gene definitions: " << ctx.gene_name.size() << " read";
+        if (bad) Rcout << ", " << bad << " dropped (missing name or coordinate)";
+        Rcout << ". NOTE: these coordinates must be on the same genome build as the .bim.\n";
+    }
 
     ChunkParams pr;
     pr.chunk_size = chunk_size; pr.window_bp = (long) window_bp; pr.do_windows = do_windows;
     pr.max_window_chunks = max_window_chunks;
+    pr.max_gene_snps = max_gene_snps; pr.min_gene_snps = min_gene_snps;
     pr.spa = SPA; pr.spa_thresh = spa_pval_threshold; pr.binary = binary;
     pr.cov_df = ISNAN(cov_df) ? ((int) ctx.covZ.cols() + 1) : (int) cov_df;
     if (pr.cov_df < 0) pr.cov_df = 0;

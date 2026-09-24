@@ -26,7 +26,8 @@ he_window_spa(
   chr = NULL,
   batch_size = 64,
   n_threads = 0,
-  max_window_chunks = 8
+  max_window_chunks = 8,
+  genes = NULL
 )
 }
 \description{
