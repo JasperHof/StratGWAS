@@ -770,11 +770,33 @@ static QuadSpaResult quad_spa_solve(
     // Upper tail computed DIRECTLY as 0.5*erfc(w/sqrt2). Writing it as
     // 1 - Phi(w) cancels catastrophically: past w ~ 8.3 it returns exactly 0,
     // which is where p_spa = 0 comes from. The lower branch has no cancellation.
-    double p_one = (w >= 0)
-        ? 0.5 * std::erfc(w / std::sqrt(2.0)) + phi_w * (1.0 / u - 1.0 / w)
-        : Phi_w - phi_w * (1.0 / u - 1.0 / w);
-    if (p_one < 0.0) p_one = 0.0;
-    if (p_one > 1.0) p_one = 1.0;
+    const double lead = (w >= 0) ? 0.5 * std::erfc(w / std::sqrt(2.0)) : Phi_w;
+    const double corr = phi_w * (1.0 / u - 1.0 / w);
+    double p_one = (w >= 0) ? lead + corr : lead - corr;
+
+    // ---- VALIDITY OF THE EXPANSION -- do not replace with a clamp ----------
+    // Lugannani-Rice is an ASYMPTOTIC expansion, not a bound. When the fitted
+    // CGF is badly conditioned -- which is what the six-cumulant fit produces
+    // from the enormous high-order cumulants of a very low prevalence binary
+    // trait -- the saddlepoint lands far out, |u| >> |w|, and the correction
+    // term swamps the leading term and drives p_one negative.
+    //
+    // Clamping that to 0 and returning converged = true reported a statistic
+    // 1.66 SE from zero as p = 0. Reject instead: the caller then falls back
+    // to the 4-cumulant fit, then the eigenvalue path, then the Wald p, all of
+    // which are honest. A rejected saddlepoint costs a little power; a silent
+    // p = 0 costs the whole calibration.
+    if (!std::isfinite(p_one) || p_one <= 0.0 || p_one >= 1.0) return res;
+    if (std::abs(corr) > std::abs(lead)) return res;   // 1st-order term exceeds the 0th
+
+    // Removable singularity at w ~ 0 (distinct from the t ~ 0 test above: the
+    // expansion is unstable in w even when t is not small).
+    if (std::abs(w) < 1e-4) {
+        const double z = (s_obs - mean0) / std::sqrt(var0);
+        res.p = std::erfc(std::abs(z) / std::sqrt(2.0));
+        res.converged = true;
+        return res;
+    }
 
     res.p = std::min(1.0, 2.0 * p_one);
     res.converged = true;
@@ -1178,10 +1200,19 @@ static double acat_combine(const std::vector<double>& p, const std::vector<doubl
     return out;
 }
 
+// Trim first, THEN strip a chr/Chr/CHR prefix. The trim matters: R's
+// as.matrix() on a data.frame with any character column formats the numeric
+// columns with format(), which right-aligns them to a common width -- so a
+// chromosome column arrives as " 1", " 2", ..., "10" and only the widest label
+// would ever match the .bim. Silent, and it looks like a build mismatch.
 static std::string strip_chr(const std::string& s) {
-    if (s.size() > 3 && (s.compare(0, 3, "Chr") == 0 || s.compare(0, 3, "chr") == 0 ||
-                         s.compare(0, 3, "CHR") == 0)) return s.substr(3);
-    return s;
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return std::string();
+    const size_t b = s.find_last_not_of(" \t\r\n");
+    const std::string t = s.substr(a, b - a + 1);
+    if (t.size() > 3 && (t.compare(0, 3, "Chr") == 0 || t.compare(0, 3, "chr") == 0 ||
+                         t.compare(0, 3, "CHR") == 0)) return t.substr(3);
+    return t;
 }
 
 static void prs_load(const std::string& path, ChunkContext& ctx, PrsSource& S) {
@@ -2157,17 +2188,24 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     std::vector<size_t> chr_g0, chr_g1;
     const bool has_genes = !ctx.gene_name.empty();
     long n_gene_drop_small = 0, n_gene_drop_chr = 0;
+    std::map<std::string, long> gene_chr_unmatched;
     if (has_genes) {
         std::map<std::string, size_t> chr_of;
         for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci)
             chr_of[strip_chr(ctx.chr_order[ci])] = ci;
+        // Resolve each gene's chromosome ONCE, so the diagnostic below is exact
+        // regardless of which chromosomes are being analysed.
+        std::vector<int> gci(ctx.gene_name.size(), -1);
+        for (size_t g = 0; g < ctx.gene_name.size(); ++g) {
+            std::map<std::string, size_t>::const_iterator it = chr_of.find(strip_chr(ctx.gene_chr[g]));
+            if (it == chr_of.end()) { ++gene_chr_unmatched[ctx.gene_chr[g]]; ++n_gene_drop_chr; }
+            else gci[g] = (int) it->second;
+        }
         for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
             if (!pr.chr.empty() && strip_chr(ctx.chr_order[ci]) != strip_chr(pr.chr)) continue;
             chr_g0.push_back(gj.size());
             for (size_t g = 0; g < ctx.gene_name.size(); ++g) {
-                std::map<std::string, size_t>::const_iterator it = chr_of.find(strip_chr(ctx.gene_chr[g]));
-                if (it == chr_of.end()) { if (ci == 0) ++n_gene_drop_chr; continue; }
-                if (it->second != ci) continue;
+                if (gci[g] != (int) ci) continue;
                 const int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
                 const int a = lower_index(ctx.bim.bp, lo, hi, ctx.gene_start[g]);
                 const int b = lower_index(ctx.bim.bp, lo, hi, ctx.gene_end[g] + 1);
@@ -2190,9 +2228,23 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
               << "phenotype = y - LOCO PRS.\n";
         if (n_gene_drop_small) Rcout << "  " << n_gene_drop_small << " genes skipped: fewer than "
                                      << pr.min_gene_snps << " SNPs in the genotype file.\n";
-        if (n_gene_drop_chr)   Rcout << "  " << n_gene_drop_chr
-                                     << " genes skipped: chromosome not in the genotype file.\n";
-        if (grec.empty()) stop("No gene overlapped the genotype file -- check the genome build of the gene coordinates");
+        if (n_gene_drop_chr) {
+            Rcout << "  " << n_gene_drop_chr << " genes skipped: chromosome not in the genotype file.\n";
+            // Quote the labels: that is what makes stray whitespace visible.
+            Rcout << "    unmatched gene chromosomes:";
+            int shown = 0;
+            for (std::map<std::string, long>::const_iterator it = gene_chr_unmatched.begin();
+                 it != gene_chr_unmatched.end(); ++it) {
+                if (shown++ == 8) { Rcout << " ..."; break; }
+                Rcout << " '" << it->first << "'(" << it->second << ")";
+            }
+            Rcout << "\n    .bim chromosomes:";
+            for (size_t ci = 0; ci < ctx.chr_order.size() && ci < 12; ++ci)
+                Rcout << " '" << ctx.chr_order[ci] << "'";
+            if (ctx.chr_order.size() > 12) Rcout << " ...";
+            Rcout << "\n";
+        }
+        if (grec.empty()) stop("No gene overlapped the genotype file -- check the chromosome labels above, and the genome build of the gene coordinates");
     }
     // A genes-only run (genes supplied, do_windows = FALSE) skips the agnostic
     // chunk pass entirely: the user wants gene p-values, not chunk p-values.
@@ -2288,8 +2340,13 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     // Under coher the two univariate components are adjusted by the SAME rule, so
     // a local genetic correlation can be formed with a calibrated numerator AND
     // calibrated denominators rather than mixing the two scales.
-    std::vector< std::vector< std::vector<double> > > adj(cj.size()), adj1(cj.size()), adj2(cj.size());
-    for (size_t k = 0; k < cj.size(); ++k)
+    // Sized from ok1, NOT from cj: in a genes-only run (need_chunks == false)
+    // ok1 and r1 are deliberately empty, and indexing them by a chunk index
+    // dereferences a null data pointer -- a segfault at address 0x0 right after
+    // the gene pass finishes, which is exactly what that looks like.
+    const size_t NCHUNK = ok1.size();
+    std::vector< std::vector< std::vector<double> > > adj(NCHUNK), adj1(NCHUNK), adj2(NCHUNK);
+    for (size_t k = 0; k < NCHUNK; ++k)
         if (ok1[k]) {
             const size_t nq = r1[k].cat_m.size();
             adj[k].assign(nq, std::vector<double>(NOUT, NA_REAL));
@@ -2565,8 +2622,13 @@ Rcpp::List stratgwas_run(const std::string& filename,
         Rcpp::CharacterMatrix gm(genes.get());
         if (gm.ncol() < 4) stop("genes must have at least 4 columns: name, chr, start, end");
         long bad = 0;
+        // as.matrix() on a mixed data.frame pads via format(), so trim everything
+        auto trim = [](const std::string& s) -> std::string {
+            const size_t a = s.find_first_not_of(" \t\r\n");
+            if (a == std::string::npos) return std::string();
+            return s.substr(a, s.find_last_not_of(" \t\r\n") - a + 1); };
         for (int i = 0; i < gm.nrow(); ++i) {
-            const std::string nm = as<std::string>(gm(i, 0));
+            const std::string nm = trim(as<std::string>(gm(i, 0)));
             const std::string cs = as<std::string>(gm(i, 1));
             const std::string ss = as<std::string>(gm(i, 2));
             const std::string es = as<std::string>(gm(i, 3));
