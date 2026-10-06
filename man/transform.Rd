@@ -21,6 +21,8 @@ Returns a list containing:
 continuous variables, including a2 (regression coefficient), genetic correlation
 with binary phenotype, heritability of stratification variable, and expected
 inflation factor}
+\item{genetic distance}{Matrix with genetic distances between case subgroups, based
+on the GDIS method}
 }
 \description{
 Create a transformed phenotype that maximizes power to detect genetic

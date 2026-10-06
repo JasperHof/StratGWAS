@@ -650,6 +650,9 @@ static void quad_cgf(double t, const std::vector<double>& eig_explicit,
     }
 }
 
+// All p-values here are TWO-SIDED: P(|X - mean| >= |s_obs - mean|), reported as
+// 2 * (tail in the direction of the observation). Both the univariate variance
+// component and the co-heritability use this convention.
 static QuadSpaResult quad_spa_solve(
     double s_obs_in, const std::vector<double>& eig_in, double eig_rep_in, double n_rep,
     int max_iter = 100, double tol = 1e-8,
@@ -798,6 +801,8 @@ static QuadSpaResult quad_spa_solve(
         return res;
     }
 
+    // p_one is the tail in the direction of the observation; doubling it gives
+    // the two-sided p-value.
     res.p = std::min(1.0, 2.0 * p_one);
     res.converged = true;
     return res;
