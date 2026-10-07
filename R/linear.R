@@ -42,7 +42,8 @@
 #' }
 #'
 #' @export
-linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
+linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL,
+                   alpha = -0.25) {
 
   # Extract transformed phenotype
   trans_pheno <- trans$transformed_pheno
@@ -104,10 +105,7 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
   # Perform linear regression GWAS
   linear_pheno <- matrix(pheno_matched, ncol = 1)
   rownames(linear_pheno) <- fam_ids
-  outfile_trans <- paste0(outfile, ".trans")
   cat("Running linear regression GWAS on transformed phenotype...\n")
-  #linear_gwas_parallel(filename, linear_pheno,
-  #                     nr_blocks, outfile_trans)
   outfile_trans <- paste0(outfile, ".assoc")
   linear_gwas(filename, linear_pheno,
               nr_blocks, outfile_trans)
@@ -115,4 +113,14 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL) {
 
   cat("\n")
   cat(sprintf("GWAS completed. Results written to %s\n\n", outfile_trans))
+
+  # Now compute the global inflation criterion
+  gwas_trans <- read.table(outfile_trans, head = T)
+  gwas_casecontrol <- read.table(paste0(outfile, ".pheno1"), head = T)
+  ldscores <- read.table(paste0(outfile, ".ldscores"), head = T)
+
+  sum_cov <- sumher_cov(gwas_casecontrol, gwas_trans, ldscores$Tagging, alpha = alpha)
+
+  global_infl <- sum_cov$h2_2 * (1 - sum_cov$rg^2)
+  cat("Global inflation criterion is", global_infl, ".\n")
 }

@@ -4,7 +4,7 @@
 \alias{linear}
 \title{Linear regression GWAS on transformed phenotype}
 \usage{
-linear(trans, filename, outfile, nr_blocks = 1000, cov = NULL)
+linear(trans, filename, outfile, nr_blocks = 1000, cov = NULL, alpha = -0.25)
 }
 \arguments{
 \item{trans}{Object returned from \code{\link{transform}}, containing the

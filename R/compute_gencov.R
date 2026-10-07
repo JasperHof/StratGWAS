@@ -139,6 +139,8 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     cat("\n")
     linear_gwas_parallel(filename, multi_matched, nr_blocks, outfile)
     cat("\n")
+    cat(sprintf("Case-control summary statistics written to %s \n", 
+                paste0(outfile, ".pheno1")))
 
     # Read in linear regression results
     ss_list <- vector("list", K_tot)

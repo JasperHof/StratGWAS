@@ -78,7 +78,7 @@ Rcpp::NumericMatrix linear_gwas(const std::string& filename, const SEXP pheno_ma
     for(int i = 0; i < n_pheno; ++i) {
         std::string fname = out_file; // + ".pheno" + std::to_string(i+1);
         out_files[i].open(fname, std::ios::out);
-        out_files[i] << "Chromosome\tPredictor\tBasepair\tA1\tA2\tBeta\tSE\tChisq\tP\tN\tMAF\tMiss\n";
+        out_files[i] << "Chromosome\tPredictor\tBasepair\tA1\tA2\tBETA\tSE\tChisq\tP\tN\tMAF\tMiss\n";
     }
 
     int nr_blocks = (n_snps + block_size - 1) / block_size;
