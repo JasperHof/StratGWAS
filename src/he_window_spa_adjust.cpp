@@ -801,9 +801,14 @@ static QuadSpaResult quad_spa_solve(
         return res;
     }
 
-    // p_one is the tail in the direction of the observation; doubling it gives
-    // the two-sided p-value.
-    res.p = std::min(1.0, 2.0 * p_one);
+    // TWO-SIDED, measured from the MEDIAN:  p = 2 min{F(x), 1 - F(x)}.
+    // p_one is the tail on the observation's side of the MEAN. For a skewed
+    // null (small K) the median lies below the mean, so for observations in
+    // between, p_one > 0.5 and the old 2 * p_one was capped at exactly 1 --
+    // 13-18% of tests for 1-2 SNP bins, each of which then dragged an ACAT
+    // combination to ~1. 1 - p_one is the other tail, so taking the smaller
+    // one is exact, uniform under the null, and leaves both tails unchanged.
+    res.p = 2.0 * std::min(p_one, 1.0 - p_one);
     res.converged = true;
     return res;
 }
@@ -899,9 +904,11 @@ static QuadSpaResult bern_spa_solve(double q_obs, const std::vector<double>& cc,
     double p_one = (w >= 0) ? 0.5 * std::erfc(w / std::sqrt(2.0))
                               + phi_w * (1.0 / u - 1.0 / w)
                             : Phi_w - phi_w * (1.0 / u - 1.0 / w);
-    if (p_one < 0.0) p_one = 0.0;
-    if (p_one > 1.0) p_one = 1.0;
-    res.p = std::min(1.0, 2.0 * p_one);
+    // Same two rules as quad_spa_solve: an expansion that leaves (0,1) has
+    // failed and is rejected (the caller falls back to the Wald p) rather than
+    // clamped to an exact 0; and the two-sided p is measured from the median.
+    if (!std::isfinite(p_one) || p_one <= 0.0 || p_one >= 1.0) return res;
+    res.p = 2.0 * std::min(p_one, 1.0 - p_one);
     res.converged = true;
     return res;
 }
@@ -1162,6 +1169,11 @@ struct ChunkContext {
     // binary raw 0/1 per trait (only when binary && coher), analysis order
     std::vector< std::vector<unsigned char> > braw;
     std::vector<double> prev, bdelta;
+    // alpha values. alphas[0] is the PRIMARY one: it weights the genotypes as
+    // read, and every vg / h2 / window estimate is at that value. Any further
+    // values are used ONLY for association p-values, which are ACAT-combined
+    // across all alphas (see Worker). One value = the original behaviour.
+    std::vector<double> alphas;
     // gene definitions (optional). Genes may overlap and nest freely -- they are
     // tested marginally, so the only cost of an overlap is re-reading its SNPs.
     std::vector<std::string> gene_name, gene_chr;
@@ -1193,7 +1205,12 @@ static double acat_combine(const std::vector<double>& p, const std::vector<doubl
         if (std::isnan(p[i]) || !(w[i] > 0.0)) continue;
         double pi = p[i];
         if (pi < 1e-300)        pi = 1e-300;        // 1/tan() would overflow
-        if (pi > 1.0 - 1e-15)   pi = 1.0 - 1e-15;
+        // Cap at 0.999, not 1 - 1e-15: a p of ~1 contributes ~ -3e14 and wipes
+        // out any real signal (p = 1e-5 alongside p = 1 combined to ~1). At
+        // 0.999 the contribution is ~ -318, so genuine signal survives, and
+        // calibration is unchanged (checked for d = 2, 3, 6). A cap of 1 - 1/d
+        // was also tried and inflates P(p < .05) to ~0.054.
+        if (pi > 0.999)         pi = 0.999;
         T += w[i] / std::tan(PI * pi);
         wsum += w[i];
     }
@@ -1459,6 +1476,9 @@ struct ChunkDataA {
     int m_flank, K;
     GenoMat V;
     std::vector<double> cj;
+    std::vector<float> colmaf;         // MAF of every column of V (0 = pseudo-marker);
+                                       // lets V be re-weighted to another alpha by a
+                                       // pure column rescaling, with no second read
     ChunkDataA() : m_flank(0), K(0) {}
 };
 struct ChunkResultA {
@@ -1471,6 +1491,9 @@ struct ChunkResultA {
     std::vector< std::vector<int> > spa_used;
     std::vector<double> vg_flank, vg_env;                       // per trait/pair
     std::vector< std::vector<double> > vg_t1, vg_t2;            // coher only
+    // multi-alpha only: the p-value at each alpha, [cat][trait or pair][alpha].
+    // p_spa then holds their ACAT combination.
+    std::vector< std::vector< std::vector<double> > > p_alpha;
 };
 
 // Read a SNP index range, project covariates, apply alpha; return false on error.
@@ -1513,6 +1536,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     int Kt = 0; for (size_t k = 0; k < act.size(); ++k) Kt += (int) cat_cols[act[k]].size();
     cd.K = Kt + m_flank;
     cd.V = GenoMat(ctx.n_inds, cd.K);
+    cd.colmaf.assign(cd.K, 0.f);
     const double e1 = 1.0 + ctx.alpha;
     int off = 0;
     for (size_t k = 0; k < act.size(); ++k) {
@@ -1521,15 +1545,24 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
         for (size_t q = 0; q < cc.size(); ++q) {
             cd.V.col(off + (int) q) = tgt.X.col(cc[q]);
             const double f = tgt.maf[cc[q]];
+            cd.colmaf[off + (int) q] = tgt.maf[cc[q]];
             w += (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), e1) : 0.0;
         }
         off += (int) cc.size();
         cd.cat_m.push_back((int) cc.size()); cd.cat_id.push_back(c);
         cd.cat_name.push_back(ctx.cat_names[c]); cd.cat_w.push_back(w);
     }
-    for (size_t q = 0; q < bg_cols.size(); ++q) cd.V.col(off++) = tgt.X.col(bg_cols[q]);
-    if (fl.X.cols() > 0) { cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols(); }
-    if (fr.X.cols() > 0) { cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols(); }
+    for (size_t q = 0; q < bg_cols.size(); ++q) {
+        cd.colmaf[off] = tgt.maf[bg_cols[q]]; cd.V.col(off++) = tgt.X.col(bg_cols[q]);
+    }
+    if (fl.X.cols() > 0) {
+        for (int q = 0; q < (int) fl.X.cols(); ++q) cd.colmaf[off + q] = fl.maf[q];
+        cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols();
+    }
+    if (fr.X.cols() > 0) {
+        for (int q = 0; q < (int) fr.X.cols(); ++q) cd.colmaf[off + q] = fr.maf[q];
+        cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols();
+    }
     cd.m_flank = m_flank;
     cd.cj.resize(cd.K);
     for (int j = 0; j < cd.K; ++j) cd.cj[j] = cd.V.col(j).cast<double>().squaredNorm();
@@ -1571,8 +1604,14 @@ struct ChunkGeom {
                   have_L(false), use_wcache(false) {}
 };
 
+// Gpre: an already-formed (double) Gram for this cd, used instead of recomputing
+// V'V. Gout: if non-null, receives the Gram. Both default to null, in which case
+// this is exactly the original function. They exist so the multi-alpha path can
+// form the Gram ONCE and obtain every other alpha's as  D G D  -- a K^2 rescale
+// instead of another n K^2 / 2 product.
 static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
-                       ChunkGeom& gm) {
+                       ChunkGeom& gm, const Eigen::MatrixXd* Gpre = 0,
+                       Eigen::MatrixXd* Gout = 0) {
     gm = ChunkGeom();
     const int n = (int) cd.V.rows(), K = cd.K;
     const int A = (int) cd.cat_m.size();
@@ -1587,9 +1626,15 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
     for (int c = 0; c < A; ++c) gm.off[c + 1] = gm.off[c] + cd.cat_m[c];
     if (has_f) gm.off[A + 1] = gm.off[A] + cd.m_flank;
 
-    GenoMat Gf = GenoMat::Zero(K, K);
-    Gf.selfadjointView<Eigen::Upper>().rankUpdate(cd.V.transpose());
-    Eigen::MatrixXd G = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
+    Eigen::MatrixXd G;
+    if (Gpre != 0 && Gpre->rows() == K && Gpre->cols() == K) {
+        G = *Gpre;
+    } else {
+        GenoMat Gf = GenoMat::Zero(K, K);
+        Gf.selfadjointView<Eigen::Upper>().rankUpdate(cd.V.transpose());
+        G = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
+    }
+    if (Gout != 0) *Gout = G;
 
     {
         Eigen::MatrixXd G2 = G.array().square();
@@ -2038,17 +2083,81 @@ struct Worker : public RcppParallel::Worker {
            const std::vector<PhenoStats>& S, const ChunkParams& pr, bool spa,
            std::vector< std::vector<ChunkResultA> >& out, std::vector<char>& ok)
         : ctx(ctx), jobs(jobs), job0(job0), S(S), pr(pr), spa(spa), out(out), ok(ok) {}
+    // Column weight exactly as apply_alpha() applies it, so the ratio between two
+    // alphas reproduces what reading the data at the second alpha would give.
+    static double alpha_w(double f, double a) {
+        if (a == -1.0) return 1.0;
+        return (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), (1.0 + a) / 2.0) : 1.0;
+    }
     void operator()(std::size_t begin, std::size_t end) {
         for (std::size_t w = begin; w < end; ++w) {
             const Job& j = jobs[job0 + w];
             ChunkDataA cd;
             if (!make_chunk(ctx, j.ci, j.a, j.b, j.fL0, j.fL1, j.fR0, j.fR1, cd)) { ok[w] = 0; continue; }
-            ChunkGeom gm;
-            build_geom(cd, pr.cov_df, spa, pr.binary, gm);   // may leave gm.ok false
+            // Multi-alpha applies to ASSOCIATION passes only (spa = true). The
+            // heritability pass runs with spa = false and stays single-alpha.
+            const bool multi = spa && ctx.alphas.size() > 1;
+            ChunkGeom gm; Eigen::MatrixXd G0;
+            build_geom(cd, pr.cov_df, spa, pr.binary, gm, 0, multi ? &G0 : 0);   // may leave gm.ok false
             for (size_t v = 0; v < S.size(); ++v)
                 test_chunk_annot(cd, gm, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
                                  pr.binary, spa, pr.spa_thresh, pr.coher, pr.pairs,
                                  S[v].ycross, S[v].cb, out[v][w]);
+            if (multi) {
+                // ---- ACAT over alpha ------------------------------------------
+                // V was read at alphas[0]. Another alpha only rescales columns:
+                //     V_a = V_0 D,   d_j = w(f_j, a) / w(f_j, a0)
+                // so  G_a = D G_0 D  and  ||v_j||^2 scales by d_j^2. No second
+                // read, no second n K^2 Gram -- the extra cost per alpha is one
+                // copy of V for the n x K GEMM V'Y and the per-test SPA.
+                const size_t NAL = ctx.alphas.size();
+                const double a0 = ctx.alphas[0];
+                for (size_t v = 0; v < S.size(); ++v) {
+                    ChunkResultA& R = out[v][w];
+                    R.p_alpha.assign(R.p_spa.size(), std::vector< std::vector<double> >());
+                    for (size_t q = 0; q < R.p_spa.size(); ++q) {
+                        R.p_alpha[q].assign(R.p_spa[q].size(), std::vector<double>(NAL, NA_REAL));
+                        for (size_t t = 0; t < R.p_spa[q].size(); ++t) R.p_alpha[q][t][0] = R.p_spa[q][t];
+                    }
+                }
+                if (gm.ok) {
+                    for (size_t k = 1; k < NAL; ++k) {
+                        const double ak = ctx.alphas[k];
+                        Eigen::VectorXd d(cd.K);
+                        for (int c = 0; c < cd.K; ++c)
+                            d[c] = alpha_w(cd.colmaf[c], ak) / alpha_w(cd.colmaf[c], a0);
+                        ChunkDataA ck = cd;
+                        for (int c = 0; c < cd.K; ++c) {
+                            ck.V.col(c) *= (float) d[c];
+                            ck.cj[c] *= d[c] * d[c];
+                        }
+                        Eigen::MatrixXd Gk = d.asDiagonal() * G0 * d.asDiagonal();
+                        ChunkGeom gk;
+                        build_geom(ck, pr.cov_df, spa, pr.binary, gk, &Gk);
+                        for (size_t v = 0; v < S.size(); ++v) {
+                            ChunkResultA tmp;
+                            test_chunk_annot(ck, gk, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
+                                             pr.binary, spa, pr.spa_thresh, pr.coher, pr.pairs,
+                                             S[v].ycross, S[v].cb, tmp);
+                            ChunkResultA& R = out[v][w];
+                            for (size_t q = 0; q < R.p_alpha.size() && q < tmp.p_spa.size(); ++q)
+                                for (size_t t = 0; t < R.p_alpha[q].size() && t < tmp.p_spa[q].size(); ++t)
+                                    R.p_alpha[q][t][k] = tmp.p_spa[q][t];
+                        }
+                    }
+                }
+                // combine; vg / se_vg / h2 / spa_used stay at the primary alpha
+                for (size_t v = 0; v < S.size(); ++v) {
+                    ChunkResultA& R = out[v][w];
+                    for (size_t q = 0; q < R.p_alpha.size(); ++q)
+                        for (size_t t = 0; t < R.p_alpha[q].size(); ++t) {
+                            std::vector<double> pv, pw;
+                            for (size_t k = 0; k < NAL; ++k)
+                                if (!std::isnan(R.p_alpha[q][t][k])) { pv.push_back(R.p_alpha[q][t][k]); pw.push_back(1.0); }
+                            R.p_spa[q][t] = pv.empty() ? NA_REAL : acat_combine(pv, pw);
+                        }
+                }
+            }
             ok[w] = 1;
         }
     }
@@ -2422,12 +2531,28 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
 
     // ---- WRITE ---------------------------------------------------------------
     auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
+    // multi-alpha: one extra column per alpha, p_alpha_<value>; p_spa = their ACAT
+    const bool multi_a = pr.spa && ctx.alphas.size() > 1;
+    std::string alpha_hdr;
+    if (multi_a)
+        for (size_t k = 0; k < ctx.alphas.size(); ++k) {
+            std::ostringstream o; o << "\tp_alpha_" << ctx.alphas[k]; alpha_hdr += o.str();
+        }
+    auto wr_alpha = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
+        if (!multi_a) return;
+        for (size_t k = 0; k < ctx.alphas.size(); ++k) {
+            f << '\t';
+            if (q < R.p_alpha.size() && (size_t) t < R.p_alpha[q].size() && k < R.p_alpha[q][t].size())
+                wr(f, R.p_alpha[q][t][k]);
+            else f << "NA";
+        }
+    };
     long n1 = 0, n2 = 0;
     if (!pr.out_file.empty() && need_chunks) {
         std::ofstream f1(pr.out_file.c_str());
         if (!f1.is_open()) stop("Could not open out_file: " + pr.out_file);
         f1 << "chr\tstart\tend\twindow\tcategory\tm_cat\tm_flank\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_env";
-        if (pr.spa)   f1 << "\tp_spa\tspa_used";
+        if (pr.spa)   f1 << "\tp_spa\tspa_used" << alpha_hdr;
         if (pr.coher) f1 << "\tvg_t1\tvg_t2";
         if (pr.do_windows) {
             f1 << "\tvg_adj\th2_adj";
@@ -2444,7 +2569,8 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     wr(f1, R.vg[q][t]); f1 << '\t'; wr(f1, R.se_vg[q][t]); f1 << '\t';
                     wr(f1, h2den(t) > 0 ? R.vg[q][t] / h2den(t) : NA_REAL);
                     f1 << '\t'; wr(f1, R.vg_flank[t]); f1 << '\t'; wr(f1, R.vg_env[t]);
-                    if (pr.spa) { f1 << '\t'; wr(f1, R.p_spa[q][t]); f1 << '\t' << R.spa_used[q][t]; }
+                    if (pr.spa) { f1 << '\t'; wr(f1, R.p_spa[q][t]); f1 << '\t' << R.spa_used[q][t];
+                                  wr_alpha(f1, R, q, t); }
                     if (pr.coher) { f1 << '\t'; wr(f1, R.vg_t1[q][t]); f1 << '\t'; wr(f1, R.vg_t2[q][t]); }
                     if (pr.do_windows) {
                         const double a = adj[k][q][t];
@@ -2500,7 +2626,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         std::ofstream f3((pr.out_file + ".genes").c_str());
         if (!f3.is_open()) stop("Could not open " + pr.out_file + ".genes");
         f3 << "gene\tchr\tstart\tend\tblock\tn_blocks\tcategory\tm_cat\tphenotype\tvg\tse_vg\th2\tvg_env";
-        if (pr.spa)        f3 << "\tp_spa\tspa_used";
+        if (pr.spa)        f3 << "\tp_spa\tspa_used" << alpha_hdr;
         if (pr.do_windows) f3 << "\tvg_adj\th2_adj";
         f3 << "\n";
         // Window overlap per gene block, computed ONCE. Windows tile each
@@ -2547,6 +2673,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                         f3 << '\t'; wr(f3, B.vg_env[t]);
                         if (pr.spa) {
                             f3 << '\t'; wr(f3, B.p_spa[q][t]); f3 << '\t' << B.spa_used[q][t];
+                            wr_alpha(f3, B, q, t);
                             pv.push_back(B.p_spa[q][t]); pw.push_back((double) B.cat_m[q]);
                         }
                         if (pr.do_windows) {
@@ -2562,6 +2689,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                    << "NA\t" << nb << "\tACAT\t" << mtot << '\t' << label(t)
                    << "\tNA\tNA\tNA\tNA\t";
                 wr(f3, acat_combine(pv, pw)); f3 << "\tNA";
+                if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f3 << "\tNA";
                 if (pr.do_windows) f3 << "\tNA\tNA";
                 f3 << '\n';
             }
@@ -2582,7 +2710,6 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
 
 }  // end anonymous namespace
 
-
 // ===========================================================================
 // Export
 // ===========================================================================
@@ -2600,7 +2727,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          Rcpp::Nullable<Rcpp::CharacterMatrix> genes = R_NilValue,
                          int max_gene_snps = 512,
                          int min_gene_snps = 2,
-                         double alpha = -1.0,
+                         Rcpp::NumericVector alpha = Rcpp::NumericVector::create(-1.0),
                          Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                          double cov_df = NA_REAL,
                          bool SPA = true,
@@ -2617,7 +2744,28 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    ChunkContext ctx = setup_context(filename, pheno_mat, alpha, covariates, annotation, annot_names);
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: two-sided)\n";
+    // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
+    // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
+    std::vector<double> alphas;
+    for (int k = 0; k < (int) alpha.size(); ++k) {
+        const double ak = alpha[k];
+        if (!std::isfinite(ak)) stop("alpha must be finite");
+        bool dup = false;
+        for (size_t q = 0; q < alphas.size(); ++q) if (alphas[q] == ak) dup = true;
+        if (!dup) alphas.push_back(ak);
+    }
+    if (alphas.empty()) stop("alpha must have at least one value");
+    ChunkContext ctx = setup_context(filename, pheno_mat, alphas[0], covariates, annotation, annot_names);
+    ctx.alphas = alphas;
+    if (alphas.size() > 1) {
+        if (!SPA) Rcpp::warning("alpha has several values but SPA = FALSE: only alpha[1] is used");
+        else {
+            Rcout << "Multi-alpha: association p-values are the ACAT combination over alpha = {";
+            for (size_t k = 0; k < alphas.size(); ++k) Rcout << (k ? ", " : "") << alphas[k];
+            Rcout << "}; vg / se / h2 use alpha = " << alphas[0] << ".\n";
+        }
+    }
     const int P = ctx.n_pheno;
 
     // ---- gene definitions: name, chr, start, end (extra columns ignored) ------
