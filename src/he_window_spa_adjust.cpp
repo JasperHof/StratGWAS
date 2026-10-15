@@ -19,6 +19,7 @@
 #include <utility>
 #include <cstdint>
 #include <map>
+#include <unordered_map>
 
 using namespace Rcpp;
 
@@ -71,6 +72,7 @@ typedef Eigen::MatrixXf GenoMat;
 
 struct BimInfo {
     std::vector<std::string> chr;
+    std::vector<std::string> id;       // SNP name (column 2): used to match KVIK summaries
     std::vector<long>        bp;
     int n_snps;
 };
@@ -86,6 +88,7 @@ static BimInfo read_bim_positions(const std::string& bim_path) {
         std::string chr, rsid, cm, bp;
         ss >> chr >> rsid >> cm >> bp;
         out.chr.push_back(chr);
+        out.id.push_back(rsid);
         out.bp.push_back(std::stol(bp));
     }
     out.n_snps = (int) out.bp.size();
@@ -1178,6 +1181,10 @@ struct ChunkContext {
     // tested marginally, so the only cost of an overlap is re-reading its SNPs.
     std::vector<std::string> gene_name, gene_chr;
     std::vector<long> gene_start, gene_end;
+    // LDAK-KVIK step-2 single-variant results (optional), one per trait, indexed
+    // by .bim position: z oriented to the MINOR allele (NaN = not in the file)
+    // and the minor allele count 2 n MAF. Drive the ACAT-V component.
+    std::vector< std::vector<float> > kz, kmac;
 };
 
 // ---------------------------------------------------------------------------
@@ -1222,6 +1229,58 @@ static double acat_combine(const std::vector<double>& p, const std::vector<doubl
     return out;
 }
 
+// ---------------------------------------------------------------------------
+// |z| such that the TWO-SIDED normal p-value of z equals p:  erfc(|z|/sqrt2) = p.
+// Acklam's rational approximation for the lower-tail quantile, then two Newton
+// steps in log space (accurate to ~1e-12 relative, down to p ~ 1e-300).
+// Self-contained and thread-safe (no R API), so it can run inside the workers.
+// Used to turn a saddlepoint p-value back into a standard error:
+//     se_vg = |vg| / z(p)
+// ---------------------------------------------------------------------------
+static double z_from_p2(double p) {
+    if (std::isnan(p)) return NA_REAL;
+    if (p >= 1.0) return 0.0;
+    if (p < 1e-300) p = 1e-300;
+    const double q = 0.5 * p;                                  // upper tail
+    static const double a[6] = {-3.969683028665376e+01,  2.209460984245205e+02,
+                                -2.759285104469687e+02,  1.383577518672690e+02,
+                                -3.066479806614716e+01,  2.506628277459239e+00};
+    static const double b[5] = {-5.447609879822406e+01,  1.615858368580409e+02,
+                                -1.556989798598866e+02,  6.680131188771972e+01,
+                                -1.328068155288572e+01};
+    static const double c[6] = {-7.784894002430293e-03, -3.223964580411365e-01,
+                                -2.400758277161838e+00, -2.549732539343734e+00,
+                                 4.374664141464968e+00,  2.938163982698783e+00};
+    static const double d[4] = { 7.784695709041462e-03,  3.224671290700398e-01,
+                                 2.445134137142996e+00,  3.754408661907416e+00};
+    double x;                                                  // Phi^{-1}(q), q <= 0.5
+    if (q < 0.02425) {
+        const double r = std::sqrt(-2.0 * std::log(q));
+        x = (((((c[0]*r + c[1])*r + c[2])*r + c[3])*r + c[4])*r + c[5]) /
+            ((((d[0]*r + d[1])*r + d[2])*r + d[3])*r + 1.0);
+    } else {
+        const double r = q - 0.5, s2 = r * r;
+        x = (((((a[0]*s2 + a[1])*s2 + a[2])*s2 + a[3])*s2 + a[4])*s2 + a[5]) * r /
+            (((((b[0]*s2 + b[1])*s2 + b[2])*s2 + b[3])*s2 + b[4])*s2 + 1.0);
+    }
+    double z = -x;                                             // upper-tail quantile
+    for (int it = 0; it < 2; ++it) {                           // Newton on log Q(z) = log q
+        const double Q = 0.5 * std::erfc(z / std::sqrt(2.0));
+        if (!(Q > 0.0)) break;
+        const double phi = std::exp(-0.5 * z * z) / std::sqrt(2.0 * M_PI);
+        z += (std::log(Q) - std::log(q)) * Q / phi;
+    }
+    return z > 0.0 ? z : 0.0;
+}
+
+// Standard error implied by an estimate and its two-sided p-value.
+static double se_from_p(double est, double p) {
+    if (std::isnan(est) || std::isnan(p)) return NA_REAL;
+    const double z = z_from_p2(p);
+    if (!(z > 1e-8)) return NA_REAL;                           // p ~ 1: SE undefined
+    return std::abs(est) / z;
+}
+
 // Trim first, THEN strip a chr/Chr/CHR prefix. The trim matters: R's
 // as.matrix() on a data.frame with any character column formats the numeric
 // columns with format(), which right-aligns them to a common width -- so a
@@ -1235,6 +1294,65 @@ static std::string strip_chr(const std::string& s) {
     if (t.size() > 3 && (t.compare(0, 3, "Chr") == 0 || t.compare(0, 3, "chr") == 0 ||
                          t.compare(0, 3, "CHR") == 0)) return t.substr(3);
     return t;
+}
+
+// ---------------------------------------------------------------------------
+// LDAK-KVIK step-2 single-variant results: the .summaries file
+//     Predictor  A1  A2  Z  n  A1Freq
+// Z is KVIK's test statistic AFTER its saddlepoint correction (empirical SPA for
+// quantitative traits, logistic SPA for binary), i.e. its p-value is exactly
+// erfc(|Z|/sqrt2). Variants are matched to the .bim by name. Z is re-oriented
+// to the MINOR allele (flipped when A1Freq > 0.5), so that a burden of
+// ultra-rare variants adds up effects of the same allele. Main thread only.
+// ---------------------------------------------------------------------------
+static void kvik_load(const std::string& path, ChunkContext& ctx, int t,
+                      const std::unordered_map<std::string, int>& idx) {
+    std::ifstream f(path.c_str());
+    if (!f.is_open()) stop("Cannot open KVIK summaries file: " + path);
+    std::string line;
+    if (!std::getline(f, line)) stop("Empty KVIK summaries file: " + path);
+    std::istringstream hs(line); std::vector<std::string> hdr; std::string tok;
+    while (hs >> tok) hdr.push_back(tok);
+    int cP = -1, cZ = -1, cN = -1, cF = -1;
+    for (size_t i = 0; i < hdr.size(); ++i) {
+        if (hdr[i] == "Predictor") cP = (int) i;
+        else if (hdr[i] == "Z")      cZ = (int) i;
+        else if (hdr[i] == "n")      cN = (int) i;
+        else if (hdr[i] == "A1Freq") cF = (int) i;
+    }
+    if (cP < 0 || cZ < 0 || cN < 0 || cF < 0)
+        stop("KVIK file " + path + " needs columns Predictor, Z, n and A1Freq "
+             "(use the .summaries file written by --kvik-step2)");
+    const float nanf = std::numeric_limits<float>::quiet_NaN();
+    ctx.kz[t].assign(ctx.n_snps, nanf);
+    ctx.kmac[t].assign(ctx.n_snps, nanf);
+    std::vector<std::string> v(hdr.size());
+    long nread = 0, nmatch = 0, nbad = 0;
+    auto num = [](const std::string& x, double& out) -> bool {
+        char* e = 0; out = std::strtod(x.c_str(), &e);
+        return e != x.c_str() && *e == '\0' && std::isfinite(out);
+    };
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        std::istringstream ls(line);
+        size_t k = 0;
+        while (k < v.size() && (ls >> v[k])) ++k;
+        if (k < v.size()) { ++nbad; continue; }
+        ++nread;
+        std::unordered_map<std::string, int>::const_iterator it = idx.find(v[cP]);
+        if (it == idx.end()) continue;
+        double z, nn, fr;
+        if (!num(v[cZ], z) || !num(v[cN], nn) || !num(v[cF], fr)) { ++nbad; continue; }
+        const double maf = (fr <= 0.5) ? fr : 1.0 - fr;
+        ctx.kz[t][it->second]   = (float) ((fr <= 0.5) ? z : -z);
+        ctx.kmac[t][it->second] = (float) (2.0 * nn * maf);
+        ++nmatch;
+    }
+    Rcout << "KVIK summaries " << path << ": " << nread << " variants, " << nmatch
+          << " matched to the .bim";
+    if (nbad) Rcout << " (" << nbad << " rows skipped: missing or non-numeric values)";
+    Rcout << "\n";
+    if (nmatch == 0) stop("No variant in " + path + " matched the .bim names -- check the Predictor IDs");
 }
 
 static void prs_load(const std::string& path, ChunkContext& ctx, PrsSource& S) {
@@ -1479,6 +1597,9 @@ struct ChunkDataA {
     std::vector<float> colmaf;         // MAF of every column of V (0 = pseudo-marker);
                                        // lets V be re-weighted to another alpha by a
                                        // pure column rescaling, with no second read
+    std::vector<int> colbim;           // .bim index of every CATEGORY column (-1 for
+                                       // background / flank columns): links a column to
+                                       // its KVIK single-variant statistic for ACAT-V
     ChunkDataA() : m_flank(0), K(0) {}
 };
 struct ChunkResultA {
@@ -1494,6 +1615,11 @@ struct ChunkResultA {
     // multi-alpha only: the p-value at each alpha, [cat][trait or pair][alpha].
     // p_spa then holds their ACAT combination.
     std::vector< std::vector< std::vector<double> > > p_alpha;
+    // ACAT-V (only with KVIK summaries): per alpha [cat][trait][alpha], the
+    // ACAT over alphas of the variance-component p-values (p_vc) and of the
+    // ACAT-V p-values (p_acv). p_spa then holds the omnibus of all of them.
+    std::vector< std::vector< std::vector<double> > > p_acatv;
+    std::vector< std::vector<double> > p_vc, p_acv;
 };
 
 // Read a SNP index range, project covariates, apply alpha; return false on error.
@@ -1537,6 +1663,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     cd.K = Kt + m_flank;
     cd.V = GenoMat(ctx.n_inds, cd.K);
     cd.colmaf.assign(cd.K, 0.f);
+    cd.colbim.assign(cd.K, -1);
     const double e1 = 1.0 + ctx.alpha;
     int off = 0;
     for (size_t k = 0; k < act.size(); ++k) {
@@ -1546,6 +1673,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
             cd.V.col(off + (int) q) = tgt.X.col(cc[q]);
             const double f = tgt.maf[cc[q]];
             cd.colmaf[off + (int) q] = tgt.maf[cc[q]];
+            cd.colbim[off + (int) q] = a + cc[q];
             w += (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), e1) : 0.0;
         }
         off += (int) cc.size();
@@ -1711,7 +1839,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                              const Eigen::MatrixXd& Y, const GenoMat& Yf,
                              const std::vector<double>& Vp, const std::vector<double>& yty,
                              const std::vector<double>& kur, bool binary,
-                             bool spa, double spa_thresh, bool coher,
+                             bool spa, bool coher,
                              const std::vector< std::pair<int,int> >& pairs,
                              const std::vector<double>& ycross,
                              const CoherBin& cb,
@@ -1734,6 +1862,19 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
     cr.vg_t2.assign(A, std::vector<double>(NO, NA_REAL));
     if (A <= 0) return;
     if (!gm.ok) return;          // degenerate geometry: metadata + NAs only
+
+    // REPORTED STANDARD ERROR. The closed-form variance of the moment estimator
+    // (var0 below) is still computed -- the saddlepoint needs it internally to
+    // normalise the null distribution and pin its second cumulant -- but it is
+    // NOT reported: for rare-variant kernels it does not describe the sampling
+    // distribution of vg well. The reported se_vg is instead the SE implied by
+    // the estimate and its saddlepoint p-value, se = |vg| / z(p), so that
+    // vg / se_vg reproduces the p-value exactly.
+    auto finish_se = [&]() {
+        for (size_t c = 0; c < cr.vg.size(); ++c)
+            for (size_t t = 0; t < cr.vg[c].size(); ++t)
+                cr.se_vg[c][t] = se_from_p(cr.vg[c][t], cr.p_spa[c][t]);
+    };
 
     // Aliases onto the prebuilt geometry. Everything below is exactly as it was
     // when these were local; they are simply not recomputed per variant.
@@ -1881,9 +2022,10 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                           sg[t1], sg[t2], s12, Vp[t1], Vp[t2],
                           (binary && cb.active) ? cb.k22[pi] : 0.0, Sb2c, F);
                 if (!F.ok) continue;
-                cr.se_vg[c][pi] = std::sqrt(F.var0);
+                // Wald p from the closed-form variance: used ONLY as a fallback
+                // when the saddlepoint cannot be computed (flagged spa_used = 0).
                 const double p_wald =
-                    std::erfc(std::abs(s12[c] / cr.se_vg[c][pi]) / std::sqrt(2.0));
+                    std::erfc(std::abs(s12[c] / std::sqrt(F.var0)) / std::sqrt(2.0));
                 // ---- BINARY: exact conditional saddlepoint ------------------
                 if (binary && cb.active) {
                     const int tc = cb.cond_t[pi], trd = cb.rand_t[pi];
@@ -1902,7 +2044,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     else                  { cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; }
                     continue;
                 }
-                if (p_wald >= spa_thresh || !spec_ok) {
+                if (!spec_ok) {
                     cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; continue;
                 }
                 std::vector<double> eig; double erep, l2, nrep;
@@ -1915,6 +2057,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 else              { cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; }
             }
         }
+        finish_se();
         return;
     }
 
@@ -1966,9 +2109,10 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 if (var0 + d2 > 0.0) { cscale = std::sqrt((var0 + d2) / var0); var0 += d2; }
             }
 
-            cr.se_vg[c][t] = std::sqrt(var0);
-            double p_wald = std::erfc(std::abs(sigma[c] / cr.se_vg[c][t]) / std::sqrt(2.0));
-            if (p_wald >= spa_thresh) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
+            // Every test goes to the saddlepoint (no Wald screen). The Wald p
+            // from the closed-form variance is kept ONLY as the fallback for a
+            // saddlepoint that fails (spa_used = 0).
+            double p_wald = std::erfc(std::abs(sigma[c] / std::sqrt(var0)) / std::sqrt(2.0));
 
             // 4-cumulant path first: when it succeeds, none of the Cholesky of
             // Smat, the Cf products, or the eigensolve below is needed.
@@ -2031,12 +2175,12 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
 
             // ---- fallback: build Asym and solve the eigenproblem -------------
             Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
-            if (lltS.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; continue; }
+            if (lltS.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
             Eigen::MatrixXd Cf = lltS.matrixL();
             Eigen::MatrixXd Asym = Cf.transpose() * Amat * Cf;
             Asym = (0.5 * (Asym + Asym.transpose())).eval();
             Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ses(Asym, Eigen::EigenvaluesOnly);
-            if (ses.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; continue; }
+            if (ses.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
             const Eigen::VectorXd& ev = ses.eigenvalues();
             std::vector<double> eig(ev.data(), ev.data() + K);
             double eig_rep_s = eig_rep;
@@ -2049,6 +2193,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             else              { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; }
         }
     }
+    finish_se();
 }
 
 
@@ -2058,7 +2203,8 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
 struct ChunkParams {
     int chunk_size; long window_bp; bool do_windows; int max_window_chunks;
     int max_gene_snps, min_gene_snps;
-    bool spa; double spa_thresh; bool binary;
+    bool spa; bool binary;
+    double acatv_mac;          // variants with MAC below this are collapsed into a burden
     int  cov_df;
     std::string out_file; int batch_size, n_threads;
     std::string chr;
@@ -2070,6 +2216,54 @@ struct ChunkParams {
 // One unit of work: its own range [a,b) plus two flank ranges. `win` is the
 // index of the window a pass-1 chunk belongs to (or of the window itself).
 struct Job { size_t ci; int a, b, fL0, fL1, fR0, fR1; int win; };
+
+// ---------------------------------------------------------------------------
+// ACAT-V for one category of one unit (gene block / chunk), at one alpha.
+//
+// Each variant contributes its KVIK p-value p_j = erfc(|Z_j|/sqrt2) to a
+// Cauchy combination with weight
+//     w_j = [2 f_j (1 - f_j)]^(1 + alpha)
+// -- the variant's expected share of heritability under the alpha model, the
+// same quantity that weights it in the variance-component test. (The ACAT-V
+// default, Beta(f;1,25)^2 f(1-f), is ~ 2f(1-f) for rare variants, i.e. alpha = 0.)
+//
+// As in ACAT-V, variants with minor allele count below `macthr` are not
+// combined individually but collapsed into one burden statistic,
+//     Z_b = sum_j s_j Z_j / sqrt(sum_j s_j^2),   s_j = sqrt(w_j),
+// with Z_j oriented to the minor allele. This uses the KVIK statistics as if
+// the collapsed variants were uncorrelated, which holds closely for ultra-rare
+// variants (they almost never share carriers). The burden enters the Cauchy
+// combination as one variant, with the average weight of its members.
+// ---------------------------------------------------------------------------
+static double acatv_p(const ChunkDataA& cd, int off, int m,
+                      const std::vector<float>& kz, const std::vector<float>& kmac,
+                      double alpha, double macthr) {
+    std::vector<double> pv, pw;
+    double bz = 0.0, bs2 = 0.0; int bn = 0;
+    for (int j = off; j < off + m; ++j) {
+        const int b = (j < (int) cd.colbim.size()) ? cd.colbim[j] : -1;
+        if (b < 0) continue;
+        const double z = kz[b];
+        if (std::isnan(z)) continue;
+        const double f = cd.colmaf[j];
+        if (!(f > 0.0 && f < 1.0)) continue;
+        const double s2 = (alpha == -1.0) ? 1.0 : std::pow(2.0 * f * (1.0 - f), 1.0 + alpha);
+        if (!(s2 > 0.0) || !std::isfinite(s2)) continue;
+        if (kmac[b] >= macthr) {
+            pv.push_back(std::erfc(std::abs(z) / std::sqrt(2.0)));
+            pw.push_back(s2);
+        } else {
+            bz += std::sqrt(s2) * z; bs2 += s2; ++bn;
+        }
+    }
+    if (bn > 0 && bs2 > 0.0) {
+        const double zb = bz / std::sqrt(bs2);
+        pv.push_back(std::erfc(std::abs(zb) / std::sqrt(2.0)));
+        pw.push_back(bs2 / bn);
+    }
+    if (pv.empty()) return NA_REAL;
+    return acat_combine(pv, pw);
+}
 
 // The worker takes a VECTOR of phenotype variants (distinct prs_mask rows).
 // Each job is read from disk and its geometry built ONCE; the variants are then
@@ -2101,7 +2295,7 @@ struct Worker : public RcppParallel::Worker {
             build_geom(cd, pr.cov_df, spa, pr.binary, gm, 0, multi ? &G0 : 0);   // may leave gm.ok false
             for (size_t v = 0; v < S.size(); ++v)
                 test_chunk_annot(cd, gm, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
-                                 pr.binary, spa, pr.spa_thresh, pr.coher, pr.pairs,
+                                 pr.binary, spa, pr.coher, pr.pairs,
                                  S[v].ycross, S[v].cb, out[v][w]);
             if (multi) {
                 // ---- ACAT over alpha ------------------------------------------
@@ -2137,7 +2331,7 @@ struct Worker : public RcppParallel::Worker {
                         for (size_t v = 0; v < S.size(); ++v) {
                             ChunkResultA tmp;
                             test_chunk_annot(ck, gk, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
-                                             pr.binary, spa, pr.spa_thresh, pr.coher, pr.pairs,
+                                             pr.binary, spa, pr.coher, pr.pairs,
                                              S[v].ycross, S[v].cb, tmp);
                             ChunkResultA& R = out[v][w];
                             for (size_t q = 0; q < R.p_alpha.size() && q < tmp.p_spa.size(); ++q)
@@ -2156,6 +2350,44 @@ struct Worker : public RcppParallel::Worker {
                                 if (!std::isnan(R.p_alpha[q][t][k])) { pv.push_back(R.p_alpha[q][t][k]); pw.push_back(1.0); }
                             R.p_spa[q][t] = pv.empty() ? NA_REAL : acat_combine(pv, pw);
                         }
+                }
+            }
+            // ---- ACAT-V from LDAK-KVIK single-variant statistics -------------
+            // Association passes only, univariate only. For every category and
+            // trait: one ACAT-V p-value per alpha, then the omnibus
+            //     p_spa = ACAT( VC p at each alpha , ACAT-V p at each alpha )
+            // with equal weights (2 x n_alpha p-values). p_vc and p_acv keep the
+            // two families separately (each ACAT-combined over alpha).
+            if (spa && !pr.coher && !ctx.kz.empty()) {
+                const size_t NAL = ctx.alphas.size();
+                for (size_t v = 0; v < S.size(); ++v) {
+                    ChunkResultA& R = out[v][w];
+                    const size_t A = R.cat_m.size();
+                    const size_t NT = R.p_spa.empty() ? 0 : R.p_spa[0].size();
+                    R.p_acatv.assign(A, std::vector< std::vector<double> >(NT, std::vector<double>(NAL, NA_REAL)));
+                    R.p_vc.assign(A, std::vector<double>(NT, NA_REAL));
+                    R.p_acv.assign(A, std::vector<double>(NT, NA_REAL));
+                    int off = 0;
+                    for (size_t q = 0; q < A; ++q) {
+                        for (size_t t = 0; t < NT && t < ctx.kz.size(); ++t) {
+                            std::vector<double> av, aw, ov, ow;
+                            for (size_t k = 0; k < NAL; ++k) {
+                                const double pa = acatv_p(cd, off, R.cat_m[q], ctx.kz[t], ctx.kmac[t],
+                                                          ctx.alphas[k], pr.acatv_mac);
+                                R.p_acatv[q][t][k] = pa;
+                                if (!std::isnan(pa)) { av.push_back(pa); aw.push_back(1.0); }
+                            }
+                            R.p_vc[q][t]  = R.p_spa[q][t];     // already the ACAT over alphas
+                            R.p_acv[q][t] = av.empty() ? NA_REAL : acat_combine(av, aw);
+                            if (!R.p_alpha.empty() && q < R.p_alpha.size() && t < R.p_alpha[q].size()) {
+                                for (size_t k = 0; k < NAL; ++k)
+                                    if (!std::isnan(R.p_alpha[q][t][k])) { ov.push_back(R.p_alpha[q][t][k]); ow.push_back(1.0); }
+                            } else if (!std::isnan(R.p_spa[q][t])) { ov.push_back(R.p_spa[q][t]); ow.push_back(1.0); }
+                            for (size_t k = 0; k < av.size(); ++k) { ov.push_back(av[k]); ow.push_back(1.0); }
+                            R.p_spa[q][t] = ov.empty() ? NA_REAL : acat_combine(ov, ow);
+                        }
+                        off += R.cat_m[q];
+                    }
                 }
             }
             ok[w] = 1;
@@ -2538,6 +2770,25 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         for (size_t k = 0; k < ctx.alphas.size(); ++k) {
             std::ostringstream o; o << "\tp_alpha_" << ctx.alphas[k]; alpha_hdr += o.str();
         }
+    // ACAT-V columns (KVIK summaries supplied): p_vc, p_acatv, p_acatv_<alpha>
+    const bool acv = pr.spa && !pr.coher && !ctx.kz.empty();
+    std::string acv_hdr;
+    if (acv) {
+        acv_hdr = "\tp_vc\tp_acatv";
+        for (size_t k = 0; k < ctx.alphas.size(); ++k) {
+            std::ostringstream o; o << "\tp_acatv_" << ctx.alphas[k]; acv_hdr += o.str();
+        }
+    }
+    auto wr_acv = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
+        if (!acv) return;
+        const bool has = q < R.p_vc.size() && (size_t) t < R.p_vc[q].size();
+        f << '\t'; if (has) wr(f, R.p_vc[q][t]);  else f << "NA";
+        f << '\t'; if (has) wr(f, R.p_acv[q][t]); else f << "NA";
+        for (size_t k = 0; k < ctx.alphas.size(); ++k) {
+            f << '\t';
+            if (has && k < R.p_acatv[q][t].size()) wr(f, R.p_acatv[q][t][k]); else f << "NA";
+        }
+    };
     auto wr_alpha = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
         if (!multi_a) return;
         for (size_t k = 0; k < ctx.alphas.size(); ++k) {
@@ -2552,7 +2803,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         std::ofstream f1(pr.out_file.c_str());
         if (!f1.is_open()) stop("Could not open out_file: " + pr.out_file);
         f1 << "chr\tstart\tend\twindow\tcategory\tm_cat\tm_flank\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_env";
-        if (pr.spa)   f1 << "\tp_spa\tspa_used" << alpha_hdr;
+        if (pr.spa)   f1 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr;
         if (pr.coher) f1 << "\tvg_t1\tvg_t2";
         if (pr.do_windows) {
             f1 << "\tvg_adj\th2_adj";
@@ -2570,7 +2821,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     wr(f1, h2den(t) > 0 ? R.vg[q][t] / h2den(t) : NA_REAL);
                     f1 << '\t'; wr(f1, R.vg_flank[t]); f1 << '\t'; wr(f1, R.vg_env[t]);
                     if (pr.spa) { f1 << '\t'; wr(f1, R.p_spa[q][t]); f1 << '\t' << R.spa_used[q][t];
-                                  wr_alpha(f1, R, q, t); }
+                                  wr_alpha(f1, R, q, t); wr_acv(f1, R, q, t); }
                     if (pr.coher) { f1 << '\t'; wr(f1, R.vg_t1[q][t]); f1 << '\t'; wr(f1, R.vg_t2[q][t]); }
                     if (pr.do_windows) {
                         const double a = adj[k][q][t];
@@ -2626,7 +2877,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         std::ofstream f3((pr.out_file + ".genes").c_str());
         if (!f3.is_open()) stop("Could not open " + pr.out_file + ".genes");
         f3 << "gene\tchr\tstart\tend\tblock\tn_blocks\tcategory\tm_cat\tphenotype\tvg\tse_vg\th2\tvg_env";
-        if (pr.spa)        f3 << "\tp_spa\tspa_used" << alpha_hdr;
+        if (pr.spa)        f3 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr;
         if (pr.do_windows) f3 << "\tvg_adj\th2_adj";
         f3 << "\n";
         // Window overlap per gene block, computed ONCE. Windows tile each
@@ -2674,6 +2925,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                         if (pr.spa) {
                             f3 << '\t'; wr(f3, B.p_spa[q][t]); f3 << '\t' << B.spa_used[q][t];
                             wr_alpha(f3, B, q, t);
+                            wr_acv(f3, B, q, t);
                             pv.push_back(B.p_spa[q][t]); pw.push_back((double) B.cat_m[q]);
                         }
                         if (pr.do_windows) {
@@ -2690,6 +2942,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                    << "\tNA\tNA\tNA\tNA\t";
                 wr(f3, acat_combine(pv, pw)); f3 << "\tNA";
                 if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f3 << "\tNA";
+                if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
                 if (pr.do_windows) f3 << "\tNA\tNA";
                 f3 << '\n';
             }
@@ -2728,10 +2981,12 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          int max_gene_snps = 512,
                          int min_gene_snps = 2,
                          Rcpp::NumericVector alpha = Rcpp::NumericVector::create(-1.0),
+                         Rcpp::Nullable<Rcpp::CharacterVector> kvik_summaries = R_NilValue,
+                         double acatv_mac = 10,
                          Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                          double cov_df = NA_REAL,
                          bool SPA = true,
-                         double spa_pval_threshold = 0.1,
+                         double spa_pval_threshold = NA_REAL,
                          bool binary = false,
                          Rcpp::Nullable<Rcpp::NumericMatrix> binary_raw = R_NilValue,
                          bool coher = false,
@@ -2744,7 +2999,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: two-sided)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: two-sided, always SPA, ACAT-V via KVIK)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
@@ -2806,7 +3061,9 @@ Rcpp::List stratgwas_run(const std::string& filename,
     pr.chunk_size = chunk_size; pr.window_bp = (long) window_bp; pr.do_windows = do_windows;
     pr.max_window_chunks = max_window_chunks;
     pr.max_gene_snps = max_gene_snps; pr.min_gene_snps = min_gene_snps;
-    pr.spa = SPA; pr.spa_thresh = spa_pval_threshold; pr.binary = binary;
+    pr.spa = SPA; pr.binary = binary; pr.acatv_mac = acatv_mac;
+    if (!ISNAN(spa_pval_threshold))
+        Rcout << "NOTE: spa_pval_threshold is no longer used -- every test now uses the saddlepoint.\n";
     pr.cov_df = ISNAN(cov_df) ? ((int) ctx.covZ.cols() + 1) : (int) cov_df;
     if (pr.cov_df < 0) pr.cov_df = 0;
     if (pr.cov_df >= ctx.n_inds) stop("cov_df must be smaller than the sample size");
@@ -2902,6 +3159,27 @@ Rcpp::List stratgwas_run(const std::string& filename,
             if (strip_chr(ctx.chr_order[i]) == strip_chr(pr.chr)) found = true;
         if (!found) stop("chr = '" + pr.chr + "' not found in " + filename + ".bim");
         Rcout << "Restricting to chromosome " << pr.chr << "\n";
+    }
+    // ---- LDAK-KVIK single-variant summaries -> ACAT-V --------------------------
+    if (kvik_summaries.isNotNull()) {
+        Rcpp::CharacterVector kv(kvik_summaries.get());
+        if (coher) Rcpp::warning("kvik_summaries is ignored with coher = TRUE (ACAT-V is univariate)");
+        else if (!SPA) Rcpp::warning("kvik_summaries is ignored with SPA = FALSE");
+        else {
+            if (kv.size() != P) stop("kvik_summaries must give one file per phenotype (column of pheno)");
+            std::unordered_map<std::string, int> idx;
+            idx.reserve((size_t) ctx.n_snps * 2);
+            long dup = 0;
+            for (int j = 0; j < ctx.n_snps; ++j)
+                if (!idx.insert(std::make_pair(ctx.bim.id[j], j)).second) ++dup;
+            if (dup) Rcout << "NOTE: " << dup << " duplicated SNP names in the .bim; KVIK results are matched to the first.\n";
+            ctx.kz.resize(P); ctx.kmac.resize(P);
+            for (int t = 0; t < P; ++t) kvik_load(as<std::string>(kv[t]), ctx, t, idx);
+            Rcout << "ACAT-V: KVIK single-variant tests, weights [2f(1-f)]^(1+alpha) for each alpha, "
+                  << "variants with MAC < " << acatv_mac << " collapsed into a burden.\n"
+                  << "  p_spa = ACAT over " << 2 * ctx.alphas.size() << " p-values ("
+                  << ctx.alphas.size() << " variance-component + " << ctx.alphas.size() << " ACAT-V).\n";
+        }
     }
     return run_all(ctx, pr);
 }

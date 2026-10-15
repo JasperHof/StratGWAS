@@ -27,7 +27,9 @@ he_window_spa(
   batch_size = 64,
   n_threads = 0,
   max_window_chunks = 8,
-  genes = NULL
+  genes = NULL,
+  kvik_summaries = NULL,
+  acatv_mac = 10
 )
 }
 \description{
