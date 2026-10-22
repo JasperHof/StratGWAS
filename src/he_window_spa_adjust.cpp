@@ -2205,6 +2205,7 @@ struct ChunkParams {
     int max_gene_snps, min_gene_snps;
     bool spa; bool binary;
     double acatv_mac;          // variants with MAC below this are collapsed into a burden
+    bool h2_raw;               // with loco_prs: vg / se / h2 from y itself, p-values from y - LOCO
     int  cov_df;
     std::string out_file; int batch_size, n_threads;
     std::string chr;
@@ -2291,6 +2292,11 @@ struct Worker : public RcppParallel::Worker {
             // Multi-alpha applies to ASSOCIATION passes only (spa = true). The
             // heritability pass runs with spa = false and stays single-alpha.
             const bool multi = spa && ctx.alphas.size() > 1;
+            // With h2_raw, S = { y - LOCO (p-values), y (heritability) }. The extra
+            // alphas and ACAT-V only concern p-values, so they run on variant 0 only;
+            // variant 1 is tested once, at the primary alpha, which is all its
+            // reported se_vg needs.
+            const size_t NVP = (spa && pr.h2_raw) ? std::min<size_t>(1, S.size()) : S.size();
             ChunkGeom gm; Eigen::MatrixXd G0;
             build_geom(cd, pr.cov_df, spa, pr.binary, gm, 0, multi ? &G0 : 0);   // may leave gm.ok false
             for (size_t v = 0; v < S.size(); ++v)
@@ -2306,7 +2312,7 @@ struct Worker : public RcppParallel::Worker {
                 // copy of V for the n x K GEMM V'Y and the per-test SPA.
                 const size_t NAL = ctx.alphas.size();
                 const double a0 = ctx.alphas[0];
-                for (size_t v = 0; v < S.size(); ++v) {
+                for (size_t v = 0; v < NVP; ++v) {
                     ChunkResultA& R = out[v][w];
                     R.p_alpha.assign(R.p_spa.size(), std::vector< std::vector<double> >());
                     for (size_t q = 0; q < R.p_spa.size(); ++q) {
@@ -2328,7 +2334,7 @@ struct Worker : public RcppParallel::Worker {
                         Eigen::MatrixXd Gk = d.asDiagonal() * G0 * d.asDiagonal();
                         ChunkGeom gk;
                         build_geom(ck, pr.cov_df, spa, pr.binary, gk, &Gk);
-                        for (size_t v = 0; v < S.size(); ++v) {
+                        for (size_t v = 0; v < NVP; ++v) {
                             ChunkResultA tmp;
                             test_chunk_annot(ck, gk, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
                                              pr.binary, spa, pr.coher, pr.pairs,
@@ -2341,7 +2347,7 @@ struct Worker : public RcppParallel::Worker {
                     }
                 }
                 // combine; vg / se_vg / h2 / spa_used stay at the primary alpha
-                for (size_t v = 0; v < S.size(); ++v) {
+                for (size_t v = 0; v < NVP; ++v) {
                     ChunkResultA& R = out[v][w];
                     for (size_t q = 0; q < R.p_alpha.size(); ++q)
                         for (size_t t = 0; t < R.p_alpha[q].size(); ++t) {
@@ -2360,7 +2366,7 @@ struct Worker : public RcppParallel::Worker {
             // two families separately (each ACAT-combined over alpha).
             if (spa && !pr.coher && !ctx.kz.empty()) {
                 const size_t NAL = ctx.alphas.size();
-                for (size_t v = 0; v < S.size(); ++v) {
+                for (size_t v = 0; v < NVP; ++v) {
                     ChunkResultA& R = out[v][w];
                     const size_t A = R.cat_m.size();
                     const size_t NT = R.p_spa.empty() ? 0 : R.p_spa[0].size();
@@ -2611,12 +2617,34 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                 if (col >= 0) off.col(t) += src.loco.col(col);
                 else          off.col(t) += src.full;     // chromosome absent from the fit
             }
-        S.resize(1);
+        S.resize(pr.h2_raw ? 2 : 1);
         build_pheno_stats(ctx, off, pr.binary, pr.coher, pr.pairs, S[0]);
+        if (pr.h2_raw)                                    // the phenotype itself, no PRS
+            build_pheno_stats(ctx, Eigen::MatrixXd(), pr.binary, pr.coher, pr.pairs, S[1]);
     };
+    // HERITABILITY FROM y, P-VALUES FROM y - LOCO.
+    // The LOCO PRS is fitted in-sample: y_hat = H y with H the ridge hat matrix of
+    // the other chromosomes. Subtracting it removes a fraction ~ tr(H)/n of EVERY
+    // component of y, including the tested region's own signal, so moment
+    // estimates of vg shrink by ~ (1 - tr(H)/n)^2 (about 15-20% in simulation).
+    // Tests stay valid and gain power (less residual noise), so p-values keep using
+    // y - LOCO; vg / h2 / se_vg (and vg_flank, vg_env, vg_t1, vg_t2) are taken from
+    // the same unit analysed on y itself.
+    auto merge_raw = [&](std::vector< std::vector<ChunkResultA> >& rv, const std::vector<char>& okv) {
+        if (!pr.h2_raw || rv.size() < 2) return;
+        for (size_t w = 0; w < rv[0].size(); ++w) {
+            if (!okv[w]) continue;
+            ChunkResultA& R = rv[0][w]; const ChunkResultA& Q = rv[1][w];
+            R.vg = Q.vg; R.h2 = Q.h2; R.se_vg = Q.se_vg;
+            R.vg_flank = Q.vg_flank; R.vg_env = Q.vg_env;
+            R.vg_t1 = Q.vg_t1; R.vg_t2 = Q.vg_t2;
+        }
+        std::vector<ChunkResultA>().swap(rv[1]);          // free the raw copies
+    };
+    const size_t NV1 = pr.h2_raw ? 2 : 1;
 
     // ---- PASS 1: association, one phenotype variant per chromosome ---------
-    std::vector< std::vector<ChunkResultA> > r1v(1, std::vector<ChunkResultA>(need_chunks ? cj.size() : 0));
+    std::vector< std::vector<ChunkResultA> > r1v(NV1, std::vector<ChunkResultA>(need_chunks ? cj.size() : 0));
     std::vector<ChunkResultA>& r1 = r1v[0];
     std::vector<char> ok1(need_chunks ? cj.size() : 0, 0);
     if (need_chunks) {
@@ -2628,13 +2656,14 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
             run_jobs(ctx, pr, S, pr.spa, cj, chr_c0[k], chr_c1[k], r1v, ok1, "pass1",
                      done, (long) cj.size(), pr.batch_size, t1);
         }
+        merge_raw(r1v, ok1);
         Rcout << "\n";
     } else {
         Rcout << "Skipping the agnostic chunk pass (genes supplied with do_windows = FALSE).\n";
     }
 
     // ---- PASS 1G: the same, on genes ---------------------------------------
-    std::vector< std::vector<ChunkResultA> > rgv(1, std::vector<ChunkResultA>(gj.size()));
+    std::vector< std::vector<ChunkResultA> > rgv(NV1, std::vector<ChunkResultA>(gj.size()));
     std::vector<ChunkResultA>& rg = rgv[0];
     std::vector<char> okg(gj.size(), 0);
     if (has_genes && !gj.empty()) {
@@ -2646,6 +2675,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
             run_jobs(ctx, pr, S, pr.spa, gj, chr_g0[k], chr_g1[k], rgv, okg, "genes",
                      doneg, (long) gj.size(), pr.batch_size, tg);
         }
+        merge_raw(rgv, okg);
         Rcout << "\n";
     }
 
@@ -2983,6 +3013,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          Rcpp::NumericVector alpha = Rcpp::NumericVector::create(-1.0),
                          Rcpp::Nullable<Rcpp::CharacterVector> kvik_summaries = R_NilValue,
                          double acatv_mac = 10,
+                         bool h2_without_prs = true,
                          Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                          double cov_df = NA_REAL,
                          bool SPA = true,
@@ -2999,7 +3030,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: two-sided, always SPA, ACAT-V via KVIK)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: two-sided, always SPA, ACAT-V via KVIK, h2 without PRS)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
@@ -3061,7 +3092,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     pr.chunk_size = chunk_size; pr.window_bp = (long) window_bp; pr.do_windows = do_windows;
     pr.max_window_chunks = max_window_chunks;
     pr.max_gene_snps = max_gene_snps; pr.min_gene_snps = min_gene_snps;
-    pr.spa = SPA; pr.binary = binary; pr.acatv_mac = acatv_mac;
+    pr.spa = SPA; pr.binary = binary; pr.acatv_mac = acatv_mac; pr.h2_raw = false;
     if (!ISNAN(spa_pval_threshold))
         Rcout << "NOTE: spa_pval_threshold is no longer used -- every test now uses the saddlepoint.\n";
     pr.cov_df = ISNAN(cov_df) ? ((int) ctx.covZ.cols() + 1) : (int) cov_df;
@@ -3100,6 +3131,10 @@ Rcpp::List stratgwas_run(const std::string& filename,
         for (int c = 0; c < ctx.n_cat; ++c)
             for (size_t g = 0; g < G; ++g) ctx.prs_mask[c][g] = mm(c, (int) g) ? 1 : 0;
     }
+    pr.h2_raw = (G > 0) && h2_without_prs;
+    if (pr.h2_raw)
+        Rcout << "LOCO PRS used for p-values only: vg / se_vg / h2 of chunks and genes are estimated on y itself\n"
+              << "  (an in-sample PRS shrinks heritability estimates). Use prs_mask = 0 to estimate windows on y as well.\n";
     if (G > 0) {
         Rcout << "PRS mask (pass 2, category x source):\n";
         for (int c = 0; c < ctx.n_cat; ++c) {
