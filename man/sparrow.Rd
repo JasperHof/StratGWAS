@@ -29,11 +29,11 @@ sparrow(
   spa = TRUE,
   chr = NULL,
   n_threads = 0,
-  batch_size = 16
+  batch_size = 64
 )
 }
 \arguments{
-\item{filename}{PLINK prefix (.bed/.bim/.fam) holding rare variants (and common SNPs).}
+\item{filename}{PLINK prefix (.bed/.bim/.fam) holding rare variants and common SNPs.}
 
 \item{pheno}{Data frame or file: FID, IID, then one column per phenotype.}
 
@@ -43,15 +43,16 @@ sparrow(
 \item{covariates}{Optional data frame or file: FID, IID, then numeric covariates
 (an intercept is added automatically; do not include one).}
 
-\item{annotation}{Optional 0/1 matrix, one row per .bim variant, one column per
-variant category (e.g. pLoF, missense, ...). NULL = one category with all variants.}
+\item{annotation}{Optional 0/1 matrix or file (with header), one column per variant
+category (e.g. rare / common) and one row per .bim variant. A file may start with a
+column of variant IDs, which is matched to the .bim. NULL = one category with all variants.}
 
 \item{annot_names}{Category names (default: column names of \code{annotation}).}
 
 \item{genes}{Optional data frame or file: gene, chr, start, end (extra columns ignored).
-Must be on the same genome build as the .bim!}
+Must be on the same genome build as the .bim.}
 
-\item{alpha}{Heritability models tested; alpha\link{1} is used for the h2 estimates.}
+\item{alpha}{Heritability models tested; alpha\link{1} is used for the estimates.}
 
 \item{loco_prs}{Optional LDAK-KVIK Step 1 \code{.loco.prs} files: one per phenotype
 (character vector), or a matrix with one row per phenotype and one column per source.}
@@ -92,6 +93,25 @@ number of individuals, and the summary returned by the C++ code.
 \description{
 Estimates the heritability explained by genes / regions (per variant category)
 and tests it using a saddlepoint approximation. Phenotypes are matched to the
-genotypes by IID, covariates are regressed out of the phenotypes and
-genotypes.
+genotypes by IID, covariates are regressed out of the phenotypes here (and out
+of the genotypes inside the C++ code), and all bookkeeping that used to be
+manual (cov_df, binary_raw, prs_mask) is done automatically.
+}
+\examples{
+\donttest{
+# example data shipped with the package
+dir <- system.file("extdata", package = "StratGWAS")
+
+res <- sparrow(filename       = file.path(dir, "data"),
+               pheno          = file.path(dir, "pheno_quant"),
+               out_file       = file.path(tempdir(), "sparrow_example"),
+               annotation     = file.path(dir, "annot"),
+               genes          = file.path(dir, "genes"),
+               loco_prs       = file.path(dir, "kvik.step1.loco.prs"),
+               kvik_summaries = file.path(dir, "kvik.step2.summaries"),
+               n_threads      = 2)
+
+genes <- read.table(res$files["genes"], header = TRUE)
+head(genes[genes$category == "ACAT", ])          # one p-value per gene
+}
 }

@@ -2,21 +2,23 @@
 #'
 #' Estimates the heritability explained by genes / regions (per variant category)
 #' and tests it using a saddlepoint approximation. Phenotypes are matched to the
-#' genotypes by IID, covariates are regressed out of the phenotypes and
-#' genotypes.
+#' genotypes by IID, covariates are regressed out of the phenotypes here (and out
+#' of the genotypes inside the C++ code), and all bookkeeping that used to be
+#' manual (cov_df, binary_raw, prs_mask) is done automatically.
 #'
-#' @param filename PLINK prefix (.bed/.bim/.fam) holding rare variants (and common SNPs).
+#' @param filename PLINK prefix (.bed/.bim/.fam) holding rare variants and common SNPs.
 #' @param pheno Data frame or file: FID, IID, then one column per phenotype.
 #' @param out_file Output prefix. Writes <out_file> (regions), <out_file>.genes and
 #'   <out_file>.windows.
 #' @param covariates Optional data frame or file: FID, IID, then numeric covariates
 #'   (an intercept is added automatically; do not include one).
-#' @param annotation Optional 0/1 matrix, one row per .bim variant, one column per
-#'   variant category (e.g. pLoF, missense, ...). NULL = one category with all variants.
+#' @param annotation Optional 0/1 matrix or file (with header), one column per variant
+#'   category (e.g. rare / common) and one row per .bim variant. A file may start with a
+#'   column of variant IDs, which is matched to the .bim. NULL = one category with all variants.
 #' @param annot_names Category names (default: column names of `annotation`).
 #' @param genes Optional data frame or file: gene, chr, start, end (extra columns ignored).
-#'   Must be on the same genome build as the .bim!
-#' @param alpha Heritability models tested; alpha[1] is used for the h2 estimates.
+#'   Must be on the same genome build as the .bim.
+#' @param alpha Heritability models tested; alpha[1] is used for the estimates.
 #' @param loco_prs Optional LDAK-KVIK Step 1 `.loco.prs` files: one per phenotype
 #'   (character vector), or a matrix with one row per phenotype and one column per source.
 #' @param kvik_summaries Optional LDAK-KVIK Step 2 `.summaries` files, one per phenotype.
@@ -38,6 +40,24 @@
 #'
 #' @return Invisibly, a list with the output file names, the analysed traits and
 #'   number of individuals, and the summary returned by the C++ code.
+#'
+#' @examples
+#' \donttest{
+#' # example data shipped with the package
+#' dir <- system.file("extdata", package = "StratGWAS")
+#'
+#' res <- sparrow(filename       = file.path(dir, "data"),
+#'                pheno          = file.path(dir, "pheno_quant"),
+#'                out_file       = file.path(tempdir(), "sparrow_example"),
+#'                annotation     = file.path(dir, "annot"),
+#'                genes          = file.path(dir, "genes"),
+#'                loco_prs       = file.path(dir, "kvik.step1.loco.prs"),
+#'                kvik_summaries = file.path(dir, "kvik.step2.summaries"),
+#'                n_threads      = 2)
+#'
+#' genes <- read.table(res$files["genes"], header = TRUE)
+#' head(genes[genes$category == "ACAT", ])          # one p-value per gene
+#' }
 #' @export
 sparrow <- function(filename, pheno, out_file,
                     covariates = NULL,
@@ -51,7 +71,7 @@ sparrow <- function(filename, pheno, out_file,
                     max_window_chunks = 8,
                     max_gene_snps = 512, min_gene_snps = 2,
                     acatv_mac = 10, spa = TRUE, chr = NULL,
-                    n_threads = 0, batch_size = 16) {
+                    n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
   for (ext in c(".bed", ".bim", ".fam"))
@@ -139,7 +159,21 @@ sparrow <- function(filename, pheno, out_file,
   if (binary && coher) { binary_raw <- B; rownames(binary_raw) <- ids }
 
   # ---- variant categories -------------------------------------------------------
+  # A file (or data frame) with a header and one 0/1 column per category. If the first
+  # column holds variant IDs, rows are matched to the .bim; otherwise they must be in
+  # .bim order.
   if (!is.null(annotation)) {
+    if (is.character(annotation) && length(annotation) == 1) {
+      if (!file.exists(annotation)) stop("annotation file not found: ", annotation)
+      annotation <- read.table(annotation, header = TRUE, check.names = FALSE)
+    }
+    if (is.data.frame(annotation) && !is.numeric(annotation[[1]])) {
+      bim_id <- read.table(paste0(filename, ".bim"), colClasses = "character")[[2]]
+      idx <- match(bim_id, as.character(annotation[[1]]))
+      if (anyNA(idx)) message(sum(is.na(idx)), " variants not in the annotation: assigned to no category")
+      annotation <- as.matrix(annotation[idx, -1, drop = FALSE])
+      annotation[is.na(annotation)] <- 0
+    }
     annotation <- as.matrix(annotation)
     if (anyNA(annotation) || !all(annotation %in% c(0, 1))) stop("annotation must contain only 0 and 1")
     if (any(rowSums(annotation) > 1))
