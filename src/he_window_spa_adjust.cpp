@@ -2175,6 +2175,15 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         double sp = 1.0;
                         for (int mm = 1; mm <= NCUM; ++mm) { sp *= s; KQ[mm] *= sp; }
                     }
+                    // DEBUG (set SPARROW_DEBUG=1 and n_threads = 1): the null model of this test
+                    static const bool dbg = (std::getenv("SPARROW_DEBUG") != 0);
+                    if (dbg) {
+                        const double v_gauss = var0 - (cscale != 1.0 ? kur[(size_t) t * (MAXCUM + 1) + 4] * Sb2[c] : 0.0);
+                        std::fprintf(stderr, "SPADBG\t%s\t%ld\t%ld\t%d\t%d\t%.6g\t%.6g\t%.6g",
+                                     cd.chr.c_str(), cd.start, cd.end, c, t, sigma[c], var0, v_gauss);
+                        for (int mm = 1; mm <= NCUM; ++mm) std::fprintf(stderr, "\t%.6g", KQ[mm]);
+                        std::fprintf(stderr, "\n");
+                    }
                     if (std::isfinite(KQ[2]) && KQ[2] > 0) {
                         std::vector<double> none;
                         double L3[3], N3[3];
