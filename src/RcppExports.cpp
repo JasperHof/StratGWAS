@@ -296,8 +296,8 @@ BEGIN_RCPP
 END_RCPP
 }
 // stratgwas_run
-Rcpp::List stratgwas_run(const std::string& filename, const SEXP pheno_mat, Rcpp::Nullable<Rcpp::IntegerMatrix> annotation, Rcpp::Nullable<Rcpp::CharacterVector> annot_names, Rcpp::Nullable<Rcpp::CharacterMatrix> loco_prs, Rcpp::Nullable<Rcpp::IntegerMatrix> prs_mask, int chunk_size, double window_bp, bool do_windows, int max_window_chunks, Rcpp::Nullable<Rcpp::CharacterMatrix> genes, int max_gene_snps, int min_gene_snps, Rcpp::NumericVector alpha, Rcpp::Nullable<Rcpp::CharacterVector> kvik_summaries, double acatv_mac, bool h2_without_prs, Rcpp::Nullable<Rcpp::NumericMatrix> covariates, double cov_df, bool SPA, double spa_pval_threshold, bool binary, Rcpp::Nullable<Rcpp::NumericMatrix> binary_raw, bool coher, SEXP chr, std::string out_file, int batch_size, int n_threads);
-RcppExport SEXP _StratGWAS_stratgwas_run(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP annotationSEXP, SEXP annot_namesSEXP, SEXP loco_prsSEXP, SEXP prs_maskSEXP, SEXP chunk_sizeSEXP, SEXP window_bpSEXP, SEXP do_windowsSEXP, SEXP max_window_chunksSEXP, SEXP genesSEXP, SEXP max_gene_snpsSEXP, SEXP min_gene_snpsSEXP, SEXP alphaSEXP, SEXP kvik_summariesSEXP, SEXP acatv_macSEXP, SEXP h2_without_prsSEXP, SEXP covariatesSEXP, SEXP cov_dfSEXP, SEXP SPASEXP, SEXP spa_pval_thresholdSEXP, SEXP binarySEXP, SEXP binary_rawSEXP, SEXP coherSEXP, SEXP chrSEXP, SEXP out_fileSEXP, SEXP batch_sizeSEXP, SEXP n_threadsSEXP) {
+Rcpp::List stratgwas_run(const std::string& filename, const SEXP pheno_mat, Rcpp::Nullable<Rcpp::IntegerMatrix> annotation, Rcpp::Nullable<Rcpp::CharacterVector> annot_names, Rcpp::Nullable<Rcpp::CharacterMatrix> loco_prs, Rcpp::Nullable<Rcpp::IntegerMatrix> prs_mask, int chunk_size, double window_bp, bool do_windows, int max_window_chunks, Rcpp::Nullable<Rcpp::CharacterMatrix> genes, int max_gene_snps, int min_gene_snps, Rcpp::NumericVector alpha, Rcpp::Nullable<Rcpp::CharacterVector> kvik_summaries, double acatv_mac, int collapse_mac, bool h2_without_prs, Rcpp::Nullable<Rcpp::NumericMatrix> covariates, double cov_df, bool SPA, double spa_pval_threshold, bool binary, Rcpp::Nullable<Rcpp::NumericMatrix> binary_raw, bool coher, SEXP chr, std::string out_file, int batch_size, int n_threads);
+RcppExport SEXP _StratGWAS_stratgwas_run(SEXP filenameSEXP, SEXP pheno_matSEXP, SEXP annotationSEXP, SEXP annot_namesSEXP, SEXP loco_prsSEXP, SEXP prs_maskSEXP, SEXP chunk_sizeSEXP, SEXP window_bpSEXP, SEXP do_windowsSEXP, SEXP max_window_chunksSEXP, SEXP genesSEXP, SEXP max_gene_snpsSEXP, SEXP min_gene_snpsSEXP, SEXP alphaSEXP, SEXP kvik_summariesSEXP, SEXP acatv_macSEXP, SEXP collapse_macSEXP, SEXP h2_without_prsSEXP, SEXP covariatesSEXP, SEXP cov_dfSEXP, SEXP SPASEXP, SEXP spa_pval_thresholdSEXP, SEXP binarySEXP, SEXP binary_rawSEXP, SEXP coherSEXP, SEXP chrSEXP, SEXP out_fileSEXP, SEXP batch_sizeSEXP, SEXP n_threadsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -317,6 +317,7 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< Rcpp::NumericVector >::type alpha(alphaSEXP);
     Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::CharacterVector> >::type kvik_summaries(kvik_summariesSEXP);
     Rcpp::traits::input_parameter< double >::type acatv_mac(acatv_macSEXP);
+    Rcpp::traits::input_parameter< int >::type collapse_mac(collapse_macSEXP);
     Rcpp::traits::input_parameter< bool >::type h2_without_prs(h2_without_prsSEXP);
     Rcpp::traits::input_parameter< Rcpp::Nullable<Rcpp::NumericMatrix> >::type covariates(covariatesSEXP);
     Rcpp::traits::input_parameter< double >::type cov_df(cov_dfSEXP);
@@ -329,7 +330,7 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< std::string >::type out_file(out_fileSEXP);
     Rcpp::traits::input_parameter< int >::type batch_size(batch_sizeSEXP);
     Rcpp::traits::input_parameter< int >::type n_threads(n_threadsSEXP);
-    rcpp_result_gen = Rcpp::wrap(stratgwas_run(filename, pheno_mat, annotation, annot_names, loco_prs, prs_mask, chunk_size, window_bp, do_windows, max_window_chunks, genes, max_gene_snps, min_gene_snps, alpha, kvik_summaries, acatv_mac, h2_without_prs, covariates, cov_df, SPA, spa_pval_threshold, binary, binary_raw, coher, chr, out_file, batch_size, n_threads));
+    rcpp_result_gen = Rcpp::wrap(stratgwas_run(filename, pheno_mat, annotation, annot_names, loco_prs, prs_mask, chunk_size, window_bp, do_windows, max_window_chunks, genes, max_gene_snps, min_gene_snps, alpha, kvik_summaries, acatv_mac, collapse_mac, h2_without_prs, covariates, cov_df, SPA, spa_pval_threshold, binary, binary_raw, coher, chr, out_file, batch_size, n_threads));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -421,7 +422,7 @@ static const R_CallMethodDef CallEntries[] = {
     {"_StratGWAS_he_sliding_window_part", (DL_FUNC) &_StratGWAS_he_sliding_window_part, 20},
     {"_StratGWAS_reml_sliding_window_part", (DL_FUNC) &_StratGWAS_reml_sliding_window_part, 20},
     {"_StratGWAS_he_chunk_spa", (DL_FUNC) &_StratGWAS_he_chunk_spa, 32},
-    {"_StratGWAS_stratgwas_run", (DL_FUNC) &_StratGWAS_stratgwas_run, 28},
+    {"_StratGWAS_stratgwas_run", (DL_FUNC) &_StratGWAS_stratgwas_run, 29},
     {"_StratGWAS_computeLDscoresFromBED", (DL_FUNC) &_StratGWAS_computeLDscoresFromBED, 2},
     {"_StratGWAS_linear_gwas", (DL_FUNC) &_StratGWAS_linear_gwas, 4},
     {"_StratGWAS_linear_gwas_parallel", (DL_FUNC) &_StratGWAS_linear_gwas_parallel, 4},

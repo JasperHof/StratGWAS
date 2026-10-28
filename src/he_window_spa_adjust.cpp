@@ -262,6 +262,11 @@ struct Cell {
     int i0;                        // .bim index of column 0 (-1 if empty)
     std::vector<int> cat;          // per-column category id (only set when collapsing;
                                    // empty -> columns map 1:1 to .bim via i0)
+    std::vector<int> bim;          // per-column .bim index, -1 for a pseudo-marker (collapsing only)
+    // the ORIGINAL variants of the range (collapsing only): MAF and category, so that
+    // ACAT-V and the alpha-model weights can still see every variant individually
+    std::vector<float> omaf;
+    std::vector<int> ocat;
 };
 
 // Standardize columns to unit variance (mean-impute missing == -1), capturing
@@ -306,20 +311,18 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
         return true;
     }
 
-    // -------- collapsing: variants with MAC < collapse_mac are grouped in runs --
-    // of up to collapse_n CONSECUTIVE ultra-rare variants sharing the same category,
-    // and additively collapsed (sum of MINOR-allele dosages) into one pseudo-marker.
-    // Variants with MAC >= collapse_mac stay individual. Pseudo-markers carry MAF 0
-    // so they are exempt from alpha weighting (their frequency is not well defined).
+    // -------- collapsing (as SAIGE-GENE+): every variant with MAC <= collapse_mac --
+    // is added (sum of MINOR-allele dosages) into ONE pseudo-marker per category of
+    // the range. Variants with MAC > collapse_mac stay individual. A pseudo-marker has
+    // MAF 0 here, so it is exempt from alpha weighting (its frequency is not defined),
+    // and .bim index -1. The original variants are kept in omaf / ocat.
+    // collapse_n is no longer used (kept in the signature for compatibility).
+    (void) collapse_n;
     int ncat_all = (int) cat_id->size();
     std::vector< std::vector<float> > out_cols;   // each length n_keep (raw scale)
-    std::vector<int>  out_cat;                     // per output column: category id
-    std::vector<char> out_pseudo;                  // per output column: 1 = collapsed
-
-    std::vector<float> grp; int grp_cat = -1, grp_cnt = 0; bool grp_open = false;
-    // flush the pending group into one pseudo-marker column
-    // (declared as a lambda capturing the accumulators)
-    // (kept inline below to avoid std::function overhead)
+    std::vector<int>  out_cat, out_bim;           // per output column: category id, .bim index
+    std::map<int, std::vector<float> > grp;       // category -> pseudo-marker being built
+    cell.omaf.assign(m, 0.f); cell.ocat.assign(m, -1);
 
     for (int j = 0; j < m; ++j) {
         // fold to minor-allele dosage and compute MAC (missing excluded from MAC,
@@ -330,36 +333,36 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
         int mac = (nv > 0) ? std::min(si, 2 * nv - si) : 0;
         bool flip = (nv > 0 && s > (double) nv);          // coded allele is major
         int cid = (i0 + j >= 0 && i0 + j < ncat_all) ? (*cat_id)[i0 + j] : -1;
+        double f = (nv > 0) ? s / (2.0 * nv) : 0.0; if (f > 0.5) f = 1.0 - f;
+        cell.omaf[j] = (float) f; cell.ocat[j] = cid;
 
-        if (mac >= collapse_mac) {
-            if (grp_open) { out_cols.push_back(grp); out_cat.push_back(grp_cat); out_pseudo.push_back(1);
-                            grp_open = false; grp_cnt = 0; grp_cat = -1; }
+        if (mac > collapse_mac) {
             std::vector<float> col(n_keep);
             for (int i = 0; i < n_keep; ++i) { float g = block(i, j); col[i] = (g < 0.f) ? -1.f : g; }
-            out_cols.push_back(std::move(col)); out_cat.push_back(cid); out_pseudo.push_back(0);
-        } else {
-            if (grp_open && (grp_cat != cid || grp_cnt >= collapse_n)) {
-                out_cols.push_back(grp); out_cat.push_back(grp_cat); out_pseudo.push_back(1);
-                grp_open = false; grp_cnt = 0; grp_cat = -1;
-            }
-            if (!grp_open) { grp.assign(n_keep, 0.f); grp_open = true; grp_cat = cid; grp_cnt = 0; }
+            out_cols.push_back(std::move(col)); out_cat.push_back(cid); out_bim.push_back(i0 + j);
+        } else if (mac > 0) {
+            std::vector<float>& acc = grp[cid];
+            if (acc.empty()) acc.assign(n_keep, 0.f);
             for (int i = 0; i < n_keep; ++i) {
                 float g = block(i, j);
-                if (g >= 0.f) grp[i] += (flip ? (2.f - g) : g);   // additive minor dosage
+                if (g >= 0.f) acc[i] += (flip ? (2.f - g) : g);   // additive minor dosage
             }
-            ++grp_cnt;
         }
     }
-    if (grp_open) { out_cols.push_back(grp); out_cat.push_back(grp_cat); out_pseudo.push_back(1); }
+    const int n_ind = (int) out_cols.size();
+    for (std::map<int, std::vector<float> >::iterator it = grp.begin(); it != grp.end(); ++it) {
+        out_cols.push_back(it->second); out_cat.push_back(it->first); out_bim.push_back(-1);
+    }
 
     int nout = (int) out_cols.size();
     GenoMat X(n_keep, nout);
     for (int k = 0; k < nout; ++k)
         for (int i = 0; i < n_keep; ++i) X(i, k) = out_cols[k][i];
     standardize_capture_maf(X, cell.maf);
-    for (int k = 0; k < nout; ++k) if (out_pseudo[k]) cell.maf[k] = 0.f;   // exempt from alpha
+    for (int k = n_ind; k < nout; ++k) cell.maf[k] = 0.f;   // pseudo-markers: exempt from alpha
     cell.X = std::move(X);
     cell.cat = out_cat;
+    cell.bim = out_bim;
     cell.i0 = i0;
     return true;
 }
@@ -1185,6 +1188,9 @@ struct ChunkContext {
     // by .bim position: z oriented to the MINOR allele (NaN = not in the file)
     // and the minor allele count 2 n MAF. Drive the ACAT-V component.
     std::vector< std::vector<float> > kz, kmac;
+    // collapsing (SAIGE-GENE+ style): variants with MAC <= collapse_mac are summed into one
+    // pseudo-marker per category of a tested unit (0 = off). Flanks are never collapsed.
+    int collapse_mac = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -1598,8 +1604,12 @@ struct ChunkDataA {
                                        // lets V be re-weighted to another alpha by a
                                        // pure column rescaling, with no second read
     std::vector<int> colbim;           // .bim index of every CATEGORY column (-1 for
-                                       // background / flank columns): links a column to
-                                       // its KVIK single-variant statistic for ACAT-V
+                                       // background / flank columns and pseudo-markers)
+    // the ORIGINAL variants of each active category (.bim index and MAF): identical to
+    // the columns without collapsing; with collapsing they still include the collapsed
+    // ultra-rare variants, so ACAT-V and cat_w see every variant individually
+    std::vector< std::vector<int> > cat_obim;
+    std::vector< std::vector<float> > cat_omaf;
     ChunkDataA() : m_flank(0), K(0) {}
 };
 struct ChunkResultA {
@@ -1623,10 +1633,12 @@ struct ChunkResultA {
 };
 
 // Read a SNP index range, project covariates, apply alpha; return false on error.
-static bool read_block(const ChunkContext& ctx, int lo, int hi, Cell& c) {
+static bool read_block(const ChunkContext& ctx, int lo, int hi, Cell& c, bool collapse = false) {
     c.X = GenoMat(ctx.n_inds, 0);
     if (hi <= lo) return true;
-    if (!read_cell_idx(ctx.bed, ctx.geno_keep, lo, hi, c)) return false;
+    const bool coll = collapse && ctx.collapse_mac > 0;
+    if (!read_cell_idx(ctx.bed, ctx.geno_keep, lo, hi, c,
+                       coll ? &ctx.snp_cat : 0, coll ? ctx.collapse_mac : 0)) return false;
     if (ctx.covZ.cols() > 0) project_covariates(c.X, ctx.covZ, ctx.covM);
     apply_alpha(c.X, c.maf, ctx.alpha, 0, lo);
     return true;
@@ -1639,16 +1651,26 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     cd.start = ctx.bim.bp[a]; cd.end = ctx.bim.bp[b - 1];
 
     Cell tgt;
-    if (!read_block(ctx, a, b, tgt)) return false;
+    if (!read_block(ctx, a, b, tgt, true)) return false;
     const int m_t = (int) tgt.X.cols();
     if (m_t <= 0) return false;
+    const bool coll = !tgt.cat.empty();                 // collapsed: columns != .bim variants
 
     const int A = ctx.n_cat;
     std::vector< std::vector<int> > cat_cols(A);
     std::vector<int> bg_cols;
     for (int j = 0; j < m_t; ++j) {
-        const int cid = ctx.snp_cat[a + j];
+        const int cid = coll ? tgt.cat[j] : ctx.snp_cat[a + j];
         if (cid >= 0 && cid < A) cat_cols[cid].push_back(j); else bg_cols.push_back(j);
+    }
+    // original variants per category (for ACAT-V and the alpha-model weights)
+    std::vector< std::vector<int> > ob(A);
+    std::vector< std::vector<float> > om(A);
+    for (int j = 0; j < b - a; ++j) {
+        const int cid = coll ? tgt.ocat[j] : ctx.snp_cat[a + j];
+        if (cid < 0 || cid >= A) continue;
+        ob[cid].push_back(a + j);
+        om[cid].push_back(coll ? tgt.omaf[j] : tgt.maf[j]);
     }
     std::vector<int> act;
     for (int c = 0; c < A; ++c) if (!cat_cols[c].empty()) act.push_back(c);
@@ -1668,14 +1690,18 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     int off = 0;
     for (size_t k = 0; k < act.size(); ++k) {
         const int c = act[k]; const std::vector<int>& cc = cat_cols[c];
-        double w = 0.0;
         for (size_t q = 0; q < cc.size(); ++q) {
             cd.V.col(off + (int) q) = tgt.X.col(cc[q]);
-            const double f = tgt.maf[cc[q]];
             cd.colmaf[off + (int) q] = tgt.maf[cc[q]];
-            cd.colbim[off + (int) q] = a + cc[q];
+            cd.colbim[off + (int) q] = coll ? tgt.bim[cc[q]] : a + cc[q];
+        }
+        // expected heritability under the alpha model, over the ORIGINAL variants
+        double w = 0.0;
+        for (size_t q = 0; q < om[c].size(); ++q) {
+            const double f = om[c][q];
             w += (f > 0.0 && f < 1.0) ? std::pow(2.0 * f * (1.0 - f), e1) : 0.0;
         }
+        cd.cat_obim.push_back(ob[c]); cd.cat_omaf.push_back(om[c]);
         off += (int) cc.size();
         cd.cat_m.push_back((int) cc.size()); cd.cat_id.push_back(c);
         cd.cat_name.push_back(ctx.cat_names[c]); cd.cat_w.push_back(w);
@@ -2236,17 +2262,20 @@ struct Job { size_t ci; int a, b, fL0, fL1, fR0, fR1; int win; };
 // variants (they almost never share carriers). The burden enters the Cauchy
 // combination as one variant, with the average weight of its members.
 // ---------------------------------------------------------------------------
-static double acatv_p(const ChunkDataA& cd, int off, int m,
+static double acatv_p(const ChunkDataA& cd, size_t qcat,
                       const std::vector<float>& kz, const std::vector<float>& kmac,
                       double alpha, double macthr) {
     std::vector<double> pv, pw;
     double bz = 0.0, bs2 = 0.0; int bn = 0;
-    for (int j = off; j < off + m; ++j) {
-        const int b = (j < (int) cd.colbim.size()) ? cd.colbim[j] : -1;
+    if (qcat >= cd.cat_obim.size()) return NA_REAL;
+    const std::vector<int>& vb = cd.cat_obim[qcat];
+    const std::vector<float>& vf = cd.cat_omaf[qcat];
+    for (size_t j = 0; j < vb.size(); ++j) {
+        const int b = vb[j];
         if (b < 0) continue;
         const double z = kz[b];
         if (std::isnan(z)) continue;
-        const double f = cd.colmaf[j];
+        const double f = vf[j];
         if (!(f > 0.0 && f < 1.0)) continue;
         const double s2 = (alpha == -1.0) ? 1.0 : std::pow(2.0 * f * (1.0 - f), 1.0 + alpha);
         if (!(s2 > 0.0) || !std::isfinite(s2)) continue;
@@ -2373,12 +2402,11 @@ struct Worker : public RcppParallel::Worker {
                     R.p_acatv.assign(A, std::vector< std::vector<double> >(NT, std::vector<double>(NAL, NA_REAL)));
                     R.p_vc.assign(A, std::vector<double>(NT, NA_REAL));
                     R.p_acv.assign(A, std::vector<double>(NT, NA_REAL));
-                    int off = 0;
                     for (size_t q = 0; q < A; ++q) {
                         for (size_t t = 0; t < NT && t < ctx.kz.size(); ++t) {
                             std::vector<double> av, aw, ov, ow;
                             for (size_t k = 0; k < NAL; ++k) {
-                                const double pa = acatv_p(cd, off, R.cat_m[q], ctx.kz[t], ctx.kmac[t],
+                                const double pa = acatv_p(cd, q, ctx.kz[t], ctx.kmac[t],
                                                           ctx.alphas[k], pr.acatv_mac);
                                 R.p_acatv[q][t][k] = pa;
                                 if (!std::isnan(pa)) { av.push_back(pa); aw.push_back(1.0); }
@@ -2392,7 +2420,6 @@ struct Worker : public RcppParallel::Worker {
                             for (size_t k = 0; k < av.size(); ++k) { ov.push_back(av[k]); ow.push_back(1.0); }
                             R.p_spa[q][t] = ov.empty() ? NA_REAL : acat_combine(ov, ow);
                         }
-                        off += R.cat_m[q];
                     }
                 }
             }
@@ -3013,6 +3040,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          Rcpp::NumericVector alpha = Rcpp::NumericVector::create(-1.0),
                          Rcpp::Nullable<Rcpp::CharacterVector> kvik_summaries = R_NilValue,
                          double acatv_mac = 10,
+                         int collapse_mac = 0,
                          bool h2_without_prs = true,
                          Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                          double cov_df = NA_REAL,
@@ -3030,7 +3058,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: two-sided, always SPA, ACAT-V via KVIK, h2 without PRS)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: two-sided, always SPA, ACAT-V via KVIK, h2 without PRS, collapse_mac)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
@@ -3044,6 +3072,11 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (alphas.empty()) stop("alpha must have at least one value");
     ChunkContext ctx = setup_context(filename, pheno_mat, alphas[0], covariates, annotation, annot_names);
     ctx.alphas = alphas;
+    if (collapse_mac < 0) stop("collapse_mac must be >= 0");
+    ctx.collapse_mac = collapse_mac;
+    if (collapse_mac > 0)
+        Rcout << "Collapsing: per tested unit and category, variants with MAC <= " << collapse_mac
+              << " are summed into one pseudo-marker (ACAT-V still uses them individually).\n";
     if (alphas.size() > 1) {
         if (!SPA) Rcpp::warning("alpha has several values but SPA = FALSE: only alpha[1] is used");
         else {

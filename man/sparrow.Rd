@@ -29,7 +29,8 @@ sparrow(
   spa = TRUE,
   chr = NULL,
   n_threads = 0,
-  batch_size = 64
+  batch_size = 64,
+  collapse_mac = 0
 )
 }
 \arguments{
@@ -66,7 +67,7 @@ Must be on the same genome build as the .bim.}
 \item{h2_without_prs}{With \code{loco_prs}: estimate h2 from y (TRUE) and use y - LOCO
 only for p-values. Recommended; see the supplement.}
 
-\item{prs_mask}{Advanced. Categories x PRS sources; which full PRS is subtracted in
+\item{prs_mask}{Categories x PRS sources; which full PRS is subtracted in
 the window pass. Default: 0 if h2_without_prs, else 1.}
 
 \item{do_windows}{Estimate ~1 Mb windows and report window-calibrated h2 (h2_adj).}

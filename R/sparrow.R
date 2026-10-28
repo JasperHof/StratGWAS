@@ -26,7 +26,7 @@
 #' @param coher TRUE to estimate co-heritability for all pairs of phenotypes.
 #' @param h2_without_prs With `loco_prs`: estimate h2 from y (TRUE) and use y - LOCO
 #'   only for p-values. Recommended; see the supplement.
-#' @param prs_mask Advanced. Categories x PRS sources; which full PRS is subtracted in
+#' @param prs_mask Categories x PRS sources; which full PRS is subtracted in
 #'   the window pass. Default: 0 if h2_without_prs, else 1.
 #' @param do_windows Estimate ~1 Mb windows and report window-calibrated h2 (h2_adj).
 #' @param chunk_size,window_bp,max_window_chunks Region and window sizes.
@@ -71,7 +71,8 @@ sparrow <- function(filename, pheno, out_file,
                     max_window_chunks = 8,
                     max_gene_snps = 512, min_gene_snps = 2,
                     acatv_mac = 10, spa = TRUE, chr = NULL,
-                    n_threads = 0, batch_size = 64) {
+                    n_threads = 0, batch_size = 64,
+                    collapse_mac = 0) {
 
   # ---- basic checks -----------------------------------------------------------
   for (ext in c(".bed", ".bim", ".fam"))
@@ -235,7 +236,8 @@ sparrow <- function(filename, pheno, out_file,
     h2_without_prs = h2_without_prs,
     covariates = C, cov_df = cov_df,
     SPA = spa, binary = binary, binary_raw = binary_raw, coher = coher,
-    chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
+    chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads,
+    collapse_mac = collapse_mac)
 
   files <- c(regions = out_file,
              genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA,
