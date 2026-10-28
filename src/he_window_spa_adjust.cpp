@@ -2169,18 +2169,29 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         lp *= cev; vp *= Vpt;
                         KQ[mm] += fac[mm] * (double)(n - K) * lp * vp;
                     }
-                    // Shape only -- pin kappa2 to the exact var0. See test_chunk.
+                    // Pin kappa2 to the exact var0. Two variants (TEST SWITCH):
+                    //   default           : rescale ALL cumulants by s^m (keeps the standardized shape)
+                    //   SPARROW_PIN_VAR=1 : replace kappa2 only, keep kappa3..kappa6 as computed.
+                    //     The null-phenotype evaluation showed the default shrinks skewness /
+                    //     kurtosis by (kt2/var0)^{(m-2)/2} with kt2/var0 ~ 1.15-1.3, i.e. the
+                    //     independence step mainly overstates kappa2, not the higher cumulants.
+                    static const bool pin_var_only = (std::getenv("SPARROW_PIN_VAR") != 0);
+                    const double kt2 = KQ[2];                  // unpinned kappa2 (for the debug line)
                     if (KQ[2] > 0.0 && var0 > 0.0 && std::isfinite(KQ[2])) {
-                        const double s = std::sqrt(var0 / KQ[2]);
-                        double sp = 1.0;
-                        for (int mm = 1; mm <= NCUM; ++mm) { sp *= s; KQ[mm] *= sp; }
+                        if (pin_var_only) {
+                            KQ[2] = var0;
+                        } else {
+                            const double s = std::sqrt(var0 / KQ[2]);
+                            double sp = 1.0;
+                            for (int mm = 1; mm <= NCUM; ++mm) { sp *= s; KQ[mm] *= sp; }
+                        }
                     }
                     // DEBUG (set SPARROW_DEBUG=1 and n_threads = 1): the null model of this test
                     static const bool dbg = (std::getenv("SPARROW_DEBUG") != 0);
                     if (dbg) {
                         const double v_gauss = var0 - (cscale != 1.0 ? kur[(size_t) t * (MAXCUM + 1) + 4] * Sb2[c] : 0.0);
-                        std::fprintf(stderr, "SPADBG\t%s\t%ld\t%ld\t%d\t%d\t%.6g\t%.6g\t%.6g",
-                                     cd.chr.c_str(), cd.start, cd.end, c, t, sigma[c], var0, v_gauss);
+                        std::fprintf(stderr, "SPADBG\t%s\t%ld\t%ld\t%d\t%d\t%.6g\t%.6g\t%.6g\t%.6g",
+                                     cd.chr.c_str(), cd.start, cd.end, c, t, sigma[c], var0, v_gauss, kt2);
                         for (int mm = 1; mm <= NCUM; ++mm) std::fprintf(stderr, "\t%.6g", KQ[mm]);
                         std::fprintf(stderr, "\n");
                     }
