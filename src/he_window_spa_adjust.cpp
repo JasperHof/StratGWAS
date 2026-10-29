@@ -267,7 +267,34 @@ struct Cell {
     // ACAT-V and the alpha-model weights can still see every variant individually
     std::vector<float> omaf;
     std::vector<int> ocat;
+    // exact binary SPA: per column, the carriers of the MINOR allele and their minor-allele
+    // dosage (1, 2, or more for a collapsed pseudo-marker). Filled only when requested
+    // (car_max > 0) and only for columns with at most car_max carriers; empty = dense.
+    std::vector< std::vector<int> > car;
+    std::vector< std::vector<unsigned char> > dos;
 };
+
+// Carriers of one RAW column (codes 0/1/2, -1 = missing). minor = true: the column is a
+// collapsed pseudo-marker whose values already ARE minor-allele dosages.
+static void capture_carriers(const float* col, int n, int car_max, bool minor,
+                             std::vector<int>& idx, std::vector<unsigned char>& d) {
+    idx.clear(); d.clear();
+    if (car_max <= 0) return;
+    bool flip = false;
+    if (!minor) {
+        double s = 0.0; int nv = 0;
+        for (int i = 0; i < n; ++i) if (col[i] >= 0.f) { s += col[i]; ++nv; }
+        flip = (nv > 0 && s > (double) nv);              // coded allele is the major one
+    }
+    int cnt = 0;
+    for (int i = 0; i < n; ++i) {
+        const float g = col[i];
+        if (g < 0.f) continue;                            // missing = non-carrier
+        const int md = (int) std::lround(flip ? 2.f - g : g);
+        if (md > 0) { if (++cnt > car_max) { idx.clear(); d.clear(); return; }
+                      idx.push_back(i); d.push_back((unsigned char) std::min(md, 255)); }
+    }
+}
 
 // Standardize columns to unit variance (mean-impute missing == -1), capturing
 // MAF. Reductions in double.
@@ -295,7 +322,7 @@ static void standardize_capture_maf(GenoMat& X, std::vector<float>& maf) {
 static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
                           int i0, int i1, Cell& cell,
                           const std::vector<int>* cat_id = 0,
-                          int collapse_mac = 0, int collapse_n = 5) {
+                          int collapse_mac = 0, int collapse_n = 5, int car_max = 0) {
     cell = Cell(); cell.i0 = -1;
     int m = i1 - i0;
     int n_keep = (int) keep.size();
@@ -305,6 +332,11 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
 
     // -------- no collapsing: original path (columns map 1:1 to the .bim) --------
     if (!(collapse_mac > 0 && cat_id != 0 && collapse_n >= 1)) {
+        if (car_max > 0) {
+            cell.car.resize(m); cell.dos.resize(m);
+            for (int j = 0; j < m; ++j)
+                capture_carriers(block.col(j).data(), n_keep, car_max, false, cell.car[j], cell.dos[j]);
+        }
         standardize_capture_maf(block, cell.maf);   // standardize in place
         cell.X = std::move(block);
         cell.i0 = i0;
@@ -355,6 +387,11 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
     }
 
     int nout = (int) out_cols.size();
+    if (car_max > 0) {
+        cell.car.resize(nout); cell.dos.resize(nout);
+        for (int k = 0; k < nout; ++k)
+            capture_carriers(out_cols[k].data(), n_keep, car_max, k >= n_ind, cell.car[k], cell.dos[k]);
+    }
     GenoMat X(n_keep, nout);
     for (int k = 0; k < nout; ++k)
         for (int i = 0; i < n_keep; ++i) X(i, k) = out_cols[k][i];
@@ -663,7 +700,8 @@ static QuadSpaResult quad_spa_solve(
     double s_obs_in, const std::vector<double>& eig_in, double eig_rep_in, double n_rep,
     int max_iter = 100, double tol = 1e-8,
     double lam2_in = 0.0, double nu2 = 0.0,
-    double lam3_in = 0.0, double nu3 = 0.0
+    double lam3_in = 0.0, double nu3 = 0.0,
+    int tail = 0                     // 0 = two-sided (from the median), 1 = upper tail P(X >= s)
 ) {
     QuadSpaResult res; res.p = NA_REAL; res.converged = false;
 
@@ -766,7 +804,7 @@ static QuadSpaResult quad_spa_solve(
     // that limit, so use it directly rather than divide by ~0.
     if (std::abs(t) < 1e-7) {
         double z = (s_obs - mean0) / std::sqrt(var0);
-        res.p = std::erfc(std::abs(z) / std::sqrt(2.0));
+        res.p = (tail == 1) ? 0.5 * std::erfc(z / std::sqrt(2.0)) : std::erfc(std::abs(z) / std::sqrt(2.0));
         res.converged = true;
         return res;
     }
@@ -802,7 +840,12 @@ static QuadSpaResult quad_spa_solve(
     // expansion is unstable in w even when t is not small).
     if (std::abs(w) < 1e-4) {
         const double z = (s_obs - mean0) / std::sqrt(var0);
-        res.p = std::erfc(std::abs(z) / std::sqrt(2.0));
+        res.p = (tail == 1) ? 0.5 * std::erfc(z / std::sqrt(2.0)) : std::erfc(std::abs(z) / std::sqrt(2.0));
+        res.converged = true;
+        return res;
+    }
+    if (tail == 1) {                   // ONE-SIDED (variance components): only large values count
+        res.p = (w >= 0) ? p_one : 1.0 - p_one;
         res.converged = true;
         return res;
     }
@@ -917,6 +960,359 @@ static QuadSpaResult bern_spa_solve(double q_obs, const std::vector<double>& cc,
     res.p = 2.0 * std::min(p_one, 1.0 - p_one);
     res.converged = true;
     return res;
+}
+
+
+// ===========================================================================
+// EXACT PER-VARIANT SADDLEPOINT FOR BINARY TRAITS  (spa_used = 5)
+// ===========================================================================
+// Every estimate is a quadratic form in the per-column scores u_j = v_j' y:
+//     Q = sum_j a_j u_j^2 + C ,   a_j = Tinv(c, comp(j)) g_comp(j),  C = Tinv(c, env) y'y
+// For a 0/1 trait, y_i = lo_i + delta b_i with b_i in {0,1}. For a SPARSE column (few
+// expected case carriers) u_j is, up to a fixed shift, delta * kappa_j * S_j, where S_j is
+// the (dosage-weighted) number of cases among the column's carriers -- a Poisson-binomial
+// count whose distribution is computed EXACTLY. Sparse columns rarely share carriers, so
+// their terms are treated as independent. DENSE columns (common variants, or rare
+// variants with many expected case carriers) are close to Gaussian; their joint
+// contribution is a non-central chi-square mixture from their exact covariance.
+//     K(t) = C t + sum_sparse log E exp(t a_j u_j^2) + sum_dense K_ncchi2(t)
+// y'y is treated as fixed (the null conditions on the number of cases).
+// The CGF is evaluated stably with log-sum-exp; the saddlepoint uses Lugannani-Rice
+// with the same guards as quad_spa_solve. Returns BOTH tails (upper = P(Q >= q)).
+// ---------------------------------------------------------------------------
+struct ExactTerm { std::vector<double> v, lp; int obs = -1; };   // support values, log probabilities,
+                                                                 // index of the observed value (-1 = unknown)
+
+struct ExactSpaResult { double p_up, p_lo; bool converged; bool exact = false; };   // exact: enumeration / atom
+
+static void exact_cgf(double t, const std::vector<ExactTerm>& T, const std::vector<double>& lam,
+                      const std::vector<double>& nc2, double C,
+                      double& K, double& K1, double& K2) {
+    K = C * t; K1 = C; K2 = 0.0;
+    for (size_t j = 0; j < T.size(); ++j) {
+        const std::vector<double>& v = T[j].v; const std::vector<double>& lp = T[j].lp;
+        double mx = -1e300;
+        for (size_t s = 0; s < v.size(); ++s) mx = std::max(mx, lp[s] + t * v[s]);
+        double z = 0.0, m1 = 0.0, m2 = 0.0;
+        for (size_t s = 0; s < v.size(); ++s) {
+            const double e = std::exp(lp[s] + t * v[s] - mx);
+            z += e; m1 += e * v[s]; m2 += e * v[s] * v[s];
+        }
+        m1 /= z; m2 /= z;
+        K += mx + std::log(z); K1 += m1; K2 += std::max(0.0, m2 - m1 * m1);
+    }
+    for (size_t k = 0; k < lam.size(); ++k) {
+        const double l = lam[k], d = 1.0 - 2.0 * l * t;
+        K  += -0.5 * std::log(d) + l * nc2[k] * t / d;
+        K1 += l / d + l * nc2[k] / (d * d);
+        K2 += 2.0 * l * l / (d * d) + 4.0 * l * l * nc2[k] / (d * d * d);
+    }
+}
+
+static ExactSpaResult exact_spa_solve(double q_in, std::vector<ExactTerm> T, std::vector<double> lam,
+                                      const std::vector<double>& nc2, double C_in) {
+    ExactSpaResult res; res.p_up = res.p_lo = NA_REAL; res.converged = false;
+    // ---- scale normalisation (as quad_spa_solve): work where Var(Q) = 1 --------------
+    double mean = C_in, var = 0.0, qmax = C_in, qmin = C_in;
+    for (size_t j = 0; j < T.size(); ++j) {
+        double m1 = 0.0, m2 = 0.0, vmx = -1e300, vmn = 1e300;
+        for (size_t s = 0; s < T[j].v.size(); ++s) {
+            const double pr = std::exp(T[j].lp[s]);
+            m1 += pr * T[j].v[s]; m2 += pr * T[j].v[s] * T[j].v[s];
+            vmx = std::max(vmx, T[j].v[s]); vmn = std::min(vmn, T[j].v[s]);
+        }
+        mean += m1; var += std::max(0.0, m2 - m1 * m1); qmax += vmx; qmin += vmn;
+    }
+    bool unb_up = false, unb_lo = false;
+    for (size_t k = 0; k < lam.size(); ++k) {
+        mean += lam[k] * (1.0 + nc2[k]); var += 2.0 * lam[k] * lam[k] * (1.0 + 2.0 * nc2[k]);
+        if (lam[k] > 0) unb_up = true; if (lam[k] < 0) unb_lo = true;
+    }
+    if (!(var > 0.0) || !std::isfinite(var)) return res;
+    const double sc = 1.0 / std::sqrt(var);
+    for (size_t j = 0; j < T.size(); ++j) for (size_t s = 0; s < T[j].v.size(); ++s) T[j].v[s] *= sc;
+    for (size_t k = 0; k < lam.size(); ++k) lam[k] *= sc;
+    const double C = C_in * sc, q = q_in * sc, mu0 = mean * sc;
+    qmax *= sc; qmin *= sc;
+
+    // ---- observation at the edge of a bounded support: exact atom probability ---------
+    const double tol = 1e-9 * std::max(1.0, std::abs(q));
+    if (!unb_up && q >= qmax - tol) {
+        double lp = 0.0;
+        for (size_t j = 0; j < T.size(); ++j) {
+            double vmx = -1e300; for (size_t s = 0; s < T[j].v.size(); ++s) vmx = std::max(vmx, T[j].v[s]);
+            double pr = 0.0; for (size_t s = 0; s < T[j].v.size(); ++s) if (T[j].v[s] >= vmx - tol) pr += std::exp(T[j].lp[s]);
+            lp += std::log(std::max(pr, 1e-300));
+        }
+        res.p_up = std::max(std::exp(lp), 1e-300); res.p_lo = 1.0; res.converged = true; res.exact = true; return res;
+    }
+    if (!unb_lo && q <= qmin + tol) {
+        double lp = 0.0;
+        for (size_t j = 0; j < T.size(); ++j) {
+            double vmn = 1e300; for (size_t s = 0; s < T[j].v.size(); ++s) vmn = std::min(vmn, T[j].v[s]);
+            double pr = 0.0; for (size_t s = 0; s < T[j].v.size(); ++s) if (T[j].v[s] <= vmn + tol) pr += std::exp(T[j].lp[s]);
+            lp += std::log(std::max(pr, 1e-300));
+        }
+        res.p_lo = std::max(std::exp(lp), 1e-300); res.p_up = 1.0; res.converged = true; res.exact = true; return res;
+    }
+
+    // ---- purely discrete null (no Gaussian part): enumerate the distribution -----------
+    // The support of the sum is built term by term, merging equal values. Combinations
+    // with probability < 1e-14 are dropped and their total mass is ADDED to the upper-
+    // tail p (and to the lower-tail p), so the result is an exact upper bound that is
+    // tight for p >> 1e-14. Used when the product of the term supports is <= 200,000;
+    // abandoned (-> saddlepoint) if the merged support exceeds 50,000 points.
+    double prod_support = 1.0;                 // cheap pre-check of the enumeration size
+    for (size_t j = 0; j < T.size() && prod_support <= 2e5; ++j) {
+        int cnt = 0; for (size_t s2 = 0; s2 < T[j].lp.size(); ++s2) if (T[j].lp[s2] >= -32.2) ++cnt;   // p >= 1e-14
+        prod_support *= std::max(1, cnt);
+    }
+    if (lam.empty() && prod_support <= 2e5) {
+        std::vector< std::pair<double,double> > dist(1, std::make_pair(C, 1.0)), nx;
+        bool ok = true; double dropped = 0.0;
+        for (size_t j = 0; j < T.size() && ok; ++j) {
+            nx.clear(); nx.reserve(dist.size() * T[j].v.size());
+            for (size_t a2 = 0; a2 < dist.size(); ++a2)
+                for (size_t s2 = 0; s2 < T[j].v.size(); ++s2) {
+                    const double pr = dist[a2].second * std::exp(T[j].lp[s2]);
+                    if (pr >= 1e-14) nx.push_back(std::make_pair(dist[a2].first + T[j].v[s2], pr));
+                    else dropped += pr;
+                }
+            std::sort(nx.begin(), nx.end());
+            dist.clear();
+            for (size_t k = 0; k < nx.size(); ++k) {
+                if (!dist.empty() && nx[k].first - dist.back().first <= 1e-12) dist.back().second += nx[k].second;
+                else dist.push_back(nx[k]);
+            }
+            if (dist.size() > 50000) ok = false;
+        }
+        if (ok) {
+            double pu = 0.0, pl = 0.0;
+            for (size_t k = 0; k < dist.size(); ++k) {
+                if (dist[k].first >= q - tol) pu += dist[k].second;
+                if (dist[k].first <= q + tol) pl += dist[k].second;
+            }
+            res.p_up = std::min(1.0, std::max(pu + dropped, 1e-300));
+            res.p_lo = std::min(1.0, std::max(pl + dropped, 1e-300));
+            res.converged = true; res.exact = true; return res;
+        }
+    }
+
+    // ---- saddlepoint: K'(t) = q, bracketed Newton (K' is increasing) -----------------
+    double lmax = 0.0, lmin = 0.0;
+    for (size_t k = 0; k < lam.size(); ++k) { lmax = std::max(lmax, lam[k]); lmin = std::min(lmin, lam[k]); }
+    double hi = (lmax > 1e-14) ? (1.0 - 1e-9) / (2.0 * lmax) :  1e4;
+    double lo = (lmin < -1e-14) ? (1.0 - 1e-9) / (2.0 * lmin) : -1e4;
+    double K, K1, K2, t = 0.0;
+    exact_cgf(0.0, T, lam, nc2, C, K, K1, K2);
+    double a = lo, b = hi;
+    bool conv = false;
+    for (int it = 0; it < 300; ++it) {
+        exact_cgf(t, T, lam, nc2, C, K, K1, K2);
+        const double f = K1 - q;
+        if (std::abs(f) < 1e-10 * std::max(1.0, std::abs(q - mu0))) { conv = true; break; }
+        if (f > 0) b = t; else a = t;
+        double tn = (K2 > 1e-300) ? t - f / K2 : 0.5 * (a + b);
+        if (!(tn > a && tn < b) || !std::isfinite(tn)) tn = 0.5 * (a + b);
+        if (std::abs(b - a) < 1e-14 * std::max(1.0, std::abs(t))) { conv = true; t = tn; break; }
+        t = tn;
+    }
+    if (!conv) return res;
+    exact_cgf(t, T, lam, nc2, C, K, K1, K2);
+    if (!(K2 > 0.0) || !std::isfinite(K2)) return res;
+
+    double up, dn;
+    if (std::abs(t) < 1e-7) {
+        const double z = (q - mu0);                        // Var = 1 after scaling
+        up = 0.5 * std::erfc(z / std::sqrt(2.0)); dn = 1.0 - up;
+    } else {
+        const double w = ((t > 0) ? 1.0 : -1.0) * std::sqrt(std::max(0.0, 2.0 * (t * q - K)));
+        const double u = t * std::sqrt(K2);
+        if (std::abs(w) < 1e-4) {
+            const double z = (q - mu0);
+            up = 0.5 * std::erfc(z / std::sqrt(2.0)); dn = 1.0 - up;
+        } else {
+            const double phi = std::exp(-0.5 * w * w) / std::sqrt(2.0 * M_PI);
+            const double corr = phi * (1.0 / u - 1.0 / w);
+            if (w >= 0) {
+                const double lead = 0.5 * std::erfc(w / std::sqrt(2.0));
+                if (std::abs(corr) > std::abs(lead)) return res;
+                up = lead + corr; dn = 1.0 - up;
+            } else {
+                // Below the mean. Near the lower bound of a discrete null (few sparse terms,
+                // no Gaussian part) the expansion can break down; there the UPPER-tail p is
+                // > 0.5 anyway, so the normal approximation is used instead of failing.
+                const double lead = 0.5 * std::erfc(-w / std::sqrt(2.0));
+                if (std::abs(corr) > std::abs(lead)) {
+                    dn = 0.5 * std::erfc(-(q - mu0) / std::sqrt(2.0)); up = 1.0 - dn;
+                } else {
+                    dn = lead - corr; up = 1.0 - dn;
+                }
+            }
+        }
+    }
+    if (!std::isfinite(up) || !std::isfinite(dn) || up <= 0.0 || dn <= 0.0 || up >= 1.0 || dn >= 1.0) return res;
+    res.p_up = up; res.p_lo = dn; res.converged = true;
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// Lattice convolution of the same null (used when the saddlepoint fails or p is small).
+// Why: a sparse term a_j u_j^2 is the SQUARE of a (Poisson-)binomial count, so its
+// moment generating function grows super-exponentially -- it is finite only because the
+// support is bounded. For a category made of variants with tens of carriers each (no
+// singletons; e.g. after collapsing) the saddlepoint then lands among atoms with
+// probability < 1e-30 and Lugannani-Rice is meaningless (it fails, or is far off).
+// Here the sparse part D = sum_j (v_j - min_j) is computed on a lattice of M bins
+// (each atom rounded to the nearest bin; errors average out over terms), with an
+// absorbing overflow bin at the top. The dense part G (weighted non-central chi-square)
+// is continuous and its tail is accurate by saddlepoint, so
+//     P(Q >= q) = sum_k P(D = k h) P(G >= q - C - sum_j min_j - k h).
+// Without a dense part the threshold is the observed lattice point (sum of the rounded
+// observed atoms), so the observed configuration itself is always counted, as in the
+// enumeration. Atoms with probability < 1e-18 are dropped and their mass is ADDED to
+// both tails (an upper bound).
+// ---------------------------------------------------------------------------
+static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T,
+                                       const std::vector<double>& lam, const std::vector<double>& nc2,
+                                       double C, int M = 8192) {
+    ExactSpaResult res; res.p_up = res.p_lo = NA_REAL; res.converged = false;
+    const double LPMIN = std::log(1e-18);
+    const bool dense = !lam.empty();
+    // per term: kept atoms, minimum, observed value
+    double sum_mn = 0.0, Dobs = 0.0, dropped = 0.0; bool have_obs = !dense;
+    std::vector<double> mn(T.size(), 0.0);
+    for (size_t j = 0; j < T.size(); ++j) {
+        double m = 1e300;
+        for (size_t s = 0; s < T[j].v.size(); ++s)
+            if (T[j].lp[s] >= LPMIN || (int) s == T[j].obs) m = std::min(m, T[j].v[s]);
+        if (!(m < 1e300)) return res;
+        mn[j] = m; sum_mn += m;
+        if (T[j].obs < 0 || T[j].obs >= (int) T[j].v.size()) have_obs = false;
+        else Dobs += T[j].v[T[j].obs] - m;
+    }
+    const double Dq = q - C - sum_mn;                    // threshold for D (+ G)
+    // dense part: moments, support sign
+    double mG = 0.0, vG = 0.0; bool allpos = true, allneg = true;
+    for (size_t k = 0; k < lam.size(); ++k) {
+        mG += lam[k] * (1.0 + nc2[k]); vG += 2.0 * lam[k] * lam[k] * (1.0 + 2.0 * nc2[k]);
+        if (lam[k] < 0) allpos = false;
+        if (lam[k] > 0) allneg = false;
+    }
+    const double sdG = std::sqrt(std::max(vG, 0.0));
+    double R;
+    if (!dense) R = have_obs ? Dobs : Dq;
+    else        R = Dq - (allpos ? 0.0 : (mG - 12.0 * sdG));
+    if (!dense && !(R > 0.0)) {                          // observation at the minimum of D
+        res.p_up = 1.0; res.p_lo = 1.0; res.converged = true; return res;
+    }
+    double scale = 0.0;                                  // a natural size, for degenerate R
+    for (size_t j = 0; j < T.size(); ++j) for (size_t s = 0; s < T[j].v.size(); ++s)
+        if (T[j].lp[s] >= LPMIN) scale = std::max(scale, T[j].v[s] - mn[j]);
+    if (!(R > 0.0)) R = 1e-9 * std::max(scale, 1e-300);
+    const double h = R / M;
+    long Kobs = M;
+    if (!dense && have_obs) {
+        Kobs = 0;
+        for (size_t j = 0; j < T.size(); ++j) Kobs += std::llround((T[j].v[T[j].obs] - mn[j]) / h);
+    }
+    const long Mc = std::max<long>(M, Kobs) + 1;         // bins 0..Mc-1, then overflow
+    std::vector<double> pm(Mc, 0.0), nx(Mc, 0.0);
+    pm[0] = 1.0; long top = 0; double ovf = 0.0;
+    std::vector<long> ak; std::vector<double> ap;
+    for (size_t j = 0; j < T.size(); ++j) {
+        ak.clear(); ap.clear();
+        for (size_t s = 0; s < T[j].v.size(); ++s) {
+            const double pr = std::exp(T[j].lp[s]);
+            if (T[j].lp[s] < LPMIN && (int) s != T[j].obs) { dropped += pr; continue; }
+            ak.push_back(std::llround((T[j].v[s] - mn[j]) / h)); ap.push_back(pr);
+        }
+        long ntop = 0;
+        std::fill(nx.begin(), nx.end(), 0.0);
+        for (long k = 0; k <= top; ++k) {
+            const double pk = pm[k]; if (pk == 0.0) continue;
+            for (size_t a = 0; a < ak.size(); ++a) {
+                const long idx = k + ak[a];
+                if (idx >= Mc) ovf += pk * ap[a];
+                else { nx[idx] += pk * ap[a]; if (idx > ntop) ntop = idx; }
+            }
+        }
+        pm.swap(nx); top = ntop;
+    }
+    double pu = ovf, pl = 0.0;
+    if (!dense) {
+        for (long k = 0; k <= top; ++k) { if (k >= Kobs) pu += pm[k]; if (k <= Kobs) pl += pm[k]; }
+    } else {
+        // tail of G at x: saddlepoint of the non-central chi-square mixture; cached on a
+        // coarse stride and interpolated on the log scale (G's tail is smooth)
+        const std::vector<ExactTerm> none;
+        auto pg = [&](double x, double& up, double& lo) {
+            if (allpos && x <= 0.0) { up = 1.0; lo = 0.0; return; }     // G >= 0
+            if (allneg && x >= 0.0) { up = 0.0; lo = 1.0; return; }     // G <= 0
+            ExactSpaResult r = exact_spa_solve(x, none, lam, nc2, 0.0);
+            if (r.converged) { up = r.p_up; lo = r.p_lo; }
+            else { const double z = (x - mG) / std::max(sdG, 1e-300);
+                   up = 0.5 * std::erfc(z / std::sqrt(2.0)); lo = 1.0 - up; }
+        };
+        const long stride = 8;
+        double lu0 = 0, ll0 = 0, lu1 = 0, ll1 = 0; long k0 = -1;
+        for (long k = 0; k <= top; ++k) {
+            const double pk = pm[k]; if (pk < 1e-300) continue;
+            const long kb = (k / stride) * stride;
+            if (kb != k0) {
+                double u0, l0, u1, l1;
+                pg(Dq - kb * h, u0, l0); pg(Dq - (kb + stride) * h, u1, l1);
+                lu0 = std::log(std::max(u0, 1e-300)); ll0 = std::log(std::max(l0, 1e-300));
+                lu1 = std::log(std::max(u1, 1e-300)); ll1 = std::log(std::max(l1, 1e-300));
+                k0 = kb;
+            }
+            const double f = (double) (k - kb) / stride;
+            pu += pk * std::exp(lu0 + f * (lu1 - lu0));
+            pl += pk * std::exp(ll0 + f * (ll1 - ll0));
+        }
+        { double u, l; pg(Dq - Mc * h, u, l); pl += ovf * l; }
+    }
+    res.p_up = std::min(1.0, std::max(pu + dropped, 1e-300));
+    res.p_lo = std::min(1.0, std::max(pl + dropped, 1e-300));
+    res.converged = std::isfinite(res.p_up) && std::isfinite(res.p_lo);
+    return res;
+}
+
+// Distribution of S = sum_i d_i B_i, B_i ~ Bernoulli(pi_i) independent, d_i >= 1 integer.
+// Binomial closed form when all d_i = 1 and the pi_i are equal; otherwise a DP.
+// Returns log P(S = s), s = 0..smax, trimmed where the probability is negligible.
+// Test hook (never set in normal use): capture the exact null model of the first
+// exact test of category 0, so a test harness can evaluate the tail function directly.
+struct ExactCapture { bool done = false; std::vector<ExactTerm> T; std::vector<double> lam, nc2; double C = 0, q = 0; };
+static ExactCapture* g_exact_capture = 0;
+
+static void pb_pmf(const std::vector<unsigned char>& d, const std::vector<double>& pi,
+                   std::vector<double>& lp) {
+    const int c = (int) d.size();
+    bool simple = true; double pmin = 1.0, pmax = 0.0;
+    for (int i = 0; i < c; ++i) { if (d[i] != 1) simple = false; pmin = std::min(pmin, pi[i]); pmax = std::max(pmax, pi[i]); }
+    if (simple && pmax - pmin <= 1e-9 * std::max(pmax, 1e-12)) {
+        const double p = std::min(std::max(0.5 * (pmin + pmax), 1e-12), 1.0 - 1e-12);
+        lp.assign(c + 1, 0.0);
+        const double l1 = std::log(p), l0 = std::log1p(-p);
+        for (int k = 0; k <= c; ++k)
+            lp[k] = std::lgamma(c + 1.0) - std::lgamma(k + 1.0) - std::lgamma(c - k + 1.0) + k * l1 + (c - k) * l0;
+    } else {
+        std::vector<double> pm(1, 1.0), nx;
+        for (int i = 0; i < c; ++i) {
+            const int di = d[i]; const double p = std::min(std::max(pi[i], 1e-12), 1.0 - 1e-12);
+            nx.assign(pm.size() + di, 0.0);
+            for (size_t k = 0; k < pm.size(); ++k) { nx[k] += (1.0 - p) * pm[k]; nx[k + di] += p * pm[k]; }
+            size_t L = nx.size(); while (L > 1 && nx[L - 1] < 1e-300) --L;
+            nx.resize(L); pm.swap(nx);
+        }
+        lp.resize(pm.size());
+        for (size_t k = 0; k < pm.size(); ++k) lp[k] = (pm[k] > 0.0) ? std::log(pm[k]) : -1e300;
+    }
+    // trim the far upper tail (relative probability < 1e-60): it cannot affect the result
+    double mx = -1e300; for (size_t k = 0; k < lp.size(); ++k) mx = std::max(mx, lp[k]);
+    size_t L = lp.size(); while (L > 1 && lp[L - 1] < mx - 138.0) --L;
+    lp.resize(L);
 }
 
 static void coher_mdiag(const GenoMat& V, const std::vector<int>& off, int C,
@@ -1191,6 +1587,12 @@ struct ChunkContext {
     // collapsing (SAIGE-GENE+ style): variants with MAC <= collapse_mac are summed into one
     // pseudo-marker per category of a tested unit (0 = off). Flanks are never collapsed.
     int collapse_mac = 0;
+    // exact per-variant binary saddlepoint (needs the raw 0/1 phenotypes in braw)
+    bool bin_exact = false;
+    int  car_max = 0;                            // carriers recorded for columns with <= car_max
+    double ec_max = 10.0;                        // a column is "sparse" if E[# case carriers] <= ec_max
+    std::vector< std::vector<float> > bpi;       // [trait][ind] null P(case) (covariate fit)
+    std::vector<double> ncase;                   // observed number of cases per trait
 };
 
 // ---------------------------------------------------------------------------
@@ -1411,10 +1813,24 @@ static void prs_load(const std::string& path, ChunkContext& ctx, PrsSource& S) {
 // Phenotype variant + everything the tester needs that depends on it.
 // Built once per chromosome (pass 1: y - sum LOCO_c) and once per distinct
 // prs_mask row (pass 2: y - sum full).
+// Per-phenotype-variant inputs of the exact binary saddlepoint (spa_used = 5).
+// y_i = lo_i + delta b_i: lo is variant specific (it carries the PRS offset), b, pi and
+// delta are those of the original phenotype.
+struct BinExact {
+    bool active;
+    GenoMat LoF, PiF;                           // n x P: lo and null P(case)
+    std::vector< const std::vector<unsigned char>* > b;   // raw 0/1 per trait
+    std::vector<double> delta, ncase;
+    double ec_max;
+    double grid_p;                              // lattice convolution when saddlepoint p < grid_p
+    BinExact() : active(false), ec_max(10.0), grid_p(0.1) {}
+};
+
 struct PhenoStats {
     Eigen::MatrixXd Y; GenoMat Yf;
     std::vector<double> Vp, yty, kur, ycross;
     CoherBin cb;
+    BinExact bx;
 };
 
 static ChunkContext setup_context(const std::string& filename, const SEXP pheno_mat,
@@ -1542,6 +1958,20 @@ static void build_pheno_stats(const ChunkContext& ctx, const Eigen::MatrixXd& of
             for (int r = 1; r <= MAXCUM; ++r) S.kur[(size_t) t * (MAXCUM + 1) + r] = kp[r];
         }
     }
+    S.bx = BinExact();
+    if (binary && !coher && ctx.bin_exact && (int) ctx.braw.size() == P) {
+        S.bx.active = true; S.bx.ec_max = ctx.ec_max;
+        S.bx.LoF.resize(n, P); S.bx.PiF.resize(n, P);
+        S.bx.b.resize(P); S.bx.delta.resize(P); S.bx.ncase.resize(P);
+        for (int t = 0; t < P; ++t) {
+            const double dl = ctx.bdelta[t];
+            S.bx.b[t] = &ctx.braw[t]; S.bx.delta[t] = dl; S.bx.ncase[t] = ctx.ncase[t];
+            for (int i = 0; i < n; ++i) {
+                S.bx.LoF(i, t) = (float)(S.Y(i, t) - dl * (double) ctx.braw[t][i]);
+                S.bx.PiF(i, t) = ctx.bpi[t][i];
+            }
+        }
+    }
     S.ycross.clear(); S.cb = CoherBin();
     if (!coher) return;
     const int NP = (int) pairs.size();
@@ -1610,6 +2040,11 @@ struct ChunkDataA {
     // ultra-rare variants, so ACAT-V and cat_w see every variant individually
     std::vector< std::vector<int> > cat_obim;
     std::vector< std::vector<float> > cat_omaf;
+    // exact binary SPA: minor-allele carriers (analysis-row index) and dosages of every
+    // column of V (empty for dense columns), and the column sums of V
+    std::vector< std::vector<int> > car;
+    std::vector< std::vector<unsigned char> > dos;
+    std::vector<double> colsum;
     ChunkDataA() : m_flank(0), K(0) {}
 };
 struct ChunkResultA {
@@ -1638,7 +2073,8 @@ static bool read_block(const ChunkContext& ctx, int lo, int hi, Cell& c, bool co
     if (hi <= lo) return true;
     const bool coll = collapse && ctx.collapse_mac > 0;
     if (!read_cell_idx(ctx.bed, ctx.geno_keep, lo, hi, c,
-                       coll ? &ctx.snp_cat : 0, coll ? ctx.collapse_mac : 0)) return false;
+                       coll ? &ctx.snp_cat : 0, coll ? ctx.collapse_mac : 0, 5,
+                       ctx.bin_exact ? ctx.car_max : 0)) return false;
     if (ctx.covZ.cols() > 0) project_covariates(c.X, ctx.covZ, ctx.covM);
     apply_alpha(c.X, c.maf, ctx.alpha, 0, lo);
     return true;
@@ -1686,6 +2122,13 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     cd.V = GenoMat(ctx.n_inds, cd.K);
     cd.colmaf.assign(cd.K, 0.f);
     cd.colbim.assign(cd.K, -1);
+    const bool keep_car = ctx.bin_exact;
+    if (keep_car) { cd.car.assign(cd.K, std::vector<int>()); cd.dos.assign(cd.K, std::vector<unsigned char>()); }
+    // copy the carrier list of source column j of cell C into column k of V
+    auto take_car = [&](const Cell& C, int j, int k) {
+        if (!keep_car || j >= (int) C.car.size()) return;
+        cd.car[k] = C.car[j]; cd.dos[k] = C.dos[j];
+    };
     const double e1 = 1.0 + ctx.alpha;
     int off = 0;
     for (size_t k = 0; k < act.size(); ++k) {
@@ -1694,6 +2137,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
             cd.V.col(off + (int) q) = tgt.X.col(cc[q]);
             cd.colmaf[off + (int) q] = tgt.maf[cc[q]];
             cd.colbim[off + (int) q] = coll ? tgt.bim[cc[q]] : a + cc[q];
+            take_car(tgt, cc[q], off + (int) q);
         }
         // expected heritability under the alpha model, over the ORIGINAL variants
         double w = 0.0;
@@ -1707,19 +2151,24 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
         cd.cat_name.push_back(ctx.cat_names[c]); cd.cat_w.push_back(w);
     }
     for (size_t q = 0; q < bg_cols.size(); ++q) {
+        take_car(tgt, bg_cols[q], off);
         cd.colmaf[off] = tgt.maf[bg_cols[q]]; cd.V.col(off++) = tgt.X.col(bg_cols[q]);
     }
     if (fl.X.cols() > 0) {
-        for (int q = 0; q < (int) fl.X.cols(); ++q) cd.colmaf[off + q] = fl.maf[q];
+        for (int q = 0; q < (int) fl.X.cols(); ++q) { cd.colmaf[off + q] = fl.maf[q]; take_car(fl, q, off + q); }
         cd.V.middleCols(off, fl.X.cols()) = fl.X; off += (int) fl.X.cols();
     }
     if (fr.X.cols() > 0) {
-        for (int q = 0; q < (int) fr.X.cols(); ++q) cd.colmaf[off + q] = fr.maf[q];
+        for (int q = 0; q < (int) fr.X.cols(); ++q) { cd.colmaf[off + q] = fr.maf[q]; take_car(fr, q, off + q); }
         cd.V.middleCols(off, fr.X.cols()) = fr.X; off += (int) fr.X.cols();
     }
     cd.m_flank = m_flank;
     cd.cj.resize(cd.K);
     for (int j = 0; j < cd.K; ++j) cd.cj[j] = cd.V.col(j).cast<double>().squaredNorm();
+    if (keep_car) {
+        cd.colsum.resize(cd.K);
+        for (int j = 0; j < cd.K; ++j) cd.colsum[j] = cd.V.col(j).cast<double>().sum();
+    }
     return true;
 }
 
@@ -1869,6 +2318,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                              const std::vector< std::pair<int,int> >& pairs,
                              const std::vector<double>& ycross,
                              const CoherBin& cb,
+                             const BinExact& bx, bool one_sided,
                              ChunkResultA& cr) {
     const int n = (int) Y.rows(), P = (int) Y.cols();
     const int A = (int) cd.cat_m.size();
@@ -1899,7 +2349,12 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
     auto finish_se = [&]() {
         for (size_t c = 0; c < cr.vg.size(); ++c)
             for (size_t t = 0; t < cr.vg[c].size(); ++t)
-                cr.se_vg[c][t] = se_from_p(cr.vg[c][t], cr.p_spa[c][t]);
+            {
+                // the SE always comes from the TWO-SIDED p (defined for negative estimates too)
+                const double pp = cr.p_spa[c][t];
+                const double p2 = (one_sided && !coher && std::isfinite(pp)) ? std::min(1.0, 2.0 * std::min(pp, 1.0 - pp)) : pp;
+                cr.se_vg[c][t] = se_from_p(cr.vg[c][t], p2);
+            }
     };
 
     // Aliases onto the prebuilt geometry. Everything below is exactly as it was
@@ -1988,6 +2443,17 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
     };
 
     Eigen::MatrixXd U = (cd.V.transpose() * Yf).cast<double>();      // K x P, one GEMM
+
+    // ---- exact binary SPA (spa_used = 5): shifts and Gaussian means, one GEMM each ----
+    const bool use_exact = binary && !coher && spa && have_L && bx.active &&
+                           (int) cd.car.size() == K && (int) cd.colsum.size() == K;
+    Eigen::MatrixXd Ulo, Upi;
+    std::vector<int> comp_of(K, env);
+    if (use_exact) {
+        Ulo = (cd.V.transpose() * bx.LoF).cast<double>();
+        Upi = (cd.V.transpose() * bx.PiF).cast<double>();
+        for (int a = 0; a < C; ++a) for (int j = off[a]; j < off[a + 1]; ++j) comp_of[j] = a;
+    }
 
     // ---- CO-HERITABILITY BRANCH (annotation path) --------------------------
     // Same construction as the plain path, but every one of the A tested
@@ -2108,6 +2574,45 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
 
         double sigma_env0 = std::max(sigma[env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
         Eigen::VectorXd s0base = sigma.head(C);
+
+        // ---- exact binary SPA: the exact distribution of every SPARSE column's score ----
+        // u_j = mu_j + delta * kappa_j * S_j, S_j = sum over carriers of dosage x case status.
+        // A column is sparse when its expected number of case carriers is <= ec_max.
+        struct SpCol { int j; std::vector<double> u, lp; double u_obs; int sobs; };
+        std::vector<SpCol> spc; std::vector<int> dns; std::vector<double> dns_mean;
+        if (use_exact) {
+            const double dl = bx.delta[t], Ncase = bx.ncase[t];
+            const std::vector<unsigned char>& bb = *bx.b[t];
+            for (int j = 0; j < K; ++j) {
+                const std::vector<int>& ci = cd.car[j];
+                const std::vector<unsigned char>& di = cd.dos[j];
+                double ec = 0.0;
+                for (size_t r = 0; r < ci.size(); ++r) ec += (double) bx.PiF(ci[r], t) * di[r];
+                if (ci.empty() || ec > bx.ec_max) {
+                    dns.push_back(j); dns_mean.push_back(Ulo(j, t) + dl * Upi(j, t)); continue;
+                }
+                const int cn = (int) ci.size();
+                double scar = 0.0;
+                for (int r = 0; r < cn; ++r) scar += cd.V(ci[r], j);
+                const double xnc = (cd.colsum[j] - scar) / std::max(1, n - cn);   // non-carrier value
+                double num = 0.0, den = 0.0; int sobs = 0;
+                std::vector<double> pis(cn);
+                for (int r = 0; r < cn; ++r) {
+                    num += ((double) cd.V(ci[r], j) - xnc) * di[r]; den += (double) di[r] * di[r];
+                    if (bb[ci[r]]) sobs += di[r];
+                    pis[r] = bx.PiF(ci[r], t);
+                }
+                const double kap = num / den;
+                SpCol sc; sc.j = j;
+                pb_pmf(di, pis, sc.lp);
+                if ((int) sc.lp.size() < sobs + 1) sc.lp.resize(sobs + 1, -1e300);   // keep the observation
+                const double mu = Ulo(j, t) + dl * xnc * Ncase;
+                sc.u.resize(sc.lp.size());
+                for (size_t q2 = 0; q2 < sc.u.size(); ++q2) sc.u[q2] = mu + dl * kap * (double) q2;
+                sc.u_obs = mu + dl * kap * (double) sobs; sc.sobs = sobs;
+                spc.push_back(sc);
+            }
+        }
         for (int a = 0; a < C; ++a) if (s0base[a] < 0.0) s0base[a] = 0.0;
 
         // ---- SPA-test each category component c ----
@@ -2138,7 +2643,82 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             // Every test goes to the saddlepoint (no Wald screen). The Wald p
             // from the closed-form variance is kept ONLY as the fallback for a
             // saddlepoint that fails (spa_used = 0).
-            double p_wald = std::erfc(std::abs(sigma[c] / std::sqrt(var0)) / std::sqrt(2.0));
+            double p_wald = one_sided ? 0.5 * std::erfc((sigma[c] / std::sqrt(var0)) / std::sqrt(2.0))
+                                      : std::erfc(std::abs(sigma[c] / std::sqrt(var0)) / std::sqrt(2.0));
+
+            // ---- exact per-variant binary saddlepoint (spa_used = 5) -------------------
+            if (use_exact) {
+                const double Cc = Tinv(c, env) * yty[t];
+                double qobs = Cc;
+                std::vector<ExactTerm> terms; terms.reserve(spc.size());
+                for (size_t r = 0; r < spc.size(); ++r) {
+                    const int j = spc[r].j;
+                    const double aj = Tinv(c, comp_of[j]) * g[comp_of[j]];
+                    if (aj == 0.0) continue;
+                    ExactTerm e; e.lp = spc[r].lp; e.v.resize(spc[r].u.size()); e.obs = spc[r].sobs;
+                    for (size_t q2 = 0; q2 < e.v.size(); ++q2) e.v[q2] = aj * spc[r].u[q2] * spc[r].u[q2];
+                    qobs += aj * spc[r].u_obs * spc[r].u_obs;
+                    terms.push_back(e);
+                }
+                std::vector<double> lamd, nc2d;
+                bool ok_d = true;
+                if (!dns.empty()) {
+                    const int nd = (int) dns.size();
+                    Eigen::MatrixXd LD(nd, K);
+                    for (int r = 0; r < nd; ++r) LD.row(r) = L.row(dns[r]);
+                    Eigen::MatrixXd Sig = LD * Smat * LD.transpose();       // Cov of the dense scores
+                    Sig = (0.5 * (Sig + Sig.transpose())).eval();
+                    Eigen::VectorXd ad(nd), md(nd);
+                    for (int r = 0; r < nd; ++r) {
+                        const int j = dns[r];
+                        ad[r] = Tinv(c, comp_of[j]) * g[comp_of[j]];
+                        md[r] = dns_mean[r];
+                        qobs += ad[r] * U(j, t) * U(j, t);
+                    }
+                    const double sscale = Sig.diagonal().mean();
+                    Eigen::LLT<Eigen::MatrixXd> ch; double jit = 0.0; ok_d = false;
+                    for (int it = 0; it < 6; ++it) {
+                        Eigen::MatrixXd Sj = Sig; Sj.diagonal().array() += jit * sscale;
+                        ch.compute(Sj);
+                        if (ch.info() == Eigen::Success) { ok_d = true; break; }
+                        jit = (jit == 0.0) ? 1e-10 : jit * 100.0;
+                    }
+                    if (ok_d) {
+                        Eigen::MatrixXd Fd = ch.matrixL();
+                        Eigen::MatrixXd Bd = Fd.transpose() * ad.asDiagonal() * Fd;
+                        Bd = (0.5 * (Bd + Bd.transpose())).eval();
+                        Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Bd);
+                        if (es.info() != Eigen::Success) ok_d = false;
+                        else {
+                            Eigen::VectorXd nu = es.eigenvectors().transpose() *
+                                                 Fd.triangularView<Eigen::Lower>().solve(md);
+                            for (int r = 0; r < nd; ++r) {
+                                const double l = es.eigenvalues()[r];
+                                if (std::abs(l) < 1e-300) continue;
+                                lamd.push_back(l); nc2d.push_back(nu[r] * nu[r]);
+                            }
+                        }
+                    }
+                }
+                if (ok_d && (!terms.empty() || !lamd.empty())) {
+                    if (g_exact_capture && !g_exact_capture->done && c == 0) {
+                        g_exact_capture->T = terms; g_exact_capture->lam = lamd; g_exact_capture->nc2 = nc2d;
+                        g_exact_capture->C = Cc; g_exact_capture->q = qobs; g_exact_capture->done = true;
+                    }
+                    ExactSpaResult er = exact_spa_solve(qobs, terms, lamd, nc2d, Cc);
+                    // saddlepoint failed, or p small: lattice convolution (see exact_grid_solve)
+                    if (!terms.empty() && !er.exact &&
+                        (!er.converged || (one_sided ? er.p_up : std::min(er.p_up, er.p_lo)) < bx.grid_p)) {
+                        ExactSpaResult eg = exact_grid_solve(qobs, terms, lamd, nc2d, Cc);
+                        if (eg.converged) er = eg;
+                    }
+                    if (er.converged) {
+                        cr.p_spa[c][t] = one_sided ? er.p_up : std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo));
+                        cr.spa_used[c][t] = 5;
+                        continue;
+                    }
+                }
+            }
 
             // 4-cumulant path first: when it succeeds, none of the Cholesky of
             // Smat, the Cf products, or the eigensolve below is needed.
@@ -2201,7 +2781,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         if (fit_three_component(KQ, L3, N3)) {
                             QuadSpaResult q6 = quad_spa_solve(sigma[c], none, L3[0], N3[0],
                                                               100, 1e-8, L3[1], N3[1],
-                                                              L3[2], N3[2]);
+                                                              L3[2], N3[2], one_sided ? 1 : 0);
                             if (q6.converged) {
                                 cr.p_spa[c][t] = q6.p; cr.spa_used[c][t] = 3; used_cum4 = true;
                             }
@@ -2209,7 +2789,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         double l1, v1, l2, v2;
                         if (!used_cum4 && fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
                             QuadSpaResult q4 = quad_spa_solve(sigma[c], none, l1, v1,
-                                                              100, 1e-8, l2, v2);
+                                                              100, 1e-8, l2, v2, 0.0, 0.0, one_sided ? 1 : 0);
                             if (q4.converged) {
                                 cr.p_spa[c][t] = q4.p; cr.spa_used[c][t] = 2; used_cum4 = true;
                             }
@@ -2234,7 +2814,8 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 for (size_t e = 0; e < eig.size(); ++e) eig[e] *= cscale;
                 eig_rep_s *= cscale;
             }
-            QuadSpaResult qr = quad_spa_solve(sigma[c], eig, eig_rep_s, n_rep);
+            QuadSpaResult qr = quad_spa_solve(sigma[c], eig, eig_rep_s, n_rep, 100, 1e-8,
+                                              0.0, 0.0, 0.0, 0.0, one_sided ? 1 : 0);
             if (qr.converged) { cr.p_spa[c][t] = qr.p; cr.spa_used[c][t] = 1; }
             else              { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; }
         }
@@ -2252,6 +2833,7 @@ struct ChunkParams {
     bool spa; bool binary;
     double acatv_mac;          // variants with MAC below this are collapsed into a burden
     bool h2_raw;               // with loco_prs: vg / se / h2 from y itself, p-values from y - LOCO
+    bool one_sided;            // univariate tests: upper-tail p (variance components >= 0)
     int  cov_df;
     std::string out_file; int batch_size, n_threads;
     std::string chr;
@@ -2351,7 +2933,7 @@ struct Worker : public RcppParallel::Worker {
             for (size_t v = 0; v < S.size(); ++v)
                 test_chunk_annot(cd, gm, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
                                  pr.binary, spa, pr.coher, pr.pairs,
-                                 S[v].ycross, S[v].cb, out[v][w]);
+                                 S[v].ycross, S[v].cb, S[v].bx, pr.one_sided, out[v][w]);
             if (multi) {
                 // ---- ACAT over alpha ------------------------------------------
                 // V was read at alphas[0]. Another alpha only rescales columns:
@@ -2387,7 +2969,7 @@ struct Worker : public RcppParallel::Worker {
                             ChunkResultA tmp;
                             test_chunk_annot(ck, gk, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
                                              pr.binary, spa, pr.coher, pr.pairs,
-                                             S[v].ycross, S[v].cb, tmp);
+                                             S[v].ycross, S[v].cb, S[v].bx, pr.one_sided, tmp);
                             ChunkResultA& R = out[v][w];
                             for (size_t q = 0; q < R.p_alpha.size() && q < tmp.p_spa.size(); ++q)
                                 for (size_t t = 0; t < R.p_alpha[q].size() && t < tmp.p_spa[q].size(); ++t)
@@ -3062,12 +3644,16 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          double acatv_mac = 10,
                          int collapse_mac = 0,
                          bool h2_without_prs = true,
+                         bool one_sided = true,
+                         bool binary_exact = true,
+                         double exact_ec = 10,
                          Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                          double cov_df = NA_REAL,
                          bool SPA = true,
                          double spa_pval_threshold = NA_REAL,
                          bool binary = false,
                          Rcpp::Nullable<Rcpp::NumericMatrix> binary_raw = R_NilValue,
+                         Rcpp::Nullable<Rcpp::NumericMatrix> binary_pi = R_NilValue,
                          bool coher = false,
                          SEXP chr = R_NilValue,
                          std::string out_file = "",
@@ -3078,7 +3664,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: two-sided, always SPA, ACAT-V via KVIK, h2 without PRS, collapse_mac)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
@@ -3146,6 +3732,10 @@ Rcpp::List stratgwas_run(const std::string& filename,
     pr.max_window_chunks = max_window_chunks;
     pr.max_gene_snps = max_gene_snps; pr.min_gene_snps = min_gene_snps;
     pr.spa = SPA; pr.binary = binary; pr.acatv_mac = acatv_mac; pr.h2_raw = false;
+    pr.one_sided = one_sided;
+    if (SPA) Rcout << (one_sided ? "Variance-component p-values: one-sided (upper tail)."
+                                 : "Variance-component p-values: two-sided (from the median).")
+                   << (coher ? " Co-heritability p-values are always two-sided." : "") << "\n";
     if (!ISNAN(spa_pval_threshold))
         Rcout << "NOTE: spa_pval_threshold is no longer used -- every test now uses the saddlepoint.\n";
     pr.cov_df = ISNAN(cov_df) ? ((int) ctx.covZ.cols() + 1) : (int) cov_df;
@@ -3211,32 +3801,69 @@ Rcpp::List stratgwas_run(const std::string& filename,
         Rcout << "Co-heritability: " << pr.pairs.size() << " trait pair(s); vg = genetic covariance, "
               << "h2 = vg / sqrt(Vp1 Vp2), p_spa two-sided.\n";
     }
-    // ---- binary co-heritability inputs (exact conditional saddlepoint) ---------
-    if (coher && binary) {
-        if (binary_raw.isNull())
-            stop("binary = TRUE with coher = TRUE needs binary_raw (0/1 matrix, one column per trait)");
+    // ---- raw 0/1 phenotypes: binary co-heritability (required) and the exact ------
+    // ---- per-variant saddlepoint for single binary traits (optional) ----------------
+    if (coher && binary && binary_raw.isNull())
+        stop("binary = TRUE with coher = TRUE needs binary_raw (0/1 matrix, one column per trait)");
+    if (binary && binary_raw.isNotNull()) {
         Rcpp::NumericMatrix braw(binary_raw.get());
         if (braw.ncol() != P) stop("binary_raw must have one column per phenotype");
+        if (braw.nrow() != ctx.Y.rows() && braw.nrow() < 1) stop("binary_raw has no rows");
         const int n = ctx.n_inds;
         ctx.braw.assign(P, std::vector<unsigned char>(n, 0));
         ctx.prev.assign(P, 0.0); ctx.bdelta.assign(P, 0.0);
+        ctx.bpi.assign(P, std::vector<float>(n, 0.f)); ctx.ncase.assign(P, 0.0);
         for (int t = 0; t < P; ++t) {
-            double sumb = 0.0, bty = 0.0;
+            // y = delta * (b - mu): mu = covariate fit of the 0/1 trait. delta from y'y = delta b'y
+            // (exact for a least-squares residual of b, scaled or not).
+            double ym = 0.0;
+            for (int i = 0; i < n; ++i) ym += ctx.Y(i, t);
+            ym /= n;
+            double sumb = 0.0, bty = 0.0, yy = 0.0;
             for (int i = 0; i < n; ++i) {
                 const double v = braw(ctx.pheno_keep[i], t);
                 if (!(v == 0.0 || v == 1.0)) stop("binary_raw must contain only 0 and 1 (column %d)", t + 1);
-                ctx.braw[t][i] = (unsigned char) v; sumb += v; bty += v * ctx.Y(i, t);
+                const double yc = ctx.Y(i, t) - ym;
+                ctx.braw[t][i] = (unsigned char) v; sumb += v; bty += v * yc; yy += yc * yc;
             }
-            ctx.prev[t] = sumb / n;
+            ctx.prev[t] = sumb / n; ctx.ncase[t] = sumb;
             if (!(bty > 0.0)) stop("binary_raw column %d does not match the phenotype", t + 1);
-            ctx.bdelta[t] = (double)(n - 1) / bty;      // cancels in the p-value anyway
+            ctx.bdelta[t] = yy / bty;
+            // null P(case): the logistic null model when given (binary_pi, recommended: the
+            // linear fit below is clipped at 0 and makes the exact saddlepoint conservative
+            // when covariates predict the trait); otherwise the linear covariate fit of b.
+            for (int i = 0; i < n; ++i) {
+                double mu = (double) ctx.braw[t][i] - (ctx.Y(i, t) - ym) / ctx.bdelta[t];
+                if (mu < 1e-8) mu = 1e-8; if (mu > 1.0 - 1e-8) mu = 1.0 - 1e-8;
+                ctx.bpi[t][i] = (float) mu;
+            }
         }
-        Rcout << "Binary co-heritability: exact conditional Bernoulli saddlepoint; prevalences:";
-        for (int t = 0; t < P; ++t) Rcout << " " << ctx.prev[t];
-        Rcout << "\n";
+        if (binary_pi.isNotNull()) {
+            Rcpp::NumericMatrix bp(binary_pi.get());
+            if (bp.ncol() != P || bp.nrow() != braw.nrow()) stop("binary_pi must have the same dimensions as binary_raw");
+            for (int t = 0; t < P; ++t)
+                for (int i = 0; i < n; ++i) {
+                    double mu = bp(ctx.pheno_keep[i], t);
+                    if (!std::isfinite(mu) || mu < 0.0 || mu > 1.0) stop("binary_pi must contain probabilities (column %d)", t + 1);
+                    ctx.bpi[t][i] = (float) std::min(std::max(mu, 1e-8), 1.0 - 1e-8);
+                }
+        }
+        if (coher) {
+            Rcout << "Binary co-heritability: exact conditional Bernoulli saddlepoint; prevalences:";
+            for (int t = 0; t < P; ++t) Rcout << " " << ctx.prev[t];
+            Rcout << "\n";
+        }
+        if (!coher && SPA && binary_exact) {
+            ctx.bin_exact = true; ctx.car_max = 5000; ctx.ec_max = exact_ec;
+            Rcout << "Binary phenotype: exact per-variant saddlepoint (spa_used = 5): exact case-count "
+                  << "distribution for variants with <= " << exact_ec << " expected case carriers, "
+                  << "Gaussian for the rest, lattice convolution when p < 0.1; null P(case) from "
+                  << (binary_pi.isNotNull() ? "the logistic null model" : "the linear covariate fit (pass binary_pi)") << ".\n";
+        }
     }
-    if (binary && !coher)
-        Rcout << "Binary phenotype: 4th-cumulant variance correction + six-cumulant saddlepoint.\n";
+    if (binary && !coher && !ctx.bin_exact)
+        Rcout << "Binary phenotype: 4th-cumulant variance correction + six-cumulant saddlepoint"
+              << (binary_raw.isNull() ? " (pass binary_raw to use the exact per-variant saddlepoint)" : "") << ".\n";
 
     if (!Rf_isNull(chr)) {
         Rcpp::CharacterVector cs(Rf_coerceVector(chr, STRSXP));

@@ -19,18 +19,18 @@ sparrow(
   coher = FALSE,
   h2_without_prs = TRUE,
   prs_mask = NULL,
-  do_windows = FALSE,
+  do_windows = TRUE,
   chunk_size = 256,
   window_bp = 1e+06,
   max_window_chunks = 8,
   max_gene_snps = 512,
   min_gene_snps = 2,
   acatv_mac = 10,
+  collapse_mac = 0,
   spa = TRUE,
   chr = NULL,
   n_threads = 0,
-  batch_size = 64,
-  collapse_mac = 0
+  batch_size = 16
 )
 }
 \arguments{
@@ -67,7 +67,7 @@ Must be on the same genome build as the .bim.}
 \item{h2_without_prs}{With \code{loco_prs}: estimate h2 from y (TRUE) and use y - LOCO
 only for p-values. Recommended; see the supplement.}
 
-\item{prs_mask}{Categories x PRS sources; which full PRS is subtracted in
+\item{prs_mask}{Advanced. Categories x PRS sources; which full PRS is subtracted in
 the window pass. Default: 0 if h2_without_prs, else 1.}
 
 \item{do_windows}{Estimate ~1 Mb windows and report window-calibrated h2 (h2_adj).}
@@ -78,6 +78,10 @@ the window pass. Default: 0 if h2_without_prs, else 1.}
 \code{max_gene_snps} variants; genes with fewer than \code{min_gene_snps} are skipped.}
 
 \item{acatv_mac}{Variants with MAC below this are collapsed into a burden in ACAT-V.}
+
+\item{collapse_mac}{Variance-component test: variants with MAC <= collapse_mac are summed
+into one pseudo-variant per category of each gene (as SAIGE-GENE+). 0 = off (default).
+ACAT-V still uses all variants individually.}
 
 \item{spa}{Compute saddlepoint p-values (FALSE = estimates only, much faster).}
 
@@ -96,7 +100,7 @@ Estimates the heritability explained by genes / regions (per variant category)
 and tests it using a saddlepoint approximation. Phenotypes are matched to the
 genotypes by IID, covariates are regressed out of the phenotypes here (and out
 of the genotypes inside the C++ code), and all bookkeeping that used to be
-manual (cov_df, binary_raw, prs_mask) is done automatically.
+manual (cov_df, binary_raw, the logistic null model, prs_mask) is done automatically.
 }
 \examples{
 \donttest{

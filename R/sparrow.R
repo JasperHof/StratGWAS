@@ -4,7 +4,7 @@
 #' and tests it using a saddlepoint approximation. Phenotypes are matched to the
 #' genotypes by IID, covariates are regressed out of the phenotypes here (and out
 #' of the genotypes inside the C++ code), and all bookkeeping that used to be
-#' manual (cov_df, binary_raw, prs_mask) is done automatically.
+#' manual (cov_df, binary_raw, the logistic null model, prs_mask) is done automatically.
 #'
 #' @param filename PLINK prefix (.bed/.bim/.fam) holding rare variants and common SNPs.
 #' @param pheno Data frame or file: FID, IID, then one column per phenotype.
@@ -26,13 +26,16 @@
 #' @param coher TRUE to estimate co-heritability for all pairs of phenotypes.
 #' @param h2_without_prs With `loco_prs`: estimate h2 from y (TRUE) and use y - LOCO
 #'   only for p-values. Recommended; see the supplement.
-#' @param prs_mask Categories x PRS sources; which full PRS is subtracted in
+#' @param prs_mask Advanced. Categories x PRS sources; which full PRS is subtracted in
 #'   the window pass. Default: 0 if h2_without_prs, else 1.
 #' @param do_windows Estimate ~1 Mb windows and report window-calibrated h2 (h2_adj).
 #' @param chunk_size,window_bp,max_window_chunks Region and window sizes.
 #' @param max_gene_snps,min_gene_snps Genes are split into blocks of at most
 #'   `max_gene_snps` variants; genes with fewer than `min_gene_snps` are skipped.
 #' @param acatv_mac Variants with MAC below this are collapsed into a burden in ACAT-V.
+#' @param collapse_mac Variance-component test: variants with MAC <= collapse_mac are summed
+#'   into one pseudo-variant per category of each gene (as SAIGE-GENE+). 0 = off (default).
+#'   ACAT-V still uses all variants individually.
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -67,12 +70,11 @@ sparrow <- function(filename, pheno, out_file,
                     loco_prs = NULL, kvik_summaries = NULL,
                     binary = FALSE, coher = FALSE,
                     h2_without_prs = TRUE, prs_mask = NULL,
-                    do_windows = FALSE, chunk_size = 256, window_bp = 1e6,
+                    do_windows = TRUE, chunk_size = 256, window_bp = 1e6,
                     max_window_chunks = 8,
                     max_gene_snps = 512, min_gene_snps = 2,
-                    acatv_mac = 10, spa = TRUE, chr = NULL,
-                    n_threads = 0, batch_size = 64,
-                    collapse_mac = 0) {
+                    acatv_mac = 10, collapse_mac = 0, spa = TRUE, chr = NULL,
+                    n_threads = 0, batch_size = 16) {
 
   # ---- basic checks -----------------------------------------------------------
   for (ext in c(".bed", ".bim", ".fam"))
@@ -156,8 +158,20 @@ sparrow <- function(filename, pheno, out_file,
   rownames(Y) <- ids
   colnames(Y) <- traits
 
-  binary_raw <- NULL
-  if (binary && coher) { binary_raw <- B; rownames(binary_raw) <- ids }
+  # binary traits: the raw 0/1 values and the logistic null model P(case | covariates),
+  # used by the exact saddlepoint (padded values: b = 0, P(case) = 0, i.e. no information)
+  binary_raw <- binary_pi <- NULL
+  if (binary) {
+    binary_raw <- B; binary_raw[is.na(binary_raw)] <- 0
+    binary_pi <- matrix(0, n, P)
+    for (t in seq_len(P)) {
+      obs <- !is.na(B[, t])
+      fit <- suppressWarnings(stats::glm.fit(Z[obs, , drop = FALSE], B[obs, t], family = stats::binomial()))
+      if (!fit$converged) warning("Logistic null model did not converge for ", traits[t])
+      binary_pi[obs, t] <- fit$fitted.values
+    }
+    rownames(binary_raw) <- rownames(binary_pi) <- ids
+  }
 
   # ---- variant categories -------------------------------------------------------
   # A file (or data frame) with a header and one 0/1 column per category. If the first
@@ -233,11 +247,11 @@ sparrow <- function(filename, pheno, out_file,
     max_window_chunks = max_window_chunks,
     genes = genes, max_gene_snps = max_gene_snps, min_gene_snps = min_gene_snps,
     alpha = alpha, kvik_summaries = kvik_summaries, acatv_mac = acatv_mac,
+    collapse_mac = as.integer(collapse_mac),
     h2_without_prs = h2_without_prs,
     covariates = C, cov_df = cov_df,
-    SPA = spa, binary = binary, binary_raw = binary_raw, coher = coher,
-    chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads,
-    collapse_mac = collapse_mac)
+    SPA = spa, binary = binary, binary_raw = binary_raw, binary_pi = binary_pi, coher = coher,
+    chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
 
   files <- c(regions = out_file,
              genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA,
