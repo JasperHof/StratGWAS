@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <map>
 #include <unordered_map>
+#include <functional>
 
 using namespace Rcpp;
 
@@ -2578,11 +2579,21 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         // ---- exact binary SPA: the exact distribution of every SPARSE column's score ----
         // u_j = mu_j + delta * kappa_j * S_j, S_j = sum over carriers of dosage x case status.
         // A column is sparse when its expected number of case carriers is <= ec_max.
-        struct SpCol { int j; std::vector<double> u, lp; double u_obs; int sobs; };
+        // Sparse columns that SHARE carriers (MNP pieces, split multi-allelics, variants on
+        // one haplotype) are not independent: they are grouped (connected components of
+        // shared carriers) and each group gets ONE exact joint distribution. Within a group
+        // the carriers fall into "atoms" (individuals with the same dosage in every column of
+        // the group); the case counts of the atoms are independent Poisson-binomials and
+        // every S_j is a fixed combination of them, so the joint null is enumerated exactly
+        // (configurations with probability < 1e-14 are dropped). A group whose enumeration
+        // exceeds 50,000 configurations falls back to independent columns.
+        struct SpCol { std::vector<int> js; std::vector<double> U, lp, uobs; int obs; };   // U: npts x m
         std::vector<SpCol> spc; std::vector<int> dns; std::vector<double> dns_mean;
         if (use_exact) {
             const double dl = bx.delta[t], Ncase = bx.ncase[t];
             const std::vector<unsigned char>& bb = *bx.b[t];
+            struct ColP { int j; double mu, kap; };
+            std::vector<ColP> sp;
             for (int j = 0; j < K; ++j) {
                 const std::vector<int>& ci = cd.car[j];
                 const std::vector<unsigned char>& di = cd.dos[j];
@@ -2595,21 +2606,147 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 double scar = 0.0;
                 for (int r = 0; r < cn; ++r) scar += cd.V(ci[r], j);
                 const double xnc = (cd.colsum[j] - scar) / std::max(1, n - cn);   // non-carrier value
-                double num = 0.0, den = 0.0; int sobs = 0;
-                std::vector<double> pis(cn);
-                for (int r = 0; r < cn; ++r) {
-                    num += ((double) cd.V(ci[r], j) - xnc) * di[r]; den += (double) di[r] * di[r];
-                    if (bb[ci[r]]) sobs += di[r];
-                    pis[r] = bx.PiF(ci[r], t);
-                }
-                const double kap = num / den;
-                SpCol sc; sc.j = j;
+                double num = 0.0, den = 0.0;
+                for (int r = 0; r < cn; ++r) { num += ((double) cd.V(ci[r], j) - xnc) * di[r]; den += (double) di[r] * di[r]; }
+                ColP cp; cp.j = j; cp.kap = num / den; cp.mu = Ulo(j, t) + dl * xnc * Ncase;
+                sp.push_back(cp);
+            }
+            // single column: Poisson-binomial of S_j
+            auto add_single = [&](const ColP& cp) {
+                const std::vector<int>& ci = cd.car[cp.j];
+                const std::vector<unsigned char>& di = cd.dos[cp.j];
+                const int cn = (int) ci.size();
+                std::vector<double> pis(cn); int sobs = 0;
+                for (int r = 0; r < cn; ++r) { pis[r] = bx.PiF(ci[r], t); if (bb[ci[r]]) sobs += di[r]; }
+                SpCol sc; sc.js.assign(1, cp.j);
                 pb_pmf(di, pis, sc.lp);
                 if ((int) sc.lp.size() < sobs + 1) sc.lp.resize(sobs + 1, -1e300);   // keep the observation
-                const double mu = Ulo(j, t) + dl * xnc * Ncase;
-                sc.u.resize(sc.lp.size());
-                for (size_t q2 = 0; q2 < sc.u.size(); ++q2) sc.u[q2] = mu + dl * kap * (double) q2;
-                sc.u_obs = mu + dl * kap * (double) sobs; sc.sobs = sobs;
+                sc.U.resize(sc.lp.size());
+                for (size_t q2 = 0; q2 < sc.U.size(); ++q2) sc.U[q2] = cp.mu + dl * cp.kap * (double) q2;
+                sc.uobs.assign(1, cp.mu + dl * cp.kap * (double) sobs); sc.obs = sobs;
+                spc.push_back(sc);
+            };
+            // connected components of shared carriers (union-find)
+            const int ns = (int) sp.size();
+            std::vector<int> par(ns);
+            for (int a = 0; a < ns; ++a) par[a] = a;
+            auto fnd = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+            {
+                // two columns are joined when their case counts are strongly correlated:
+                // corr(S_j, S_k) = sum_shared d_j d_k / sqrt(sum d_j^2 sum d_k^2) >= 0.3 (identical
+                // or nested carrier sets). Edges are added strongest first and a group is capped
+                // at 16 columns, so chance overlaps cannot chain whole genes together.
+                std::unordered_map<int, std::vector<std::pair<int, unsigned char> > > owner;
+                std::vector<double> ss(ns, 0.0);
+                for (int a = 0; a < ns; ++a) {
+                    const int j = sp[a].j;
+                    for (size_t r = 0; r < cd.car[j].size(); ++r) {
+                        owner[cd.car[j][r]].push_back(std::make_pair(a, cd.dos[j][r]));
+                        ss[a] += (double) cd.dos[j][r] * cd.dos[j][r];
+                    }
+                }
+                std::map<std::pair<int, int>, double> shared;
+                for (std::unordered_map<int, std::vector<std::pair<int, unsigned char> > >::iterator it = owner.begin();
+                     it != owner.end(); ++it) {
+                    const std::vector<std::pair<int, unsigned char> >& L2 = it->second;
+                    for (size_t x = 0; x < L2.size(); ++x)
+                        for (size_t y = x + 1; y < L2.size(); ++y)
+                            shared[std::make_pair(std::min(L2[x].first, L2[y].first), std::max(L2[x].first, L2[y].first))]
+                                += (double) L2[x].second * L2[y].second;
+                }
+                std::vector< std::pair<double, std::pair<int, int> > > edges;
+                for (std::map<std::pair<int, int>, double>::iterator it = shared.begin(); it != shared.end(); ++it) {
+                    const double rho = it->second / std::sqrt(ss[it->first.first] * ss[it->first.second]);
+                    if (rho >= 0.3) edges.push_back(std::make_pair(-rho, it->first));
+                }
+                std::sort(edges.begin(), edges.end());
+                std::vector<int> gsz(ns, 1);
+                for (size_t e2 = 0; e2 < edges.size(); ++e2) {
+                    const int r1 = fnd(edges[e2].second.first), r2 = fnd(edges[e2].second.second);
+                    if (r1 == r2 || gsz[r1] + gsz[r2] > 16) continue;
+                    par[r1] = r2; gsz[r2] += gsz[r1];
+                }
+            }
+            std::map<int, std::vector<int> > grp;
+            for (int a = 0; a < ns; ++a) grp[fnd(a)].push_back(a);
+            for (std::map<int, std::vector<int> >::iterator gi = grp.begin(); gi != grp.end(); ++gi) {
+                const std::vector<int>& mem = gi->second;
+                if (mem.size() == 1) { add_single(sp[mem[0]]); continue; }
+                const int m = (int) mem.size();
+                // atoms: carriers with the same dosage vector over the group's columns
+                std::map<int, std::vector<unsigned char> > dv;
+                for (int k = 0; k < m; ++k) {
+                    const int j = sp[mem[k]].j;
+                    for (size_t r = 0; r < cd.car[j].size(); ++r) {
+                        std::vector<unsigned char>& v = dv[cd.car[j][r]];
+                        if (v.empty()) v.assign(m, 0);
+                        v[k] = cd.dos[j][r];
+                    }
+                }
+                std::map<std::vector<unsigned char>, int> pat;
+                std::vector< std::vector<unsigned char> > apat; std::vector< std::vector<double> > api; std::vector<int> aobs;
+                for (std::map<int, std::vector<unsigned char> >::iterator it = dv.begin(); it != dv.end(); ++it) {
+                    std::map<std::vector<unsigned char>, int>::iterator pt = pat.find(it->second);
+                    int a;
+                    if (pt == pat.end()) { a = (int) apat.size(); pat[it->second] = a; apat.push_back(it->second); api.push_back(std::vector<double>()); aobs.push_back(0); }
+                    else a = pt->second;
+                    api[a].push_back(bx.PiF(it->first, t));
+                    if (bb[it->first]) ++aobs[a];
+                }
+                const int na = (int) apat.size();
+                std::vector< std::vector<double> > alp(na);
+                std::vector<double> amax(na + 1, 0.0);
+                for (int a = 0; a < na; ++a) {
+                    std::vector<unsigned char> ones(api[a].size(), 1);
+                    pb_pmf(ones, api[a], alp[a]);
+                    if ((int) alp[a].size() < aobs[a] + 1) alp[a].resize(aobs[a] + 1, -1e300);
+                }
+                for (int a = na - 1; a >= 0; --a) {
+                    double mx = -1e300; for (double v : alp[a]) mx = std::max(mx, v);
+                    amax[a] = amax[a + 1] + mx;                      // best case for atoms a..na-1
+                }
+                const double LMIN = std::log(1e-14);
+                const size_t CAP = 50000;
+                SpCol sc; sc.js.resize(m); sc.obs = -1;
+                for (int k = 0; k < m; ++k) sc.js[k] = sp[mem[k]].j;
+                std::vector<int> cnt(na, 0); std::vector<double> Sk(m, 0.0);
+                bool over = false;
+                // depth-first enumeration of the atom case counts, pruned on probability
+                std::function<void(int, double)> rec = [&](int a, double lp) {
+                    if (over) return;
+                    if (a == na) {
+                        if (sc.lp.size() >= CAP) { over = true; return; }
+                        bool isobs = true;
+                        for (int b = 0; b < na; ++b) if (cnt[b] != aobs[b]) { isobs = false; break; }
+                        if (isobs) sc.obs = (int) sc.lp.size();
+                        sc.lp.push_back(lp);
+                        for (int k = 0; k < m; ++k) sc.U.push_back(sp[mem[k]].mu + dl * sp[mem[k]].kap * Sk[k]);
+                        return;
+                    }
+                    for (int c2 = 0; c2 < (int) alp[a].size(); ++c2) {
+                        const double l2 = lp + alp[a][c2];
+                        if (l2 + amax[a + 1] < LMIN) continue;
+                        cnt[a] = c2;
+                        for (int k = 0; k < m; ++k) Sk[k] += (double) apat[a][k] * c2;
+                        rec(a + 1, l2);
+                        for (int k = 0; k < m; ++k) Sk[k] -= (double) apat[a][k] * c2;
+                        if (over) return;
+                    }
+                    cnt[a] = 0;
+                };
+                rec(0, 0.0);
+                if (over || sc.lp.empty()) { for (int k = 0; k < m; ++k) add_single(sp[mem[k]]); continue; }
+                std::vector<double> So(m, 0.0); double lpo = 0.0;
+                for (int a = 0; a < na; ++a) {
+                    lpo += alp[a][aobs[a]];
+                    for (int k = 0; k < m; ++k) So[k] += (double) apat[a][k] * aobs[a];
+                }
+                sc.uobs.resize(m);
+                for (int k = 0; k < m; ++k) sc.uobs[k] = sp[mem[k]].mu + dl * sp[mem[k]].kap * So[k];
+                if (sc.obs < 0) {                                    // observation was pruned: keep it
+                    sc.obs = (int) sc.lp.size(); sc.lp.push_back(std::max(lpo, -1e300));
+                    for (int k = 0; k < m; ++k) sc.U.push_back(sc.uobs[k]);
+                }
                 spc.push_back(sc);
             }
         }
@@ -2652,12 +2789,15 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 double qobs = Cc;
                 std::vector<ExactTerm> terms; terms.reserve(spc.size());
                 for (size_t r = 0; r < spc.size(); ++r) {
-                    const int j = spc[r].j;
-                    const double aj = Tinv(c, comp_of[j]) * g[comp_of[j]];
-                    if (aj == 0.0) continue;
-                    ExactTerm e; e.lp = spc[r].lp; e.v.resize(spc[r].u.size()); e.obs = spc[r].sobs;
-                    for (size_t q2 = 0; q2 < e.v.size(); ++q2) e.v[q2] = aj * spc[r].u[q2] * spc[r].u[q2];
-                    qobs += aj * spc[r].u_obs * spc[r].u_obs;
+                    const SpCol& sc = spc[r];
+                    const int m = (int) sc.js.size();
+                    std::vector<double> ak(m); bool any = false;
+                    for (int k = 0; k < m; ++k) { ak[k] = Tinv(c, comp_of[sc.js[k]]) * g[comp_of[sc.js[k]]]; if (ak[k] != 0.0) any = true; }
+                    if (!any) continue;
+                    ExactTerm e; e.lp = sc.lp; e.v.assign(sc.lp.size(), 0.0); e.obs = sc.obs;
+                    for (size_t q2 = 0; q2 < e.v.size(); ++q2)
+                        for (int k = 0; k < m; ++k) { const double u = sc.U[q2 * m + k]; e.v[q2] += ak[k] * u * u; }
+                    for (int k = 0; k < m; ++k) qobs += ak[k] * sc.uobs[k] * sc.uobs[k];
                     terms.push_back(e);
                 }
                 std::vector<double> lamd, nc2d;

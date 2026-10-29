@@ -77,6 +77,7 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   for(k in 1:K_tot) {
     multi_matched[, k] <- multi[match(fam_ids, ids), k]
   }
+  multi_matched_raw <- multi_matched
 
   # Scale phenotypes while preserving missing values
   for (k in 1:K_tot) {
@@ -174,11 +175,33 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
 
   gencov <- matrix(NA, nrow = K_tot, ncol = K_tot)
   rownames(gencov) <- colnames(gencov) <- colnames(multi)
-  ldscores <- lds$Tagging[match(ss_list[[1]]$Predictor, lds$Predictor)]
+
+  # Harmonize SNPs across all strata and LD scores
+  lds <- as.data.frame(lds)
+  colnames(lds)[1:2] <- c("Predictor", "Tagging")      # use columns by position, as documented
+  lds <- lds[!is.na(lds$Tagging) & !duplicated(lds$Predictor), ]
+
+  common <- Reduce(intersect, c(lapply(ss_list, function(x) x$Predictor), list(lds$Predictor)))
+  ref <- ss_list[[1]]
+  ref <- ref[ref$Predictor %in% common & !duplicated(ref$Predictor) & ref$MAF > 0, ]
+  if (all(c("Chromosome", "Basepair") %in% colnames(ref)))
+    ref <- ref[order(ref$Chromosome, ref$Basepair), ]   # genomic order -> valid jackknife blocks
+  snp_order <- ref$Predictor
+
+  if (length(snp_order) == 0)
+    stop("No SNPs shared between all strata and the LD scores - check that SNP IDs use the same format (e.g. rsID vs chr:pos)")
+  cat(sprintf("Using %d SNPs present in all %d strata and in the LD scores\n",
+              length(snp_order), K_tot))
+
+  ss_list  <- lapply(ss_list, function(x) x[match(snp_order, x$Predictor), ])
+  ldscores <- lds$Tagging[match(snp_order, lds$Predictor)]
 
   # Use SumHer implementation for genetic correlations
-  jack_ests <- vector("list", B)
-  for (b in 1:B) jack_ests[[b]] = matrix(NA, K_tot, K_tot)
+  jack_ests <- NULL
+  if (jack) {
+    jack_ests <- vector("list", B)
+    for (b in 1:B) jack_ests[[b]] <- matrix(NA, K_tot, K_tot)
+  }
 
   for (i in 1:K_tot) {
     for (j in i:K_tot) {
@@ -238,6 +261,9 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
     }
   }
 
+  if (jack && any(sapply(jack_ests, function(m) any(is.na(m)))))
+    warning("Some jackknife estimates are NA - check for strata with very few cases")
+
   if (jack == TRUE) {
     for (b in 1:B){
       rownames(jack_ests[[b]]) <- colnames(jack_ests[[b]]) <- colnames(multi)
@@ -291,13 +317,14 @@ compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
   }
   
   # Compute liability scale heritabilities + SE
-  prevs <- colMeans(multi_matched > 0, na.rm = T)
+  prevs <- colMeans(multi_matched_raw > 0, na.rm = TRUE)
   t <- qnorm(1 - prevs)
   z <- dnorm(t)
 
   hers_liab <- hers * (prevs * (1 - prevs)) / z^2
   hers_liab_se <- hers_se * (prevs * (1 - prevs)) / z^2
   hers_all <- data.frame("h2_obs" = hers, "h2_obs_SE" = hers_se, "h2_liab" = hers_liab, "h2_liab_SE" = hers_liab_se)
+  rownames(hers_all) <- colnames(multi)
   hers_all[rownames(hers_all) %in% paste0("continuous_", 1:100), c("h2_liab", "h2_liab_SE")] <- NA
 
   # Adjust cohers dataframe

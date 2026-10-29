@@ -14,6 +14,9 @@ sumher <- function(ss, ldscores,
                    max_iter = 100,
                    alpha = -0.25) {
 
+  if (nrow(ss) != length(ldscores))
+    stop("Summary statistics and LD scores differ in length - align SNPs first")
+
   M <- length(ldscores)
   N <- ss$N
   N_mean <- mean(ss$N)
@@ -293,6 +296,8 @@ sumher_cov <- function(ss1, ss2, ldscores,
   
   converged <- FALSE
   iter <- 0
+  singular_count <- 0
+  max_singular <- 3
   
   while (iter < max_iter && !converged) {
     iter <- iter + 1
