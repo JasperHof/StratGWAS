@@ -105,7 +105,7 @@ manual (cov_df, binary_raw, the logistic null model, prs_mask) is done automatic
 \examples{
 \donttest{
 # example data shipped with the package
-dir <- system.file("data", package = "StratGWAS")
+dir <- system.file("extdata", package = "StratGWAS")
 
 res <- sparrow(filename       = file.path(dir, "data"),
                pheno          = file.path(dir, "pheno_quant"),
