@@ -17,7 +17,9 @@
 #'   in strata$multi
 #' @param alpha Selection parameter for dependency MAF on SNP heritability (default: -0.25)
 #' @param jack Logical specifying whether jack-knife estimates are used to compute h2 standard errors (default: FALSE)
-#' @param B Number of jackknife blocks for standard error of genetic covariance (default 100)
+#' @param B Number of jackknife blocks for standard error of genetic covariance (default: 50)
+#' @param cov Optional: covariates in PLINK format (FID, IID, then covariates). Missing values
+#'   are imputed by the column mean, and covariates are regressed out of each stratum before the GWAS.
 #'
 #' @return Returns a list containing:
 #'   \item{gencov}{Genetic covariance matrix between strata}

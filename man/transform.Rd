@@ -12,6 +12,12 @@ transform(strata, gencov, outfile, spar = 0.8, smooth = TRUE)
 \item{gencov}{Genetic covariance object returned by \code{\link{compute_gencov}}}
 
 \item{outfile}{Name/path prefix for output files}
+
+\item{spar}{Smoothing parameter passed to \code{\link[stats]{smooth.spline}} when smoothing the
+weights of continuous stratification variables (default: 0.8)}
+
+\item{smooth}{Logical; smooth the weights of continuous variables across strata (requires K > 3;
+default: TRUE)}
 }
 \value{
 Returns a list containing:

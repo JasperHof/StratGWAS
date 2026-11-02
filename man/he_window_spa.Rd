@@ -32,6 +32,56 @@ he_window_spa(
   acatv_mac = 10
 )
 }
+\arguments{
+\item{filename}{PLINK prefix (.bed/.bim/.fam) holding the variants}
+
+\item{pheno}{Data frame: FID, IID, then one column per phenotype}
+
+\item{out_file}{Output prefix}
+
+\item{annotation}{Optional 0/1 integer matrix, one row per .bim variant and one column per category}
+
+\item{annot_names}{Optional category names}
+
+\item{loco_prs}{Optional matrix of LDAK-KVIK Step 1 \code{.loco.prs} files}
+
+\item{prs_mask}{Optional categories x PRS sources matrix: which full PRS is subtracted}
+
+\item{chunk_size, window_bp, max_window_chunks}{Region and window sizes}
+
+\item{do_windows}{Also estimate ~1 Mb windows (default: TRUE)}
+
+\item{alpha}{Heritability model(s) tested (default: -1)}
+
+\item{covariates}{Optional numeric covariate matrix}
+
+\item{cov_df}{Degrees of freedom used by covariates (NA = determined automatically)}
+
+\item{SPA}{Compute saddlepoint p-values (default: TRUE)}
+
+\item{spa_pval_threshold}{Apply SPA only to tests with p-values below this threshold}
+
+\item{binary}{TRUE if the phenotypes are binary}
+
+\item{binary_raw}{Optional matrix of the raw 0/1 phenotypes (for binary traits)}
+
+\item{coher}{TRUE to estimate co-heritability for all pairs of phenotypes}
+
+\item{chr}{Optional single chromosome to analyse}
+
+\item{batch_size}{Units per parallel batch}
+
+\item{n_threads}{Number of threads (0 = RcppParallel default)}
+
+\item{genes}{Optional gene definitions: gene, chr, start, end}
+
+\item{kvik_summaries}{Optional LDAK-KVIK Step 2 \code{.summaries} files}
+
+\item{acatv_mac}{Variants with MAC below this are collapsed into a burden in ACAT-V}
+}
+\value{
+NULL; results are written to \code{out_file}
+}
 \description{
-SPA solver for HE-based variance components with correction
+Development version of \code{\link{sparrow}}; prefer \code{sparrow()} for new analyses.
 }

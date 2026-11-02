@@ -6,7 +6,7 @@
 #' @param tol Convergence tolerance (default 1e-6)
 #' @param max_iter Maximum iterations (default 100)
 #' @param alpha Selection parameter for MAF
-#' @param B Number of jackknife blocks (default 100)
+#' @param B Number of jackknife blocks (default: 100)
 #' @return List with heritability estimates and likelihood
 #' @export
 sumher_jack <- function(ss, ldscores, 
@@ -53,13 +53,14 @@ sumher_jack <- function(ss, ldscores,
 
 #' Jackknife for estimating SE of covariance
 #'
-#' @param ss Summary statistics data.frame with columns: SNP, N, Chisq
+#' @param ss1 Summary statistics for trait 1 (see \code{\link{sumher_cov}})
+#' @param ss2 Summary statistics for trait 2, same SNPs and order as `ss1`
 #' @param ldscores Numeric vector of LD scores
 #' @param fit_intercept Logical, whether to fit intercept (default TRUE)
 #' @param tol Convergence tolerance (default 1e-6)
 #' @param max_iter Maximum iterations (default 100)
 #' @param alpha Selection parameter for MAF
-#' @param B Number of jackknife blocks (default 100)
+#' @param B Number of jackknife blocks (default: 100)
 #' @return List with heritability estimates and likelihood
 #' @export
 sumher_cov_jack <- function(ss1, ss2, ldscores,

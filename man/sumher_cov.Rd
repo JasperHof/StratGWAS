@@ -18,9 +18,10 @@ sumher_cov(
 )
 }
 \arguments{
-\item{ss1}{Summary statistics for trait 1: data.frame with SNP, N, Z}
+\item{ss1}{Summary statistics for trait 1: data.frame with columns Predictor, N, BETA, SE,
+Chisq and MAF (same SNPs and order as \code{ldscores})}
 
-\item{ss2}{Summary statistics for trait 2: data.frame with SNP, N, Z}
+\item{ss2}{Summary statistics for trait 2, in the same format and SNP order as \code{ss1}}
 
 \item{ldscores}{Numeric vector of LD scores}
 
@@ -35,6 +36,8 @@ sumher_cov(
 \item{tol}{Convergence tolerance (default 1e-6)}
 
 \item{max_iter}{Maximum iterations (default 100)}
+
+\item{alpha}{Selection parameter for the dependency of SNP heritability on MAF (default: -0.25)}
 }
 \value{
 List with genetic correlation and covariance estimates

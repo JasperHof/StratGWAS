@@ -5,8 +5,8 @@
 \title{Fit elastic net model}
 \usage{
 elastic(
-  filename = filename,
-  pheno_mat = pheno_mat,
+  filename,
+  pheno_mat,
   h2 = 0.3,
   alpha_param = -0.25,
   p_en = 0.1,
@@ -16,6 +16,27 @@ elastic(
   max_scans = 10
 )
 }
+\arguments{
+\item{filename}{PLINK prefix (.bed/.bim/.fam) of the genotype data}
+
+\item{pheno_mat}{Numeric matrix of phenotypes (one column per phenotype), with IIDs as rownames}
+
+\item{h2}{Assumed SNP heritability (default: 0.3)}
+
+\item{alpha_param}{Selection parameter for the dependency of SNP heritability on MAF (default: -0.25)}
+
+\item{p_en, F_en}{Elastic-net prior hyperparameters: proportion of SNPs in the large-effect
+component, and the fraction of heritability they explain (defaults: 0.1 and 0.5)}
+
+\item{chunk_size}{Number of SNPs read per block (default: 256)}
+
+\item{tol}{Convergence tolerance (default: 1e-6)}
+
+\item{max_scans}{Maximum number of passes through the data (default: 10)}
+}
+\value{
+List returned by the C++ elastic-net solver
+}
 \description{
-Development version
+Development version: fits a variational Bayes elastic-net polygenic score.
 }

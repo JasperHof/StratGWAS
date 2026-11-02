@@ -4,12 +4,19 @@
 \alias{scores}
 \title{Compute polygenic scores}
 \usage{
-scores(
-  filename = filename,
-  snp_input = snp,
-  beta_input = beta,
-  block_size = 256
-)
+scores(filename, snp_input, beta_input, block_size = 256)
+}
+\arguments{
+\item{filename}{PLINK prefix (.bed/.bim/.fam) of the genotype data}
+
+\item{snp_input}{Character vector of SNP IDs}
+
+\item{beta_input}{Numeric vector of effect sizes, in the same order as \code{snp_input}}
+
+\item{block_size}{Number of SNPs read per block (default: 256)}
+}
+\value{
+Data frame with a polygenic score per individual
 }
 \description{
 Compute polygenic scores

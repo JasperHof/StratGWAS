@@ -26,6 +26,9 @@ compute_gencov(
 
 \item{outfile}{Name/path prefix for output files}
 
+\item{cov}{Optional: covariates in PLINK format (FID, IID, then covariates). Missing values
+are imputed by the column mean, and covariates are regressed out of each stratum before the GWAS.}
+
 \item{lds}{Optional: data frame containing LD scores. The first column should contain
 SNP IDs, while the second column contains LD scores. If NULL, LD scores will be
 computed from genotype data (using a random subset of 1000 individuals if N > 1000).}
@@ -37,7 +40,7 @@ in strata$multi}
 
 \item{jack}{Logical specifying whether jack-knife estimates are used to compute h2 standard errors (default: FALSE)}
 
-\item{B}{Number of jackknife blocks for standard error of genetic covariance (default 100)}
+\item{B}{Number of jackknife blocks for standard error of genetic covariance (default: 50)}
 }
 \value{
 Returns a list containing:

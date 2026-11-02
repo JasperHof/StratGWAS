@@ -19,16 +19,14 @@ LinkingTo: Rcpp, RcppEigen, RcppParallel
 Imports: 
     Rcpp,
     RcppParallel,
-    Matrix
+    stats,
+    utils
 SystemRequirements: GNU make
 Depends: 
     R (>= 3.5)
 LazyData: true
 Suggests: 
-    knitr,
-    rmarkdown,
     testthat (>= 3.0.0)
-VignetteBuilder: knitr
 Config/testthat/edition: 3
 URL: https://github.com/JasperHof/StratGWAS
 BugReports: https://github.com/JasperHof/StratGWAS/issues

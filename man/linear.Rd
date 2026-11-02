@@ -20,6 +20,9 @@ transformed phenotype and associated weights}
 and covariate columns). Missing covariate values will be imputed to their
 column means. Covariates will be regressed out of the transformed phenotype
 before GWAS analysis.}
+
+\item{alpha}{Selection parameter for the dependency of SNP heritability on MAF, used for the
+global inflation criterion (default: -0.25)}
 }
 \value{
 GWAS results are written to \if{html}{\out{<outfile>}}.assoc

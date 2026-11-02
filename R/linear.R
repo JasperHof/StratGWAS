@@ -17,6 +17,9 @@
 #'   column means. Covariates will be regressed out of the transformed phenotype
 #'   before GWAS analysis.
 #'
+#' @param alpha Selection parameter for the dependency of SNP heritability on MAF, used for the
+#'   global inflation criterion (default: -0.25)
+#'
 #' @return GWAS results are written to <outfile>.assoc
 #'
 #' @examples
@@ -115,9 +118,9 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL,
   cat(sprintf("GWAS completed. Results written to %s\n\n", outfile_trans))
 
   # Now compute the global inflation criterion
-  gwas_trans <- read.table(outfile_trans, head = T)
-  gwas_casecontrol <- read.table(paste0(outfile, ".pheno1"), head = T)
-  ldscores <- read.table(paste0(outfile, ".ldscores"), head = T)
+  gwas_trans <- read.table(outfile_trans, header = TRUE)
+  gwas_casecontrol <- read.table(paste0(outfile, ".pheno1"), header = TRUE)
+  ldscores <- read.table(paste0(outfile, ".ldscores"), header = TRUE)
 
   # Reduce to common first
   common <- Reduce(intersect, list(gwas_casecontrol$Predictor, gwas_trans$Predictor, ldscores$Predictor))

@@ -16,6 +16,10 @@ sumher_cov_jack(
 )
 }
 \arguments{
+\item{ss1}{Summary statistics for trait 1 (see \code{\link{sumher_cov}})}
+
+\item{ss2}{Summary statistics for trait 2, same SNPs and order as \code{ss1}}
+
 \item{ldscores}{Numeric vector of LD scores}
 
 \item{fit_intercept}{Logical, whether to fit intercept (default TRUE)}
@@ -26,9 +30,7 @@ sumher_cov_jack(
 
 \item{alpha}{Selection parameter for MAF}
 
-\item{B}{Number of jackknife blocks (default 100)}
-
-\item{ss}{Summary statistics data.frame with columns: SNP, N, Chisq}
+\item{B}{Number of jackknife blocks (default: 100)}
 }
 \value{
 List with heritability estimates and likelihood

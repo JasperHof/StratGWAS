@@ -1,11 +1,12 @@
 #' Implementation of SumHer for estimating SNP Heritability
 #'
-#' @param ss Summary statistics data.frame with columns: SNP, N, Chisq
+#' @param ss Summary statistics data.frame with columns N, Chisq and MAF (one row per SNP,
+#'   in the same order as `ldscores`)
 #' @param ldscores Numeric vector of LD scores
 #' @param fit_intercept Logical, whether to fit intercept (default TRUE)
 #' @param tol Convergence tolerance (default 1e-6)
 #' @param max_iter Maximum iterations (default 100)
-#' @param weights Optional weights (default: 1/ldscores)
+#' @param alpha Selection parameter for the dependency of SNP heritability on MAF (default: -0.25)
 #' @return List with heritability estimates and likelihood
 #' @export
 sumher <- function(ss, ldscores,
@@ -187,8 +188,9 @@ sumher <- function(ss, ldscores,
 
 #' Implementation of SumHer for estimating genetic covariance
 #'
-#' @param ss1 Summary statistics for trait 1: data.frame with SNP, N, Z
-#' @param ss2 Summary statistics for trait 2: data.frame with SNP, N, Z
+#' @param ss1 Summary statistics for trait 1: data.frame with columns Predictor, N, BETA, SE,
+#'   Chisq and MAF (same SNPs and order as `ldscores`)
+#' @param ss2 Summary statistics for trait 2, in the same format and SNP order as `ss1`
 #' @param ldscores Numeric vector of LD scores
 #' @param h2_1 Heritability estimate for trait 1 (optional, will estimate if NULL)
 #' @param h2_2 Heritability estimate for trait 2 (optional, will estimate if NULL)
@@ -196,6 +198,7 @@ sumher <- function(ss, ldscores,
 #' @param fit_intercept Logical, fit intercept for overlap (default TRUE)
 #' @param tol Convergence tolerance (default 1e-6)
 #' @param max_iter Maximum iterations (default 100)
+#' @param alpha Selection parameter for the dependency of SNP heritability on MAF (default: -0.25)
 #' @return List with genetic correlation and covariance estimates
 #' @export
 sumher_cov <- function(ss1, ss2, ldscores,

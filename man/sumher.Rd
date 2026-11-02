@@ -14,7 +14,8 @@ sumher(
 )
 }
 \arguments{
-\item{ss}{Summary statistics data.frame with columns: SNP, N, Chisq}
+\item{ss}{Summary statistics data.frame with columns N, Chisq and MAF (one row per SNP,
+in the same order as \code{ldscores})}
 
 \item{ldscores}{Numeric vector of LD scores}
 
@@ -24,7 +25,7 @@ sumher(
 
 \item{max_iter}{Maximum iterations (default 100)}
 
-\item{weights}{Optional weights (default: 1/ldscores)}
+\item{alpha}{Selection parameter for the dependency of SNP heritability on MAF (default: -0.25)}
 }
 \value{
 List with heritability estimates and likelihood

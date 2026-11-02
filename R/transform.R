@@ -10,6 +10,10 @@
 #' @param strata Object returned from \code{\link{stratify}}
 #' @param gencov Genetic covariance object returned by \code{\link{compute_gencov}}
 #' @param outfile Name/path prefix for output files
+#' @param spar Smoothing parameter passed to \code{\link[stats]{smooth.spline}} when smoothing the
+#'   weights of continuous stratification variables (default: 0.8)
+#' @param smooth Logical; smooth the weights of continuous variables across strata (requires K > 3;
+#'   default: TRUE)
 #'   
 #' @return Returns a list containing:
 #'   \item{transformed_pheno}{Data frame with FID, IID, and transformed phenotype values}
