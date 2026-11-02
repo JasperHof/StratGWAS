@@ -75,6 +75,11 @@ SumHer. This is the second step in the StratGWAS workflow.</p>
 <dd><p>Name/path prefix for output files</p></dd>
 
 
+<dt id="arg-cov">cov<a class="anchor" aria-label="anchor" href="#arg-cov"></a></dt>
+<dd><p>Optional: covariates in PLINK format (FID, IID, then covariates). Missing values
+are imputed by the column mean, and covariates are regressed out of each stratum before the GWAS.</p></dd>
+
+
 <dt id="arg-lds">lds<a class="anchor" aria-label="anchor" href="#arg-lds"></a></dt>
 <dd><p>Optional: data frame containing LD scores. The first column should contain
 SNP IDs, while the second column contains LD scores. If NULL, LD scores will be
@@ -95,7 +100,7 @@ in strata$multi</p></dd>
 
 
 <dt id="arg-b">B<a class="anchor" aria-label="anchor" href="#arg-b"></a></dt>
-<dd><p>Number of jackknife blocks for standard error of genetic covariance (default 100)</p></dd>
+<dd><p>Number of jackknife blocks for standard error of genetic covariance (default: 50)</p></dd>
 
 </dl></div>
     <div class="section level2">

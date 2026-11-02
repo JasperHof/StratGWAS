@@ -53,7 +53,8 @@
 
 
 <dl><dt id="arg-ss">ss<a class="anchor" aria-label="anchor" href="#arg-ss"></a></dt>
-<dd><p>Summary statistics data.frame with columns: SNP, N, Chisq</p></dd>
+<dd><p>Summary statistics data.frame with columns N, Chisq and MAF (one row per SNP,
+in the same order as <code>ldscores</code>)</p></dd>
 
 
 <dt id="arg-ldscores">ldscores<a class="anchor" aria-label="anchor" href="#arg-ldscores"></a></dt>
@@ -72,8 +73,8 @@
 <dd><p>Maximum iterations (default 100)</p></dd>
 
 
-<dt id="arg-weights">weights<a class="anchor" aria-label="anchor" href="#arg-weights"></a></dt>
-<dd><p>Optional weights (default: 1/ldscores)</p></dd>
+<dt id="arg-alpha">alpha<a class="anchor" aria-label="anchor" href="#arg-alpha"></a></dt>
+<dd><p>Selection parameter for the dependency of SNP heritability on MAF (default: -0.25)</p></dd>
 
 </dl></div>
     <div class="section level2">

@@ -19,6 +19,14 @@ sumher_cov_jack(
 
 ## Arguments
 
+- ss1:
+
+  Summary statistics for trait 1 (see [`sumher_cov`](sumher_cov.md))
+
+- ss2:
+
+  Summary statistics for trait 2, same SNPs and order as `ss1`
+
 - ldscores:
 
   Numeric vector of LD scores
@@ -41,11 +49,7 @@ sumher_cov_jack(
 
 - B:
 
-  Number of jackknife blocks (default 100)
-
-- ss:
-
-  Summary statistics data.frame with columns: SNP, N, Chisq
+  Number of jackknife blocks (default: 100)
 
 ## Value
 

@@ -23,11 +23,13 @@ sumher_cov(
 
 - ss1:
 
-  Summary statistics for trait 1: data.frame with SNP, N, Z
+  Summary statistics for trait 1: data.frame with columns Predictor, N,
+  BETA, SE, Chisq and MAF (same SNPs and order as `ldscores`)
 
 - ss2:
 
-  Summary statistics for trait 2: data.frame with SNP, N, Z
+  Summary statistics for trait 2, in the same format and SNP order as
+  `ss1`
 
 - ldscores:
 
@@ -56,6 +58,11 @@ sumher_cov(
 - max_iter:
 
   Maximum iterations (default 100)
+
+- alpha:
+
+  Selection parameter for the dependency of SNP heritability on MAF
+  (default: -0.25)
 
 ## Value
 

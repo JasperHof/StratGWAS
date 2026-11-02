@@ -25,6 +25,18 @@ transform(strata, gencov, outfile, spar = 0.8, smooth = TRUE)
 
   Name/path prefix for output files
 
+- spar:
+
+  Smoothing parameter passed to
+  [`smooth.spline`](https://rdrr.io/r/stats/smooth.spline.html) when
+  smoothing the weights of continuous stratification variables (default:
+  0.8)
+
+- smooth:
+
+  Logical; smooth the weights of continuous variables across strata
+  (requires K \> 3; default: TRUE)
+
 ## Value
 
 Returns a list containing:

@@ -170,7 +170,7 @@ res <- sparrow(filename       = file.path(dir, "data"),
 #> 5000 of 5000 individuals in `pheno` are in the .fam file
 #> Dropping 0 individuals with missing phenotypes
 #> SPARROW: 5000 individuals, 1 phenotype(s), 1 covariate df, alpha = -1, -0.5, 0
-#> StratGWAS C++ build: Nov  2 2026 12:30:29   (p-values: one-sided VC / two-sided coher, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac)
+#> StratGWAS C++ build: Nov  2 2026 13:26:04   (p-values: one-sided VC / two-sided coher, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac)
 #> Genotype file: 5000 individuals, 9071 SNPs
 #> Fast .bed reader calibrated for genotype (codes 0/1/2/3 -> 2/-1/1/0; verified on 3 extra blocks)
 #> Categories: pLoF=3098 missense=2935 synonymous=3038

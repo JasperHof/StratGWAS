@@ -38,6 +38,12 @@ compute_gencov(
 
   Name/path prefix for output files
 
+- cov:
+
+  Optional: covariates in PLINK format (FID, IID, then covariates).
+  Missing values are imputed by the column mean, and covariates are
+  regressed out of each stratum before the GWAS.
+
 - lds:
 
   Optional: data frame containing LD scores. The first column should
@@ -63,7 +69,7 @@ compute_gencov(
 - B:
 
   Number of jackknife blocks for standard error of genetic covariance
-  (default 100)
+  (default: 50)
 
 ## Value
 

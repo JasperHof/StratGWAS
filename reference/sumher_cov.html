@@ -57,11 +57,12 @@
 
 
 <dl><dt id="arg-ss-">ss1<a class="anchor" aria-label="anchor" href="#arg-ss-"></a></dt>
-<dd><p>Summary statistics for trait 1: data.frame with SNP, N, Z</p></dd>
+<dd><p>Summary statistics for trait 1: data.frame with columns Predictor, N, BETA, SE,
+Chisq and MAF (same SNPs and order as <code>ldscores</code>)</p></dd>
 
 
 <dt id="arg-ss-">ss2<a class="anchor" aria-label="anchor" href="#arg-ss-"></a></dt>
-<dd><p>Summary statistics for trait 2: data.frame with SNP, N, Z</p></dd>
+<dd><p>Summary statistics for trait 2, in the same format and SNP order as <code>ss1</code></p></dd>
 
 
 <dt id="arg-ldscores">ldscores<a class="anchor" aria-label="anchor" href="#arg-ldscores"></a></dt>
@@ -90,6 +91,10 @@
 
 <dt id="arg-max-iter">max_iter<a class="anchor" aria-label="anchor" href="#arg-max-iter"></a></dt>
 <dd><p>Maximum iterations (default 100)</p></dd>
+
+
+<dt id="arg-alpha">alpha<a class="anchor" aria-label="anchor" href="#arg-alpha"></a></dt>
+<dd><p>Selection parameter for the dependency of SNP heritability on MAF (default: -0.25)</p></dd>
 
 </dl></div>
     <div class="section level2">

@@ -44,7 +44,7 @@ sumher_jack(
 
 - B:
 
-  Number of jackknife blocks (default 100)
+  Number of jackknife blocks (default: 100)
 
 ## Value
 

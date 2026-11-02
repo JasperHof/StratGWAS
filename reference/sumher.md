@@ -19,7 +19,8 @@ sumher(
 
 - ss:
 
-  Summary statistics data.frame with columns: SNP, N, Chisq
+  Summary statistics data.frame with columns N, Chisq and MAF (one row
+  per SNP, in the same order as `ldscores`)
 
 - ldscores:
 
@@ -37,9 +38,10 @@ sumher(
 
   Maximum iterations (default 100)
 
-- weights:
+- alpha:
 
-  Optional weights (default: 1/ldscores)
+  Selection parameter for the dependency of SNP heritability on MAF
+  (default: -0.25)
 
 ## Value
 

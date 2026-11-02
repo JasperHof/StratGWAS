@@ -44,8 +44,158 @@
   </div>
 </nav><div class="container template-home">
 <div class="row">
-  <main id="main" class="col-md-9">
-Performs a stratified genome-wide association study (GWAS) of a binary trait by leveraging clinical heterogeneity among cases. Cases are stratified using a secondary phenotype (e.g. age of onset, symptom severity, or recruitment definition), genetic covariance between strata is estimated, and a transformed phenotype that upweights cases with higher inferred genetic liability is constructed for GWAS. An inflation criterion quantifies the risk that a given stratification variable introduces false-positive associations, allowing risky strata to be flagged before genome-wide analysis.
+  <main id="main" class="col-md-9"><div class="section level1">
+<div class="page-header"><h1 id="stratgwas">StratGWAS<a class="anchor" aria-label="anchor" href="#stratgwas"></a>
+</h1></div>
+<p>StratGWAS is an R package for constructing more powerful phenotypes for genome-wide association studies (GWAS) by including heterogeneity of measures of binary traits. StratGWAS can leverage secondary phenotypes (e.g. age at diagnosis, comorbodities) as continuous and/or categorical variables to stratify cases, estimate genetic covariance between strata, and construct a transformed phenotype with increased power to detect genetic associations.</p>
+<p>The StratGWAS preprint is now on <a href="https://www.medrxiv.org/content/10.64898/2026.03.26.26349370v1.full-text" class="external-link">medRxiv</a>.</p>
+<p>Below is a brief description on how to run StratGWAS. For more details, please visit the <a href="https://github.com/JasperHof/StratGWAS/wiki" class="external-link">Wiki</a>.</p>
+<hr>
+<div class="section level2">
+<h2 id="installation">Installation<a class="anchor" aria-label="anchor" href="#installation"></a>
+</h2>
+<p>StratGWAS can be installed from GitHub:</p>
+<div class="sourceCode" id="cb1"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="co"># install.packages("devtools")</span></span>
+<span><span class="fu">devtools</span><span class="fu">::</span><span class="fu">install_github</span><span class="op">(</span><span class="st">"JasperHof/StratGWAS"</span><span class="op">)</span></span></code></pre></div>
+<p>Then load the package:</p>
+<div class="sourceCode" id="cb2"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="kw"><a href="https://rdrr.io/r/base/library.html" class="external-link">library</a></span><span class="op">(</span><span class="va"><a href="https://github.com/JasperHof/StratGWAS" class="external-link">StratGWAS</a></span><span class="op">)</span></span></code></pre></div>
+<p>Please note that StratGWAS requires Rtools to install, so this should be downloaded prior to installing StratGWAS.</p>
+<hr>
+</div>
+<div class="section level2">
+<h2 id="input-data-format">Input Data Format<a class="anchor" aria-label="anchor" href="#input-data-format"></a>
+</h2>
+<p>All phenotype, covariate, and stratification variables must follow <strong>PLINK-style format</strong>:</p>
+<table class="table">
+<thead><tr>
+<th>Column</th>
+<th>Description</th>
+</tr></thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>Family ID (FID)</td>
+</tr>
+<tr>
+<td>2</td>
+<td>Individual ID (IID)</td>
+</tr>
+<tr>
+<td>3+</td>
+<td>Phenotype / covariates / stratification variables</td>
+</tr>
+</tbody>
+</table>
+<p>Additional requirements:</p>
+<ul>
+<li>Binary phenotypes coded as <code>0 = control</code>, <code>1 = case</code>
+</li>
+<li>Missing values coded as <code>NA</code>
+</li>
+<li>Genotypes supplied in PLINK <code>.bed/.bim/.fam</code> format</li>
+</ul>
+<hr>
+</div>
+<div class="section level2">
+<h2 id="workflow-overview">Workflow Overview<a class="anchor" aria-label="anchor" href="#workflow-overview"></a>
+</h2>
+<p>StratGWAS consists of four main steps:</p>
+<ol style="list-style-type: decimal">
+<li><p><strong>Stratification</strong> (<code>stratify</code>) Divide cases into subgroups based on stratification variables.</p></li>
+<li><p><strong>Genetic Covariance Estimation</strong> (<code>compute_gencov</code>) Estimate genetic covariances between strata using SumHer.</p></li>
+<li><p><strong>Phenotype Transformation</strong> (<code>transform</code>) Create a transformed phenotype based on the covariance structure.</p></li>
+<li><p><strong>GWAS Analysis</strong> (<code>linear</code>) Perform GWAS on the transformed phenotype.</p></li>
+</ol>
+<hr>
+</div>
+<div class="section level2">
+<h2 id="example-workflow">Example Workflow<a class="anchor" aria-label="anchor" href="#example-workflow"></a>
+</h2>
+<div class="sourceCode" id="cb3"><pre class="downlit sourceCode r">
+<code class="sourceCode R"><span><span class="kw"><a href="https://rdrr.io/r/base/library.html" class="external-link">library</a></span><span class="op">(</span><span class="va"><a href="https://github.com/JasperHof/StratGWAS" class="external-link">StratGWAS</a></span><span class="op">)</span></span>
+<span></span>
+<span><span class="co"># Load example data</span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/utils/data.html" class="external-link">data</a></span><span class="op">(</span><span class="va">pheno</span><span class="op">)</span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/utils/data.html" class="external-link">data</a></span><span class="op">(</span><span class="va">strat_cont</span><span class="op">)</span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/utils/data.html" class="external-link">data</a></span><span class="op">(</span><span class="va">strat_cat</span><span class="op">)</span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/utils/data.html" class="external-link">data</a></span><span class="op">(</span><span class="va">cov</span><span class="op">)</span></span>
+<span></span>
+<span><span class="co"># Genotype file (PLINK)</span></span>
+<span><span class="va">filename_bed</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/system.file.html" class="external-link">system.file</a></span><span class="op">(</span><span class="st">"extdata"</span>, <span class="st">"data.bed"</span>, package <span class="op">=</span> <span class="st">"StratGWAS"</span><span class="op">)</span></span>
+<span><span class="va">filename</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/grep.html" class="external-link">gsub</a></span><span class="op">(</span><span class="st">".bed"</span>, <span class="st">""</span>, <span class="va">filename_bed</span><span class="op">)</span></span>
+<span></span>
+<span><span class="va">outfile</span> <span class="op">&lt;-</span> <span class="fu"><a href="https://rdrr.io/r/base/tempfile.html" class="external-link">tempfile</a></span><span class="op">(</span><span class="st">"stratgwas_output"</span><span class="op">)</span></span>
+<span></span>
+<span><span class="co"># Step 1: Stratify</span></span>
+<span><span class="va">strata</span> <span class="op">&lt;-</span> <span class="fu"><a href="reference/stratify.html">stratify</a></span><span class="op">(</span><span class="va">pheno</span>, strat_cont <span class="op">=</span> <span class="va">strat_cont</span>, strat_cat <span class="op">=</span> <span class="va">strat_cat</span>, K <span class="op">=</span> <span class="fl">5</span><span class="op">)</span></span>
+<span></span>
+<span><span class="co"># Step 2: Genetic covariance</span></span>
+<span><span class="va">gencov</span> <span class="op">&lt;-</span> <span class="fu"><a href="reference/compute_gencov.html">compute_gencov</a></span><span class="op">(</span><span class="va">strata</span>, <span class="va">filename</span>, nr_blocks <span class="op">=</span> <span class="fl">1000</span>, <span class="va">outfile</span><span class="op">)</span></span>
+<span></span>
+<span><span class="co"># Step 3: Transform phenotype</span></span>
+<span><span class="va">trans</span> <span class="op">&lt;-</span> <span class="fu"><a href="reference/transform.html">transform</a></span><span class="op">(</span><span class="va">strata</span>, <span class="va">gencov</span>, <span class="va">outfile</span><span class="op">)</span></span>
+<span></span>
+<span><span class="co"># Step 4: Run GWAS</span></span>
+<span><span class="va">results</span> <span class="op">&lt;-</span> <span class="fu"><a href="reference/linear.html">linear</a></span><span class="op">(</span><span class="va">trans</span>, <span class="va">filename</span>, <span class="va">outfile</span>, nr_blocks <span class="op">=</span> <span class="fl">1000</span>, cov <span class="op">=</span> <span class="va">cov</span><span class="op">)</span></span>
+<span></span>
+<span><span class="fu"><a href="https://rdrr.io/r/utils/head.html" class="external-link">head</a></span><span class="op">(</span><span class="va">results</span><span class="op">$</span><span class="va">results</span><span class="op">)</span></span></code></pre></div>
+<hr>
+</div>
+<div class="section level2">
+<h2 id="output-files">Output Files<a class="anchor" aria-label="anchor" href="#output-files"></a>
+</h2>
+<p>The workflow produces several files using the provided output prefix:</p>
+<div class="section level3">
+<h3 id="from-compute_gencov">From <code>compute_gencov()</code>
+<a class="anchor" aria-label="anchor" href="#from-compute_gencov"></a>
+</h3>
+<ul>
+<li>
+<code>&lt;outfile&gt;.strata</code> – Multi-phenotype file for all strata</li>
+<li>
+<code>&lt;outfile&gt;.pheno1-K</code> – GWAS results per stratum</li>
+<li>
+<code>&lt;outfile&gt;.ldscores</code> – LD scores</li>
+<li>
+<code>&lt;outfile&gt;.hers</code> – SNP heritabilities of strata</li>
+<li>
+<code>&lt;outfile&gt;.gencov</code> – Genetic covariance matrix</li>
+<li>
+<code>&lt;outfile&gt;.gencor</code> – Genetic correlation matrix</li>
+</ul>
+</div>
+<div class="section level3">
+<h3 id="from-transform">From <code>transform()</code>
+<a class="anchor" aria-label="anchor" href="#from-transform"></a>
+</h3>
+<ul>
+<li>
+<code>&lt;outfile&gt;.transformation</code> – Transformed phenotype file</li>
+</ul>
+</div>
+<div class="section level3">
+<h3 id="from-linear">From <code>linear()</code>
+<a class="anchor" aria-label="anchor" href="#from-linear"></a>
+</h3>
+<ul>
+<li>
+<code>&lt;outfile&gt;.assoc</code> – Final GWAS results</li>
+</ul>
+<hr>
+</div>
+</div>
+<div class="section level2">
+<h2 id="performance-notes">Performance Notes<a class="anchor" aria-label="anchor" href="#performance-notes"></a>
+</h2>
+<ul>
+<li>Ensure sufficient sample size per stratum.</li>
+<li>Quality control of genotypes is recommended before running StratGWAS.</li>
+<li>StratGWAS can benefit from multithreading</li>
+</ul>
+</div>
+</div>
   </main><aside class="col-md-3"><div class="links">
 <h2 data-toc-skip>Links</h2>
 <ul class="list-unstyled">

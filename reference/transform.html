@@ -62,6 +62,16 @@ This is the third step in the StratGWAS workflow.</p>
 <dt id="arg-outfile">outfile<a class="anchor" aria-label="anchor" href="#arg-outfile"></a></dt>
 <dd><p>Name/path prefix for output files</p></dd>
 
+
+<dt id="arg-spar">spar<a class="anchor" aria-label="anchor" href="#arg-spar"></a></dt>
+<dd><p>Smoothing parameter passed to <code><a href="https://rdrr.io/r/stats/smooth.spline.html" class="external-link">smooth.spline</a></code> when smoothing the
+weights of continuous stratification variables (default: 0.8)</p></dd>
+
+
+<dt id="arg-smooth">smooth<a class="anchor" aria-label="anchor" href="#arg-smooth"></a></dt>
+<dd><p>Logical; smooth the weights of continuous variables across strata (requires K &gt; 3;
+default: TRUE)</p></dd>
+
 </dl></div>
     <div class="section level2">
     <h2 id="value">Value<a class="anchor" aria-label="anchor" href="#value"></a></h2>

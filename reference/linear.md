@@ -36,6 +36,11 @@ linear(trans, filename, outfile, nr_blocks = 1000, cov = NULL, alpha = -0.25)
   column means. Covariates will be regressed out of the transformed
   phenotype before GWAS analysis.
 
+- alpha:
+
+  Selection parameter for the dependency of SNP heritability on MAF,
+  used for the global inflation criterion (default: -0.25)
+
 ## Value
 
 GWAS results are written to .assoc
