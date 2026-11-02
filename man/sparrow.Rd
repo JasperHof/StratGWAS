@@ -53,7 +53,7 @@ column of variant IDs, which is matched to the .bim. NULL = one category with al
 \item{genes}{Optional data frame or file: gene, chr, start, end (extra columns ignored).
 Must be on the same genome build as the .bim.}
 
-\item{alpha}{Heritability models tested; alpha\link{1} is used for the estimates.}
+\item{alpha}{Heritability models tested; \code{alpha[1]} is used for the estimates.}
 
 \item{loco_prs}{Optional LDAK-KVIK Step 1 \code{.loco.prs} files: one per phenotype
 (character vector), or a matrix with one row per phenotype and one column per source.}
