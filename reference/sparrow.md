@@ -78,7 +78,7 @@ sparrow(
 
 - alpha:
 
-  Heritability models tested; alpha1 is used for the estimates.
+  Heritability models tested; `alpha[1]` is used for the estimates.
 
 - loco_prs:
 
@@ -157,7 +157,7 @@ number of individuals, and the summary returned by the C++ code.
 ``` r
 # \donttest{
 # example data shipped with the package
-dir <- system.file("data", package = "StratGWAS")
+dir <- system.file("extdata", package = "StratGWAS")
 
 res <- sparrow(filename       = file.path(dir, "data"),
                pheno          = file.path(dir, "pheno_quant"),
@@ -170,7 +170,7 @@ res <- sparrow(filename       = file.path(dir, "data"),
 #> 5000 of 5000 individuals in `pheno` are in the .fam file
 #> Dropping 0 individuals with missing phenotypes
 #> SPARROW: 5000 individuals, 1 phenotype(s), 1 covariate df, alpha = -1, -0.5, 0
-#> StratGWAS C++ build: Nov  2 2026 08:51:29   (p-values: one-sided VC / two-sided coher, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac)
+#> StratGWAS C++ build: Nov  2 2026 12:30:29   (p-values: one-sided VC / two-sided coher, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac)
 #> Genotype file: 5000 individuals, 9071 SNPs
 #> Fast .bed reader calibrated for genotype (codes 0/1/2/3 -> 2/-1/1/0; verified on 3 extra blocks)
 #> Categories: pLoF=3098 missense=2935 synonymous=3038
@@ -179,7 +179,7 @@ res <- sparrow(filename       = file.path(dir, "data"),
 #> Gene definitions: 114 read. NOTE: these coordinates must be on the same genome build as the .bim.
 #> Variance-component p-values: one-sided (upper tail).
 #> Environment moment: T(env,env) = n - 1
-#> LOCO PRS /home/runner/work/_temp/Library/StratGWAS/data/kvik.step1.loco.prs: 10 chromosome columns, 5000 rows matched, 10 columns map onto the .bim chromosomes.
+#> LOCO PRS /home/runner/work/_temp/Library/StratGWAS/extdata/kvik.step1.loco.prs: 10 chromosome columns, 5000 rows matched, 10 columns map onto the .bim chromosomes.
 #>   full PRS = sum(LOCO)/9;  sd(full) per column: 0.582672
 #> LOCO PRS used for p-values only: vg / se_vg / h2 of chunks and genes are estimated on y itself
 #>   (an in-sample PRS shrinks heritability estimates). Use prs_mask = 0 to estimate windows on y as well.
@@ -187,7 +187,7 @@ res <- sparrow(filename       = file.path(dir, "data"),
 #>   pLoF: 0
 #>   missense: 0
 #>   synonymous: 0
-#> KVIK summaries /home/runner/work/_temp/Library/StratGWAS/data/kvik.step2.summaries: 9070 variants, 9070 matched to the .bim
+#> KVIK summaries /home/runner/work/_temp/Library/StratGWAS/extdata/kvik.step2.summaries: 9070 variants, 9070 matched to the .bim
 #> ACAT-V: KVIK single-variant tests, weights [2f(1-f)]^(1+alpha) for each alpha, variants with MAC < 10 collapsed into a burden.
 #>   p_spa = ACAT over 6 p-values (3 variance-component + 3 ACAT-V).
 #> Pass 1: 40 chunks of 256 SNPs, no flanks, 3 categories, phenotype = y - LOCO PRS of the tested chromosome.
@@ -200,11 +200,11 @@ res <- sparrow(filename       = file.path(dir, "data"),
 #> 
 [pass1] 4/40  10%  elapsed 0s  eta 1s     
 [pass1] 8/40  20%  elapsed 0s  eta 1s     
-[pass1] 12/40  30%  elapsed 0s  eta 0s     
-[pass1] 16/40  40%  elapsed 0s  eta 0s     
+[pass1] 12/40  30%  elapsed 0s  eta 1s     
+[pass1] 16/40  40%  elapsed 0s  eta 1s     
 [pass1] 20/40  50%  elapsed 0s  eta 0s     
-[pass1] 24/40  60%  elapsed 0s  eta 0s     
-[pass1] 28/40  70%  elapsed 0s  eta 0s     
+[pass1] 24/40  60%  elapsed 1s  eta 0s     
+[pass1] 28/40  70%  elapsed 1s  eta 0s     
 [pass1] 32/40  80%  elapsed 1s  eta 0s     
 [pass1] 36/40  90%  elapsed 1s  eta 0s     
 [pass1] 40/40  100%  elapsed 1s  eta 0s     
@@ -237,7 +237,7 @@ head(genes[genes$category == "ACAT", ])          # one p-value per gene
 #> 20 GENE5   1   350 389    NA        1     ACAT    40     Phen1 NA    NA NA
 #> 24 GENE6   1   409 481    NA        1     ACAT    73     Phen1 NA    NA NA
 #>    vg_env       p_spa spa_used p_alpha_.1 p_alpha_.0.5 p_alpha_0 p_vc p_acatv
-#> 4      NA 3.73924e-06       NA         NA           NA        NA   NA      NA
+#> 4      NA 3.73926e-06       NA         NA           NA        NA   NA      NA
 #> 8      NA 1.75149e-05       NA         NA           NA        NA   NA      NA
 #> 12     NA 1.82862e-04       NA         NA           NA        NA   NA      NA
 #> 16     NA 5.07700e-02       NA         NA           NA        NA   NA      NA

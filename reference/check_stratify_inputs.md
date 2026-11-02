@@ -26,10 +26,6 @@ check_stratify_inputs(pheno, strat_cont, strat_cat, K)
 
   Number of groups for continuous variables
 
-- cov:
-
-  Covariates in PLINK format
-
 ## Value
 
 NULL if all checks pass, stops with error message otherwise

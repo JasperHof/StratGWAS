@@ -56,6 +56,14 @@ format:
 Binary phenotypes should be coded as 0 (controls) and 1 (cases). Missing
 values should be coded as NA.
 
+## See also
+
+Useful links:
+
+- <https://github.com/JasperHof/StratGWAS>
+
+- Report bugs at <https://github.com/JasperHof/StratGWAS/issues>
+
 ## Author
 
 Jasper Hof <jasper.hof@qgg.au.dk>
