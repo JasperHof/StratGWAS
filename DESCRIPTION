@@ -20,7 +20,7 @@ Imports:
     Rcpp,
     RcppParallel,
     Matrix
-SystemRequirements: GNU make, C++11
+SystemRequirements: GNU make
 Depends: 
     R (>= 3.5)
 LazyData: true

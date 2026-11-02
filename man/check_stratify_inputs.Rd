@@ -14,8 +14,6 @@ check_stratify_inputs(pheno, strat_cont, strat_cat, K)
 \item{strat_cat}{Categorical stratification variables in PLINK format}
 
 \item{K}{Number of groups for continuous variables}
-
-\item{cov}{Covariates in PLINK format}
 }
 \value{
 NULL if all checks pass, stops with error message otherwise

@@ -174,6 +174,14 @@ linear(trans, filename, outfile, nr_blocks = 1000)
 }
 
 }
+\seealso{
+Useful links:
+\itemize{
+  \item \url{https://github.com/JasperHof/StratGWAS}
+  \item Report bugs at \url{https://github.com/JasperHof/StratGWAS/issues}
+}
+
+}
 \author{
 Jasper Hof \email{jasper.hof@qgg.au.dk}
 }

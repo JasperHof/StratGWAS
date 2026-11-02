@@ -18,7 +18,7 @@
 #' @param annot_names Category names (default: column names of `annotation`).
 #' @param genes Optional data frame or file: gene, chr, start, end (extra columns ignored).
 #'   Must be on the same genome build as the .bim.
-#' @param alpha Heritability models tested; alpha[1] is used for the estimates.
+#' @param alpha Heritability models tested; `alpha[1]` is used for the estimates.
 #' @param loco_prs Optional LDAK-KVIK Step 1 `.loco.prs` files: one per phenotype
 #'   (character vector), or a matrix with one row per phenotype and one column per source.
 #' @param kvik_summaries Optional LDAK-KVIK Step 2 `.summaries` files, one per phenotype.

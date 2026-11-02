@@ -6,7 +6,6 @@
 #' @param strat_cont Continuous stratification variables in PLINK format
 #' @param strat_cat Categorical stratification variables in PLINK format
 #' @param K Number of groups for continuous variables
-#' @param cov Covariates in PLINK format
 #' @return NULL if all checks pass, stops with error message otherwise
 #' @keywords internal
 check_stratify_inputs <- function(pheno, strat_cont, strat_cat, K) {
