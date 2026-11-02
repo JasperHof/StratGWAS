@@ -1,0 +1,8 @@
+^StratGWAS_WCPG_slides\.pptx$
+^Dockerfile$
+^LICENSE\.md$
+^\.github$
+^_pkgdown\.yml$
+^docs$
+^pkgdown$
+^.*\.swp$

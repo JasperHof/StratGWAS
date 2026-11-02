@@ -1,6 +1,6 @@
 Package: StratGWAS
 Title: Stratified Genome-Wide Association Analysis for Binary Traits
-Version: 0.0.0
+Version: 0.1.0
 Authors@R: person("Jasper", "Hof", email = "jasper.hof@qgg.au.dk", role = c("aut","cre"))
 Description: Performs a stratified genome-wide association study (GWAS) of a 
     binary trait by leveraging clinical heterogeneity among cases. Cases are 
@@ -11,7 +11,7 @@ Description: Performs a stratified genome-wide association study (GWAS) of a
     criterion quantifies the risk that a given stratification variable 
     introduces false-positive associations, allowing risky strata to be 
     flagged before genome-wide analysis.
-License: GPL-3
+License: GPL (>= 3)
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.3
@@ -26,5 +26,9 @@ Depends:
 LazyData: true
 Suggests: 
     knitr,
-    rmarkdown
+    rmarkdown,
+    testthat (>= 3.0.0)
 VignetteBuilder: knitr
+Config/testthat/edition: 3
+URL: https://github.com/JasperHof/StratGWAS
+BugReports: https://github.com/JasperHof/StratGWAS/issues
