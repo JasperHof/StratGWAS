@@ -119,7 +119,12 @@ linear <- function(trans, filename, outfile, nr_blocks = 1000, cov = NULL,
   gwas_casecontrol <- read.table(paste0(outfile, ".pheno1"), head = T)
   ldscores <- read.table(paste0(outfile, ".ldscores"), head = T)
 
-  sum_cov <- sumher_cov(gwas_casecontrol, gwas_trans, ldscores$Tagging, alpha = alpha)
+  # Reduce to common first
+  common <- Reduce(intersect, list(gwas_casecontrol$Predictor, gwas_trans$Predictor, ldscores$Predictor))
+  gwas_casecontrol <- gwas_casecontrol[match(common, gwas_casecontrol$Predictor), ]
+  gwas_trans       <- gwas_trans[match(common, gwas_trans$Predictor), ]
+  sum_cov <- sumher_cov(gwas_casecontrol, gwas_trans,
+                        ldscores$Tagging[match(common, ldscores$Predictor)], alpha = alpha)
 
   global_infl <- sum_cov$h2_2 * (1 - sum_cov$rg^2)
   cat("Global inflation criterion is", global_infl, ".\n")

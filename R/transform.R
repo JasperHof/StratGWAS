@@ -202,6 +202,7 @@ transform <- function(strata, gencov, outfile, spar = 0.8, smooth = TRUE) {
       }
     }
 
+    trans_pheno[is.na(strata$y[, 3]), 3] <- NA
     trans_pheno[, 3] <- trans_pheno[, 3] + trans_add
 
   }

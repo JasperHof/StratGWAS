@@ -13,7 +13,7 @@ compute_gencov(
   lds = NULL,
   ss_list = NULL,
   alpha = -0.25,
-  jack = FALSE,
+  jack = TRUE,
   B = 50
 )
 }

@@ -50,7 +50,7 @@
 compute_gencov <- function(strata, filename, nr_blocks = 1000, outfile,
                            cov = NULL,
                            lds = NULL, ss_list = NULL,
-                           alpha = -0.25, jack = FALSE, B = 50) {
+                           alpha = -0.25, jack = TRUE, B = 50) {
 
   # Check input data
   # compute_gencov_checks(strata, filename, nr_blocks, outfile, SumHer, lds)
