@@ -1,0 +1,186 @@
+# StratGWAS
+
+StratGWAS performs genome-wide association studies (GWAS) by stratifying
+cases based on input variables, and assiging extra weight to those
+conferring greater genetic risk. The package can stratify cases based on
+continuous and/or categorical variables (e.g., age at diagnosis, disease
+subtype), and computes a transformed phenotype that maximizes power to
+detect genetic associations.
+
+## Details
+
+The StratGWAS workflow consists of four main steps:
+
+**1. Stratification** ([`stratify`](stratify.md)): Divide cases into
+subgroups based on stratification variables
+
+**2. Genetic Covariance Estimation**
+([`compute_gencov`](compute_gencov.md)): Estimate genetic covariances
+between strata using approach similar to SumHer
+
+**3. Compute Transformed Phenotype** ([`transform`](transform.md)):
+Create a transformed phenotype based on the genetic covariance structure
+
+**4. GWAS Analysis** ([`linear`](linear.md)): Perform genome-wide
+association analysis on the transformed phenotype
+
+## Key Functions
+
+- [`stratify`](stratify.md):
+
+  Create case strata from continuous/categorical variables
+
+- [`compute_gencov`](compute_gencov.md):
+
+  Estimate genetic covariance matrix between strata
+
+- [`transform`](transform.md):
+
+  Generate transformed phenotype
+
+- [`linear`](linear.md):
+
+  Run linear regression GWAS on transformed phenotype
+
+## Input Data Format
+
+All phenotype, covariate and stratification files should be in PLINK
+format:
+
+- Column 1: Family ID (FID)
+
+- Column 2: Individual ID (IID)
+
+- Column 3+: Phenotype or stratification variables
+
+Binary phenotypes should be coded as 0 (controls) and 1 (cases). Missing
+values should be coded as NA.
+
+## Author
+
+Jasper Hof <jasper.hof@qgg.au.dk>
+
+## Examples
+
+``` r
+if (FALSE) { # \dontrun{
+# ============================================================================
+# EXAMPLE 1: Basic workflow with continuous stratification variable
+# ============================================================================
+
+# Load example data
+data(pheno)           # Binary phenotype (case-control)
+data(strat_cont)      # Continuous stratification variable (e.g., age at diagnosis)
+data(strat_cat)       # Categorical stratification variable (e.g., comorbidity)
+data(cov)             # Covariates (optional)
+
+# Specify genotype file (PLINK .bed format)
+filename_bed <- system.file("extdata", "data.bed", package = "StratGWAS")
+filename <- gsub(".bed", "", filename_bed)
+
+# Specify output file prefix
+outfile <- tempfile("stratgwas_output")
+
+# Step 1: Stratify cases into 5 quantile groups
+strata <- stratify(pheno, strat_cont = strat_cont, strat_cat = strat_cat, K = 5)
+
+# Examine stratification results
+table(strata$info$groups)           # Number of cases per stratum
+length(strata$strat_miss)           # Cases with missing stratification values
+head(strata$multi)                  # Multi-phenotype matrix
+
+# Step 2: Compute genetic covariances between strata
+gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
+
+# Examine genetic covariance results
+print(gencov$gencov)                # Genetic covariance matrix
+print(gencov$gencor)                # Genetic correlation matrix
+print(gencov$hers)                  # SNP heritabilities
+
+# Step 3: Transform phenotype based on genetic covariance structure
+trans <- transform(strata, gencov, outfile)
+
+# Examine transformation results
+head(trans$transformed_pheno)       # Transformed phenotype values
+print(trans$weights)                # Transformation weights
+print(trans$inflation_criteria)     # Expected inflation for continuous variables
+
+# Step 4: Run GWAS on transformed phenotype with covariates
+results <- linear(trans, filename, outfile, nr_blocks = 1000, cov = cov)
+
+# ============================================================================
+# EXAMPLE 2: Categorical stratification (e.g., disease subtypes)
+# ============================================================================
+
+data(strat_cat)       # Categorical variable with multiple subtypes
+
+# Stratify by categorical variable
+strata_cat <- stratify(pheno, strat_cat = strat_cat)
+
+# Check detected categories
+strata_cat$strat_details[[1]]$categories
+strata_cat$strat_details[[1]]$K
+
+# Continue with genetic covariance estimation
+gencov_cat <- compute_gencov(strata_cat, filename, nr_blocks = 1000, outfile)
+trans_cat <- transform(strata_cat, gencov_cat)
+linear(trans_cat, filename, outfile, nr_blocks = 1000, cov = cov)
+
+# ============================================================================
+# EXAMPLE 3: Multiple stratification variables
+# ============================================================================
+
+# Stratify by both continuous and categorical variables
+strata_multi <- stratify(pheno,
+                         strat_cont = strat_cont,   # e.g., age at diagnosis
+                         strat_cat = strat_cat,     # e.g., disease subtype
+                         K = 5)
+
+# Check stratification structure
+strata_multi$n_cont                 # Number of continuous variables
+strata_multi$n_bin                  # Number of categorical variables
+ncol(strata_multi$multi) - 3        # Total number of strata + variables
+
+# Complete workflow
+gencov_multi <- compute_gencov(strata_multi, filename, nr_blocks = 1000, outfile)
+trans_multi <- transform(strata_multi, gencov_multi)
+linear(trans_multi, filename, outfile, nr_blocks = 1000, cov = cov)
+
+# ============================================================================
+# EXAMPLE 4: Adjust number of strata for continuous variables
+# ============================================================================
+
+# Use 10 quantile groups instead of 5
+strata_10 <- stratify(pheno, strat_cont = strat_cont, K = 10)
+gencov_10 <- compute_gencov(strata_10, filename, nr_blocks = 1000, outfile)
+trans_10 <- transform(strata_10, gencov_10)
+linear(trans_10, filename, outfile, nr_blocks = 1000, cov = cov)
+
+# ============================================================================
+# EXAMPLE 5: GWAS without covariates
+# ============================================================================
+
+linear(trans, filename, outfile, nr_blocks = 1000)
+
+# ============================================================================
+# OUTPUT FILES
+# ============================================================================
+
+# The workflow generates several output files with the specified prefix:
+#
+# From compute_gencov():
+#   <outfile>.strata      - Multi-phenotype file for all strata
+#   <outfile>.pheno1-K    - GWAS results for each stratum
+#   <outfile>.ldscores    - LD scores
+#   <outfile>.hers        - SNP heritabilities
+#   <outfile>.gencov      - Genetic covariance matrix
+#   <outfile>.gencor      - Genetic correlation matrix
+#
+# From transform():
+#   <outfile>.weights       - StratGWAS weights
+#   <outfile>.transformed   - Transformed phenotype
+#
+# From linear():
+#   <outfile>.assoc  - Final GWAS results
+} # }
+```

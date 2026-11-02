@@ -1,0 +1,35 @@
+# SPA solver for HE-based variance components with correction
+
+SPA solver for HE-based variance components with correction
+
+## Usage
+
+``` r
+he_window_spa(
+  filename,
+  pheno,
+  out_file,
+  annotation = NULL,
+  annot_names = NULL,
+  loco_prs = NULL,
+  prs_mask = NULL,
+  chunk_size = 256,
+  window_bp = 1e+06,
+  do_windows = T,
+  alpha = -1,
+  covariates = NULL,
+  cov_df = NA,
+  SPA = T,
+  spa_pval_threshold = 0.1,
+  binary = F,
+  binary_raw = NULL,
+  coher = F,
+  chr = NULL,
+  batch_size = 64,
+  n_threads = 0,
+  max_window_chunks = 8,
+  genes = NULL,
+  kvik_summaries = NULL,
+  acatv_mac = 10
+)
+```

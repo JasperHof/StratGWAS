@@ -1,0 +1,19 @@
+# Fit elastic net model
+
+Development version
+
+## Usage
+
+``` r
+elastic(
+  filename = filename,
+  pheno_mat = pheno_mat,
+  h2 = 0.3,
+  alpha_param = -0.25,
+  p_en = 0.1,
+  F_en = 0.5,
+  chunk_size = 256,
+  tol = 1e-06,
+  max_scans = 10
+)
+```

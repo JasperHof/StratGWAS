@@ -1,0 +1,81 @@
+# Transform phenotype based on genetic covariance
+
+Create a transformed phenotype that maximizes power to detect genetic
+associations by leveraging the genetic covariance structure between
+strata. This is the third step in the StratGWAS workflow.
+
+## Usage
+
+``` r
+transform(strata, gencov, outfile, spar = 0.8, smooth = TRUE)
+```
+
+## Arguments
+
+- strata:
+
+  Object returned from [`stratify`](stratify.md)
+
+- gencov:
+
+  Genetic covariance object returned by
+  [`compute_gencov`](compute_gencov.md)
+
+- outfile:
+
+  Name/path prefix for output files
+
+## Value
+
+Returns a list containing:
+
+- transformed_pheno:
+
+  Data frame with FID, IID, and transformed phenotype values
+
+- weights:
+
+  Named vector of transformation weights for each stratum
+
+- inflation_criteria:
+
+  Data frame with expected inflation statistics for continuous
+  variables, including a2 (regression coefficient), genetic correlation
+  with binary phenotype, heritability of stratification variable, and
+  expected inflation factor
+
+- genetic distance:
+
+  Matrix with genetic distances between case subgroups, based on the
+  GDIS method
+
+## Examples
+
+``` r
+if (FALSE) { # \dontrun{
+# Basic usage
+data(pheno)
+data(strat_cont)
+filename_bed <- system.file("extdata", "data.bed", package = "StratGWAS")
+filename <- gsub(".bed", "", filename_bed)
+outfile <- tempfile("transform")
+
+strata <- stratify(pheno, strat_cont = strat_cont, K = 5)
+gencov <- compute_gencov(strata, filename, nr_blocks = 1000, outfile)
+trans <- transform(strata, gencov)
+
+# Examine transformation results
+head(trans$transformed_pheno)      # Transformed phenotype values
+print(trans$weights)               # Weights for each stratum
+print(trans$inflation_criteria)    # Expected inflation (continuous vars only)
+
+# Check distribution of transformed phenotype
+hist(trans$transformed_pheno[, 3], main = "Transformed Phenotype Distribution")
+
+# With categorical variables
+data(strat_cat)
+strata_cat <- stratify(pheno, strat_cat = strat_cat)
+gencov_cat <- compute_gencov(strata_cat, filename, nr_blocks = 1000, outfile)
+trans_cat <- transform(strata_cat, gencov_cat)
+} # }
+```
