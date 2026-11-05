@@ -769,10 +769,23 @@ struct ExactTerm { std::vector<double> v, lp; int obs = -1; };   // support valu
 
 struct ExactSpaResult { double p_up, p_lo; bool converged; bool exact = false; };   // exact: enumeration / atom
 
+// Many small Bernoulli terms, grouped: w independent copies of c * Bernoulli(p) per group.
+// Used for the part of a binary co-heritability statistic that is NOT kept as individual
+// exact terms; its exact CGF replaces a Gaussian approximation, which is badly anti-
+// conservative when p is small (a sum of Bernoulli(0.01) terms is Poisson-like, skewed).
+struct BernRest { std::vector<double> c, p, w; };
+
 static void exact_cgf(double t, const std::vector<ExactTerm>& T, const std::vector<double>& lam,
                       const std::vector<double>& nc2, double C,
-                      double& K, double& K1, double& K2) {
+                      double& K, double& K1, double& K2, const BernRest* br = 0) {
     K = C * t; K1 = C; K2 = 0.0;
+    if (br) for (size_t g = 0; g < br->c.size(); ++g) {
+        const double c = br->c[g], p = br->p[g], w = br->w[g], x = t * c;
+        double lk, qq;                                   // log(1 - p + p e^x), tilted probability
+        if (x > 0.0) { const double d = p + (1.0 - p) * std::exp(-x); lk = x + std::log(d); qq = p / d; }
+        else         { const double e = p * std::exp(x); lk = std::log1p(e - p); qq = e / (1.0 - p + e); }
+        K += w * lk; K1 += w * c * qq; K2 += w * c * c * qq * (1.0 - qq);
+    }
     for (size_t j = 0; j < T.size(); ++j) {
         const std::vector<double>& v = T[j].v; const std::vector<double>& lp = T[j].lp;
         double mx = -1e300;
@@ -794,7 +807,7 @@ static void exact_cgf(double t, const std::vector<ExactTerm>& T, const std::vect
 }
 
 static ExactSpaResult exact_spa_solve(double q_in, std::vector<ExactTerm> T, std::vector<double> lam,
-                                      const std::vector<double>& nc2, double C_in) {
+                                      const std::vector<double>& nc2, double C_in, const BernRest* br_in = 0) {
     ExactSpaResult res; res.p_up = res.p_lo = NA_REAL; res.converged = false;
     // ---- scale normalisation (as quad_spa_solve): work where Var(Q) = 1 --------------
     double mean = C_in, var = 0.0, qmax = C_in, qmin = C_in;
@@ -812,10 +825,19 @@ static ExactSpaResult exact_spa_solve(double q_in, std::vector<ExactTerm> T, std
         mean += lam[k] * (1.0 + nc2[k]); var += 2.0 * lam[k] * lam[k] * (1.0 + 2.0 * nc2[k]);
         if (lam[k] > 0) unb_up = true; if (lam[k] < 0) unb_lo = true;
     }
+    BernRest brs; const BernRest* br = 0;
+    if (br_in && !br_in->c.empty()) {
+        brs = *br_in; br = &brs;
+        for (size_t g = 0; g < brs.c.size(); ++g) {
+            mean += brs.w[g] * brs.c[g] * brs.p[g]; var += brs.w[g] * brs.c[g] * brs.c[g] * brs.p[g] * (1.0 - brs.p[g]);
+        }
+        unb_up = unb_lo = true;              // the atom shortcut below covers the terms T only
+    }
     if (!(var > 0.0) || !std::isfinite(var)) return res;
     const double sc = 1.0 / std::sqrt(var);
     for (size_t j = 0; j < T.size(); ++j) for (size_t s = 0; s < T[j].v.size(); ++s) T[j].v[s] *= sc;
     for (size_t k = 0; k < lam.size(); ++k) lam[k] *= sc;
+    if (br) for (size_t g = 0; g < brs.c.size(); ++g) brs.c[g] *= sc;
     const double C = C_in * sc, q = q_in * sc, mu0 = mean * sc;
     qmax *= sc; qmin *= sc;
 
@@ -851,7 +873,7 @@ static ExactSpaResult exact_spa_solve(double q_in, std::vector<ExactTerm> T, std
         int cnt = 0; for (size_t s2 = 0; s2 < T[j].lp.size(); ++s2) if (T[j].lp[s2] >= -32.2) ++cnt;   // p >= 1e-14
         prod_support *= std::max(1, cnt);
     }
-    if (lam.empty() && prod_support <= 2e5) {
+    if (lam.empty() && !br && prod_support <= 2e5) {
         std::vector< std::pair<double,double> > dist(1, std::make_pair(C, 1.0)), nx;
         bool ok = true; double dropped = 0.0;
         for (size_t j = 0; j < T.size() && ok; ++j) {
@@ -888,11 +910,11 @@ static ExactSpaResult exact_spa_solve(double q_in, std::vector<ExactTerm> T, std
     double hi = (lmax > 1e-14) ? (1.0 - 1e-9) / (2.0 * lmax) :  1e4;
     double lo = (lmin < -1e-14) ? (1.0 - 1e-9) / (2.0 * lmin) : -1e4;
     double K, K1, K2, t = 0.0;
-    exact_cgf(0.0, T, lam, nc2, C, K, K1, K2);
+    exact_cgf(0.0, T, lam, nc2, C, K, K1, K2, br);
     double a = lo, b = hi;
     bool conv = false;
     for (int it = 0; it < 300; ++it) {
-        exact_cgf(t, T, lam, nc2, C, K, K1, K2);
+        exact_cgf(t, T, lam, nc2, C, K, K1, K2, br);
         const double f = K1 - q;
         if (std::abs(f) < 1e-10 * std::max(1.0, std::abs(q - mu0))) { conv = true; break; }
         if (f > 0) b = t; else a = t;
@@ -902,7 +924,7 @@ static ExactSpaResult exact_spa_solve(double q_in, std::vector<ExactTerm> T, std
         t = tn;
     }
     if (!conv) return res;
-    exact_cgf(t, T, lam, nc2, C, K, K1, K2);
+    exact_cgf(t, T, lam, nc2, C, K, K1, K2, br);
     if (!(K2 > 0.0) || !std::isfinite(K2)) return res;
 
     double up, dn;
@@ -959,10 +981,11 @@ static ExactSpaResult exact_spa_solve(double q_in, std::vector<ExactTerm> T, std
 // ---------------------------------------------------------------------------
 static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T,
                                        const std::vector<double>& lam, const std::vector<double>& nc2,
-                                       double C, int M = 8192) {
+                                       double C, int M = 8192, const BernRest* br = 0) {
     ExactSpaResult res; res.p_up = res.p_lo = NA_REAL; res.converged = false;
     const double LPMIN = std::log(1e-18);
-    const bool dense = !lam.empty();
+    if (br && br->c.empty()) br = 0;
+    const bool dense = !lam.empty() || br;
     // per term: kept atoms, minimum, observed value
     double sum_mn = 0.0, Dobs = 0.0, dropped = 0.0; bool have_obs = !dense;
     std::vector<double> mn(T.size(), 0.0);
@@ -983,6 +1006,14 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
         if (lam[k] < 0) allpos = false;
         if (lam[k] > 0) allneg = false;
     }
+    double Gmin = 0.0, Gmax = 0.0;                       // support of the Bernoulli part
+    if (br) for (size_t g = 0; g < br->c.size(); ++g) {
+        const double c = br->c[g], p = br->p[g], w = br->w[g];
+        mG += w * c * p; vG += w * c * c * p * (1.0 - p);
+        if (c < 0) { allpos = false; Gmin += w * c; } else Gmax += w * c;
+        if (c > 0) allneg = false;
+    }
+    const bool bounded = lam.empty();                    // G = Bernoulli part only
     const double sdG = std::sqrt(std::max(vG, 0.0));
     double R;
     if (!dense) R = have_obs ? Dobs : Dq;
@@ -1033,7 +1064,9 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
         auto pg = [&](double x, double& up, double& lo) {
             if (allpos && x <= 0.0) { up = 1.0; lo = 0.0; return; }     // G >= 0
             if (allneg && x >= 0.0) { up = 0.0; lo = 1.0; return; }     // G <= 0
-            ExactSpaResult r = exact_spa_solve(x, none, lam, nc2, 0.0);
+            if (bounded && x > Gmax) { up = 0.0; lo = 1.0; return; }
+            if (bounded && x < Gmin) { up = 1.0; lo = 0.0; return; }
+            ExactSpaResult r = exact_spa_solve(x, none, lam, nc2, 0.0, br);
             if (r.converged) { up = r.p_up; lo = r.p_lo; }
             else { const double z = (x - mG) / std::max(sdG, 1e-300);
                    up = 0.5 * std::erfc(z / std::sqrt(2.0)); lo = 1.0 - up; }
@@ -2408,9 +2441,9 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 // ---- BINARY: exact conditional distribution given the lower-prevalence trait ----
                 // Q = c0 + sum_i delta h_i b_i, b_i ~ Bernoulli(pi_i) independently. The tail is
                 // driven by the few individuals with large |h_i| (carriers): up to 500 of them,
-                // with |delta h_i| >= 0.05 SD, are kept as exact two-point terms; the rest is
-                // Gaussian (exact mean and variance). The terms are combined by saddlepoint or,
-                // when that fails or p < 0.1, by the lattice convolution (as for single traits).
+                // with |delta h_i| >= 0.05 SD, are kept as exact two-point terms; the rest enters
+                // through its exact (grouped) Bernoulli CGF. The terms are combined by saddlepoint
+                // (lattice convolution only if the saddlepoint equation cannot be solved).
                 if (binary && cb.active) {
                     const int tc = cb.cond_t[pi];
                     const Eigen::VectorXd& wv = get_h(c, tc);
@@ -2442,25 +2475,45 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         e.v[1] = dl * wv[i]; e.lp[1] = std::log(pr);
                         terms.push_back(e);
                     }
-                    double mr = 0.0, vr = 0.0;
+                    // the rest: EXACT CGF of its Bernoulli terms, grouped by (pi, coefficient rounded
+                    // to 1e-3 of its SD; the group uses the mean coefficient). A Gaussian for the rest
+                    // is not good enough at low prevalence: the rest is then a sum of many
+                    // Bernoulli(0.01) terms, i.e. Poisson-like and skewed (anti-conservative tails).
+                    double vr = 0.0;
                     for (int i = 0; i < n; ++i) {
                         if (isbig[i]) continue;
                         const double ci = dl * wv[i];
-                        mr += ci * cp[i]; vr += ci * ci * cp[i] * (1.0 - cp[i]);
+                        vr += ci * ci * cp[i] * (1.0 - cp[i]);
                     }
-                    // the Gaussian rest as lambda (z + nu)^2 with large nu: mean and variance
-                    // exact, skewness 3 / nu (negligible), so the univariate machinery applies
-                    std::vector<double> lamd, nc2d; double Cc = c0 + mr;
+                    BernRest br;
                     if (vr > 0.0) {
-                        const double nu = 1000.0, lam = std::sqrt(vr / (2.0 * (1.0 + 2.0 * nu * nu)));
-                        lamd.push_back(lam); nc2d.push_back(nu * nu); Cc -= lam * (1.0 + nu * nu);
+                        const double step = 1e-3 * std::sqrt(vr);
+                        std::map< std::pair<float, long>, std::pair<double, double> > grp;
+                        for (int i = 0; i < n; ++i) {
+                            if (isbig[i]) continue;
+                            const double ci = dl * wv[i];
+                            if (ci == 0.0) continue;
+                            std::pair<double, double>& gg = grp[std::make_pair(cp[i], std::lround(ci / step))];
+                            gg.first += ci; gg.second += 1.0;
+                        }
+                        br.c.reserve(grp.size()); br.p.reserve(grp.size()); br.w.reserve(grp.size());
+                        for (std::map< std::pair<float, long>, std::pair<double, double> >::const_iterator it = grp.begin(); it != grp.end(); ++it) {
+                            br.c.push_back(it->second.first / it->second.second);
+                            br.p.push_back(std::min(std::max((double) it->first.first, 1e-12), 1.0 - 1e-12));
+                            br.w.push_back(it->second.second);
+                        }
                     }
+                    const std::vector<double> nolam;
                     ExactSpaResult er; er.converged = false;
-                    if (!terms.empty() || !lamd.empty()) {
-                        er = exact_spa_solve(Q, terms, lamd, nc2d, Cc);
-                        if (!terms.empty() && !er.exact &&
-                            (!er.converged || std::min(er.p_up, er.p_lo) < 0.1)) {
-                            ExactSpaResult eg = exact_grid_solve(Q, terms, lamd, nc2d, Cc);
+                    if (!terms.empty() || !br.c.empty()) {
+                        er = exact_spa_solve(Q, terms, nolam, nolam, c0, &br);
+                        // the statistic is LINEAR in the Bernoulli variables, so its MGF is finite and
+                        // the saddlepoint is accurate even when one carrier dominates (checked against
+                        // Monte Carlo). The lattice shifts each term to its minimum, which for the many
+                        // negative coefficients puts the bulk far from 0 and makes rounding errors add
+                        // up; it is only a fallback when the saddlepoint equation cannot be solved.
+                        if (!terms.empty() && !er.exact && !er.converged) {
+                            ExactSpaResult eg = exact_grid_solve(Q, terms, nolam, nolam, c0, 8192, &br);
                             if (eg.converged) er = eg;
                         }
                     }
@@ -3711,7 +3764,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
