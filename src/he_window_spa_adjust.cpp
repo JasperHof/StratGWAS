@@ -439,223 +439,6 @@ static void apply_alpha(GenoMat& X, const std::vector<float>& maf, double alpha,
 // As apply_alpha, but for a non-contiguous SNP selection: the per-SNP weight
 // lookup uses sel[j] instead of i0 + j.
 
-// Pascal's triangle up to order MAXCUM, built once. A function-local static has
-// thread-safe initialisation in C++11, so this is safe inside the workers.
-enum { MAXCUM = 12 };
-struct BinomTable {
-    double B[MAXCUM + 1][MAXCUM + 1];
-    BinomTable() {
-        for (int i = 0; i <= MAXCUM; ++i) {
-            for (int j = 0; j <= MAXCUM; ++j) B[i][j] = 0.0;
-            B[i][0] = 1.0;
-            for (int j = 1; j <= i; ++j)
-                B[i][j] = B[i-1][j-1] + ((j <= i-1) ? B[i-1][j] : 0.0);
-        }
-    }
-};
-static const BinomTable& binoms() { static BinomTable t; return t; }
-
-// central moments -> cumulants (mu[1] must be 0)
-static void moms_to_cums(const double* mu, double* kap, int up) {
-    const BinomTable& bt = binoms();
-    kap[1] = mu[1];
-    for (int nn = 2; nn <= up; ++nn) {
-        double s = mu[nn];
-        for (int mm = 1; mm < nn; ++mm) s -= bt.B[nn-1][mm-1] * kap[mm] * mu[nn-mm];
-        kap[nn] = s;
-    }
-}
-// cumulants -> central moments
-static void cums_to_moms(const double* kap, double* mu, int up) {
-    const BinomTable& bt = binoms();
-    mu[0] = 1.0; mu[1] = kap[1];
-    for (int nn = 2; nn <= up; ++nn) {
-        double s = kap[nn];
-        for (int mm = 1; mm < nn; ++mm) s += bt.B[nn-1][mm-1] * kap[mm] * mu[nn-mm];
-        mu[nn] = s;
-    }
-}
-
-// Match kappa1..kappa4 with a two-component spectrum {(l1,v1),(l2,v2)}:
-//     kappa_m = 2^{m-1} (m-1)! * sum_j v_j l_j^m
-// Damped Newton from several starts. Returns false if no valid (v_j > 0) fit.
-// Given the two eigenvalues, the two MULTIPLICITIES solve a 2x2 LINEAR system
-// (from kappa1, kappa2), so only a 2-D root find in (l1, l2) remains. Solving it
-// that way rather than as a blind 4-D Newton takes the success rate from ~34% to
-// essentially 100%, which matters because a failure here silently falls back to
-// the weaker variance-only correction.
-static bool solve_nu(double a, double b, const double* kq, double* p, double* q) {
-    const double det = a * b * (b - a);              // det[[a,b],[a^2,b^2]]
-    if (!(std::abs(det) > 1e-300) || !std::isfinite(det)) return false;
-    const double r1 = kq[1], r2 = kq[2] / 2.0;
-    *p = ( b * b * r1 - b * r2) / det;
-    *q = (-a * a * r1 + a * r2) / det;
-    return std::isfinite(*p) && std::isfinite(*q);
-}
-static bool fit_two_component(const double* kq, double* l1, double* v1,
-                              double* l2, double* v2) {
-    const double sc = std::sqrt(std::abs(kq[2]) / 2.0);
-    if (!(sc > 0.0) || !std::isfinite(sc)) return false;
-    // residuals in kappa3 / kappa4 as a function of (a,b) alone
-    struct R { static bool f(double a, double b, const double* kq,
-                             double& r3, double& r4, double& p, double& q) {
-        if (!solve_nu(a, b, kq, &p, &q)) return false;
-        r3 =  8.0 * (p*a*a*a       + q*b*b*b)       - kq[3];
-        r4 = 48.0 * (p*a*a*a*a     + q*b*b*b*b)     - kq[4];
-        return std::isfinite(r3) && std::isfinite(r4);
-    } };
-    // Dense grid of starts. Each solve is a handful of 2x2 operations, so this is
-    // free, and it takes the success rate from ~70% to ~100%. Multiple roots
-    // exist (the labelling of the two components is arbitrary); any valid one
-    // with positive multiplicities reproduces the same distribution.
-    static const double GA[6] = {0.25, 0.5, 1.0, 2.0, 4.0, 8.0};
-    static const double GB[6] = {-0.25, -0.5, -1.0, -2.0, -4.0, -8.0};
-    double best = -1.0;
-    for (int st = 0; st < 36; ++st) {
-        double a = GA[st / 6]*sc, b = GB[st % 6]*sc;
-        for (int it = 0; it < 300; ++it) {
-            double r3, r4, p, q;
-            if (!R::f(a, b, kq, r3, r4, p, q)) break;
-            // Scale the residuals by a NATURAL magnitude, not by kappa_m itself:
-            // kappa3 can pass through zero (the two components cancel), and a
-            // relative test against it then never converges.
-            const double s3 =  8.0 * sc*sc*sc, s4 = 48.0 * sc*sc*sc*sc;
-            const double nrm = std::max(std::abs(r3) / std::max(std::abs(kq[3]), s3),
-                                        std::abs(r4) / std::max(std::abs(kq[4]), s4));
-            if (nrm < 1e-9) {
-                if (p > 1e-12 && q > 1e-12 && (best < 0 || nrm < best)) {
-                    best = nrm; *l1 = a; *v1 = p; *l2 = b; *v2 = q;
-                }
-                break;
-            }
-            // numerical 2x2 Jacobian
-            const double ha = 1e-6*std::max(std::abs(a),sc), hb = 1e-6*std::max(std::abs(b),sc);
-            double r3a,r4a,r3b,r4b,pp,qq;
-            if (!R::f(a+ha,b,kq,r3a,r4a,pp,qq)) break;
-            if (!R::f(a,b+hb,kq,r3b,r4b,pp,qq)) break;
-            Eigen::Matrix2d J; Eigen::Vector2d F;
-            J(0,0)=(r3a-r3)/ha; J(0,1)=(r3b-r3)/hb;
-            J(1,0)=(r4a-r4)/ha; J(1,1)=(r4b-r4)/hb;
-            F << r3, r4;
-            Eigen::Vector2d d = J.fullPivLu().solve(F);
-            if (!d.allFinite()) break;
-            double damp = 1.0, mx = d.cwiseAbs().maxCoeff();
-            if (mx > 0.5*sc) damp = 0.5*sc/mx;          // trust region
-            a -= damp*d[0]; b -= damp*d[1];
-            if (!std::isfinite(a) || !std::isfinite(b)) break;
-            if (std::abs(a-b) < 1e-12*sc) break;
-        }
-    }
-    return best >= 0.0;
-}
-
-// ---------------------------------------------------------------------------
-// THREE-component fit, matching SIX cumulants.
-//
-// Truncating at four cumulants is the dominant remaining error: against a Monte
-// Carlo reference the four-cumulant fit overshoots the upper tail by ~8% at
-// 1e-2 and ~24% at 1e-3, and moving to six roughly halves both. (Replacing the
-// saddlepoint with exact characteristic-function inversion, by contrast, changes
-// the answer by ~3% -- so the saddlepoint itself is not worth attacking.)
-//
-// Same structural trick as the two-component case, one dimension up: GIVEN the
-// three eigenvalues, the three multiplicities solve a 3x3 LINEAR system taken
-// from kappa1..kappa3, leaving only a 3-D root-find on the kappa4..kappa6
-// residuals. The system matrix has rows (l_j^m) for m = 1,2,3, whose determinant
-// is l1 l2 l3 (l2-l1)(l3-l1)(l3-l2): invertible whenever the values are distinct
-// and nonzero.
-// ---------------------------------------------------------------------------
-static bool solve_nu3(const double* l, const double* kq, double* nu) {
-    Eigen::Matrix3d A; Eigen::Vector3d r;
-    for (int m = 1; m <= 3; ++m) {
-        for (int j = 0; j < 3; ++j) A(m-1, j) = std::pow(l[j], m);
-        r[m-1] = kq[m] / (m == 1 ? 1.0 : (m == 2 ? 2.0 : 8.0));
-    }
-    Eigen::FullPivLU<Eigen::Matrix3d> lu(A);
-    if (!lu.isInvertible()) return false;
-    Eigen::Vector3d x = lu.solve(r);
-    if (!x.allFinite()) return false;
-    for (int j = 0; j < 3; ++j) nu[j] = x[j];
-    return true;
-}
-static bool fit_three_component(const double* kq, double* lout, double* nout) {
-    const double sc = std::sqrt(std::abs(kq[2]) / 2.0);
-    if (!(sc > 0.0) || !std::isfinite(sc)) return false;
-    const double w[7] = {0, 1, 2, 8, 48, 384, 3840};      // 2^{m-1}(m-1)!
-    struct R { static bool res(const double* l, const double* kq,
-                               double* rr, double* nu) {
-        if (!solve_nu3(l, kq, nu)) return false;
-        const double w[7] = {0, 1, 2, 8, 48, 384, 3840};
-        for (int m = 4; m <= 6; ++m) {
-            double s = 0.0;
-            for (int j = 0; j < 3; ++j) s += nu[j] * std::pow(l[j], m);
-            rr[m-4] = w[m] * s - kq[m];
-            if (!std::isfinite(rr[m-4])) return false;
-        }
-        return true;
-    } };
-    // Starting points. The plain grid alone converges on only about a third of
-    // cases; seeding from the (much more reliable) two-component solution, which
-    // already matches kappa1..kappa4, roughly doubles that. Those seeds are tried
-    // first.
-    double S[20][3]; int nS = 0;
-    double s1, w1, s2, w2;
-    if (fit_two_component(kq, &s1, &w1, &s2, &w2)) {
-        static const double thirds[6] = {0.25, 0.5, 2.0, 4.0, -0.5, -2.0};
-        for (int q = 0; q < 6; ++q) {
-            const double l3 = (thirds[q] > 0 ? s1 : s2) * std::abs(thirds[q]);
-            S[nS][0] = s1; S[nS][1] = s2; S[nS][2] = l3; ++nS;
-        }
-    }
-    static const double G[8][3] = {{ 1,-1, 2},{ 2,-1, 0.5},{ 1,-2, 3},
-                                   { 3,-0.5,1},{0.5,-3, 2},{ 1,-1, 4},
-                                   { 4,-2, 1},{ 2,-3, 0.5}};
-    for (int q = 0; q < 8 && nS < 20; ++q) {
-        S[nS][0] = G[q][0]*sc; S[nS][1] = G[q][1]*sc; S[nS][2] = G[q][2]*sc; ++nS;
-    }
-    double best = -1.0;
-    for (int st = 0; st < nS; ++st) {
-        double l[3] = {S[st][0], S[st][1], S[st][2]};
-        for (int it = 0; it < 300; ++it) {
-            double rr[3], nu[3];
-            if (!R::res(l, kq, rr, nu)) break;
-            double nrm = 0.0;
-            for (int m = 4; m <= 6; ++m) {
-                const double scl = std::max(std::abs(kq[m]), w[m]*std::pow(sc, m));
-                nrm = std::max(nrm, std::abs(rr[m-4]) / scl);
-            }
-            if (nrm < 1e-9) {
-                if (nu[0] > 1e-12 && nu[1] > 1e-12 && nu[2] > 1e-12 &&
-                    (best < 0 || nrm < best)) {
-                    best = nrm;
-                    for (int j = 0; j < 3; ++j) { lout[j] = l[j]; nout[j] = nu[j]; }
-                }
-                break;
-            }
-            Eigen::Matrix3d J; Eigen::Vector3d F(rr[0], rr[1], rr[2]);
-            bool ok = true;
-            for (int c = 0; c < 3 && ok; ++c) {
-                double lp[3] = {l[0], l[1], l[2]};
-                const double h = 1e-6 * std::max(std::abs(l[c]), sc);
-                lp[c] += h;
-                double r2[3], n2[3];
-                if (!R::res(lp, kq, r2, n2)) { ok = false; break; }
-                for (int m = 0; m < 3; ++m) J(m, c) = (r2[m] - rr[m]) / h;
-            }
-            if (!ok) break;
-            Eigen::Vector3d d = J.fullPivLu().solve(F);
-            if (!d.allFinite()) break;
-            double damp = 1.0, mx = d.cwiseAbs().maxCoeff();
-            if (mx > 0.5 * sc) damp = 0.5 * sc / mx;
-            for (int j = 0; j < 3; ++j) l[j] -= damp * d[j];
-            if (!std::isfinite(l[0]) || !std::isfinite(l[1]) || !std::isfinite(l[2])) break;
-            if (std::abs(l[0]-l[1]) < 1e-12*sc || std::abs(l[0]-l[2]) < 1e-12*sc ||
-                std::abs(l[1]-l[2]) < 1e-12*sc) break;
-        }
-    }
-    return best >= 0.0;
-}
-
 struct QuadSpaResult { double p; bool converged; };
 
 // `n_rep` and `nu2` are doubles: the binary 4-cumulant path needs FRACTIONAL
@@ -1203,7 +986,7 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
     const double sdG = std::sqrt(std::max(vG, 0.0));
     double R;
     if (!dense) R = have_obs ? Dobs : Dq;
-    else        R = Dq - (allpos ? 0.0 : (mG - 12.0 * sdG));
+    else        R = Dq - (allpos ? std::max(0.0, mG - 12.0 * sdG) : (mG - 12.0 * sdG));
     if (!dense && !(R > 0.0)) {                          // observation at the minimum of D
         res.p_up = 1.0; res.p_lo = 1.0; res.converged = true; return res;
     }
@@ -1329,6 +1112,38 @@ static void coher_mdiag(const GenoMat& V, const std::vector<int>& off, int C,
 }
 
 // w = M_c y, from the chunk's V and the already-computed u = V' y. One GEMV.
+// Regularized incomplete beta I_x(a, b) (continued fraction, Numerical Recipes 6.4), and the
+// two-sided Student t p value 2 P(T_nu >= |t|) = I_{nu / (nu + t^2)}(nu / 2, 1 / 2). Accurate in
+// the far tail (no cancellation: the direct branch is used when x is small).
+static double betacf_(double a, double b, double x) {
+    const int MAXIT = 300; const double EPS = 1e-15, FPMIN = 1e-300;
+    double qab = a + b, qap = a + 1.0, qam = a - 1.0, c = 1.0, d = 1.0 - qab * x / qap;
+    if (std::abs(d) < FPMIN) d = FPMIN; d = 1.0 / d; double h = d;
+    for (int m = 1; m <= MAXIT; ++m) {
+        const int m2 = 2 * m;
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d; if (std::abs(d) < FPMIN) d = FPMIN;
+        c = 1.0 + aa / c;  if (std::abs(c) < FPMIN) c = FPMIN;
+        d = 1.0 / d; h *= d * c;
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d; if (std::abs(d) < FPMIN) d = FPMIN;
+        c = 1.0 + aa / c;  if (std::abs(c) < FPMIN) c = FPMIN;
+        d = 1.0 / d; const double del = d * c; h *= del;
+        if (std::abs(del - 1.0) < EPS) break;
+    }
+    return h;
+}
+static double ibeta_(double a, double b, double x) {
+    if (x <= 0.0) return 0.0; if (x >= 1.0) return 1.0;
+    const double lbt = std::lgamma(a + b) - std::lgamma(a) - std::lgamma(b) + a * std::log(x) + b * std::log1p(-x);
+    if (x < (a + 1.0) / (a + b + 2.0)) return std::exp(lbt) * betacf_(a, b, x) / a;
+    return 1.0 - std::exp(lbt) * betacf_(b, a, 1.0 - x) / b;
+}
+static double t_two_sided_p(double t, double nu) {
+    if (!std::isfinite(nu) || nu > 1e6) return std::erfc(std::abs(t) / std::sqrt(2.0));
+    return std::min(1.0, ibeta_(0.5 * nu, 0.5, nu / (nu + t * t)));
+}
+
 static void coher_wvec(const GenoMat& V, const std::vector<int>& off, int C, int K,
                        const std::vector<double>& g, const Eigen::MatrixXd& Tinv,
                        int c, int env, const Eigen::VectorXd& u,
@@ -1390,6 +1205,8 @@ struct CoherBin {
 // ===========================================================================
 struct CoherFit {
     Eigen::MatrixXd S1, S2, S12, Ac;
+    Eigen::MatrixXd T1, T2;            // tested-component parts of S1 / S2 (L' D L, no e I)
+    double t1, t2;                     // the tested-component estimates of both traits
     double var0, e1, e2, e12, c_env;
     bool ok;
     CoherFit() : var0(0), e1(0), e2(0), e12(0), c_env(0), ok(false) {}
@@ -1454,6 +1271,13 @@ static void coher_fit(int c, const Eigen::MatrixXd& Tinv, int C, int env,
     coher_block(L, W, use_wcache, off, C, K, d1,  F.e1,  F.S1);
     coher_block(L, W, use_wcache, off, C, K, d2,  F.e2,  F.S2);
     coher_block(L, W, use_wcache, off, C, K, d12, F.e12, F.S12);
+    {   // tested-component parts, so that coher_spectrum can shrink ONLY them
+        std::vector<double> dt1(C, 0.0), dt2(C, 0.0);
+        dt1[c] = d1[c]; dt2[c] = d2[c];
+        coher_block(L, W, use_wcache, off, C, K, dt1, 0.0, F.T1);
+        coher_block(L, W, use_wcache, off, C, K, dt2, 0.0, F.T2);
+        F.t1 = sg1[c]; F.t2 = sg2[c];
+    }
     F.Ac = Ac;
 
     Eigen::MatrixXd N1, N2, N12;
@@ -1489,29 +1313,31 @@ static bool coher_spectrum(const CoherFit& F, int K, int n,
     Om.topRightCorner(K, K)    = F.S12;
     Om.bottomLeftCorner(K, K)  = F.S12;
     Om.bottomRightCorner(K, K) = F.S2;
-    // Plug-in estimates need not give a PSD Omega. Shrink the cross block until
-    // they do; shrinking S12 toward 0 moves toward independence, the
-    // conservative direction for a covariance test.
-    // An unclamped negative estimate for the tested component can, rarely, tip a
-    // diagonal block indefinite. Shrinking the cross block cannot fix that, so
-    // pull the diagonal blocks toward their environment-only form first.
+    // Plug-in estimates need not give a positive definite Omega_m. The usual reason is a
+    // NEGATIVE estimate of the tested component for one or both traits (it is kept
+    // unconstrained, see coher_fit), which makes S1 or S2 nearly singular in small genes.
+    // Repairs, in this order:
+    //   1. shrink the NEGATIVE tested-component parts of S1 / S2 toward zero;
+    //   2. shrink the GENETIC part of S12 (the background components) toward zero.
+    // The scalar parts e1, e2 and e12 are NEVER changed: they also give the n - K repeated
+    // eigenvalues below, and changing them in Omega_m only (as an earlier version did when it
+    // shrank all of S12) breaks the cancellation between the two, which shifted the mean of
+    // the null distribution by up to several standard deviations (p values down to 1e-300
+    // for phenotypes with environmental correlation).
+    const Eigen::MatrixXd I = Eigen::MatrixXd::Identity(K, K);
+    const Eigen::MatrixXd G12 = F.S12 - F.e12 * I;           // genetic part of S12
+    double tau = 1.0, shrink = 1.0; bool have = false;
     Eigen::LLT<Eigen::MatrixXd> llt;
-    double shrink = 1.0, dshrink = 1.0; bool have = false;
-    for (int it = 0; it < 16; ++it) {
+    for (int it = 0; it < 40; ++it) {
+        Om.topLeftCorner(K, K)     = F.S1 - (F.t1 < 0.0 ? (1.0 - tau) : 0.0) * F.T1;
+        Om.bottomRightCorner(K, K) = F.S2 - (F.t2 < 0.0 ? (1.0 - tau) : 0.0) * F.T2;
+        Om.topRightCorner(K, K)    = shrink * G12 + F.e12 * I;
+        Om.bottomLeftCorner(K, K)  = Om.topRightCorner(K, K);
         llt.compute(Om);
         if (llt.info() == Eigen::Success) { have = true; break; }
-        if (Eigen::LLT<Eigen::MatrixXd>(Om.topLeftCorner(K, K)).info() != Eigen::Success ||
-            Eigen::LLT<Eigen::MatrixXd>(Om.bottomRightCorner(K, K)).info() != Eigen::Success) {
-            dshrink *= 0.5;
-            Om.topLeftCorner(K, K) =
-                dshrink * F.S1 + (1.0 - dshrink) * F.e1 * Eigen::MatrixXd::Identity(K, K);
-            Om.bottomRightCorner(K, K) =
-                dshrink * F.S2 + (1.0 - dshrink) * F.e2 * Eigen::MatrixXd::Identity(K, K);
-        } else {
-            shrink *= 0.5;
-        }
-        Om.topRightCorner(K, K)   = shrink * F.S12;
-        Om.bottomLeftCorner(K, K) = shrink * F.S12;
+        if ((F.t1 < 0.0 || F.t2 < 0.0) && tau > 1e-6) tau *= 0.5;
+        else if (shrink > 1e-6) shrink *= 0.5;
+        else break;
     }
     if (!have) return false;
     Eigen::MatrixXd Cf = llt.matrixL();
@@ -1822,6 +1648,7 @@ struct BinExact {
     GenoMat LoF, PiF;                           // n x P: lo and null P(case)
     std::vector< const std::vector<unsigned char>* > b;   // raw 0/1 per trait
     std::vector<double> delta, ncase;
+    std::vector<double> vbar;                   // per trait: delta^2 * mean_i pi_i (1 - pi_i)
     double ec_max;
     double grid_p;                              // lattice convolution when saddlepoint p < grid_p
     BinExact() : active(false), ec_max(10.0), grid_p(0.1) {}
@@ -1829,7 +1656,7 @@ struct BinExact {
 
 struct PhenoStats {
     Eigen::MatrixXd Y; GenoMat Yf;
-    std::vector<double> Vp, yty, kur, ycross;
+    std::vector<double> Vp, yty, ycross;
     CoherBin cb;
     BinExact bx;
 };
@@ -1947,30 +1774,21 @@ static void build_pheno_stats(const ChunkContext& ctx, const Eigen::MatrixXd& of
         S.Vp[t]  = (S.Y.col(t).array() - m).square().sum() / (n - 1);
         S.yty[t] = S.Y.col(t).squaredNorm();
     }
-    S.kur.clear();
-    if (binary) {
-        S.kur.assign((size_t) P * (MAXCUM + 1), 0.0);
-        for (int t = 0; t < P; ++t) {
-            Eigen::ArrayXd d = S.Y.col(t).array() - S.Y.col(t).mean();
-            double mu[MAXCUM + 1]; mu[0] = 1.0; mu[1] = 0.0;
-            Eigen::ArrayXd pw = d;
-            for (int r = 2; r <= MAXCUM; ++r) { pw = pw * d; mu[r] = pw.sum() / (double) n; }
-            double kp[MAXCUM + 1]; moms_to_cums(mu, kp, MAXCUM);
-            for (int r = 1; r <= MAXCUM; ++r) S.kur[(size_t) t * (MAXCUM + 1) + r] = kp[r];
-        }
-    }
     S.bx = BinExact();
     if (binary && !coher && ctx.bin_exact && (int) ctx.braw.size() == P) {
         S.bx.active = true; S.bx.ec_max = ctx.ec_max;
         S.bx.LoF.resize(n, P); S.bx.PiF.resize(n, P);
-        S.bx.b.resize(P); S.bx.delta.resize(P); S.bx.ncase.resize(P);
+        S.bx.b.resize(P); S.bx.delta.resize(P); S.bx.ncase.resize(P); S.bx.vbar.assign(P, 0.0);
         for (int t = 0; t < P; ++t) {
             const double dl = ctx.bdelta[t];
             S.bx.b[t] = &ctx.braw[t]; S.bx.delta[t] = dl; S.bx.ncase[t] = ctx.ncase[t];
+            double vb = 0.0;
             for (int i = 0; i < n; ++i) {
                 S.bx.LoF(i, t) = (float)(S.Y(i, t) - dl * (double) ctx.braw[t][i]);
                 S.bx.PiF(i, t) = ctx.bpi[t][i];
+                vb += (double) ctx.bpi[t][i] * (1.0 - (double) ctx.bpi[t][i]);
             }
+            S.bx.vbar[t] = dl * dl * vb / n;
         }
     }
     S.ycross.clear(); S.cb = CoherBin();
@@ -2177,8 +1995,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
 // ===========================================================================
 // Chunk geometry: everything that depends on the GENOTYPES and cov_df but NOT
 // on the phenotype -- the Gram, G^2, the moment matrix T and its decomposition,
-// and (when SPA is on) the Cholesky factor L, the block outer products W and
-// the binary diagonal Sb2.
+// and (when SPA is on) the Cholesky factor L and the block outer products W.
 //
 // This is ~97% of the cost of a window at K ~ 3000: the Gram alone is nK^2/2
 // flops against nKP for q = V'y. Building it once and sweeping the phenotype
@@ -2198,12 +2015,6 @@ struct ChunkGeom {
     bool have_L, use_wcache;
     Eigen::MatrixXd L;
     std::vector<Eigen::MatrixXd> W;
-    std::vector<double> Sb2;
-    // lazy 4-cumulant cache, per tested category; filled on first use and then
-    // shared by every variant, since none of it involves y either
-    std::vector<char> cum4_tried, have_cum4;
-    std::vector<Eigen::VectorXd> lamB;
-    std::vector<Eigen::MatrixXd> Spow;
     ChunkGeom() : ok(false), K(0), A(0), C(0), env(0), has_f(false),
                   have_L(false), use_wcache(false) {}
 };
@@ -2286,27 +2097,6 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
         }
     }
 
-    // ---- binary: sum_i B_ii^2 per TESTED CATEGORY, once per chunk ----------
-    // M_0 differs between categories (row c of Tinv), so one diagonal per
-    // category -- but still independent of the trait, so A passes not A*P.
-    // Sb2 must be EAGER: it corrects var0, which feeds the Wald screen itself.
-    // It is only O(nK), so that is cheap.
-    gm.Sb2.assign(A, 0.0);
-    if (binary && spa && gm.have_L) {
-        for (int c = 0; c < A; ++c) {
-            Eigen::VectorXd bdiag = Eigen::VectorXd::Constant(n, gm.Tinv(c, env));
-            for (int a = 0; a < C; ++a) {
-                const double dm = gm.Tinv(c, a) * gm.g[a];
-                if (dm == 0.0) continue;
-                for (int j = gm.off[a]; j < gm.off[a + 1]; ++j)
-                    bdiag.array() += dm * cd.V.col(j).cast<double>().array().square();
-            }
-            gm.Sb2[c] = bdiag.squaredNorm();
-        }
-    }
-
-    gm.cum4_tried.assign(A, 0); gm.have_cum4.assign(A, 0);
-    gm.lamB.resize(A); gm.Spow.resize(A);
     gm.ok = true;
 }
 
@@ -2314,7 +2104,7 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
 static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                              const Eigen::MatrixXd& Y, const GenoMat& Yf,
                              const std::vector<double>& Vp, const std::vector<double>& yty,
-                             const std::vector<double>& kur, bool binary,
+                             bool binary,
                              bool spa, bool coher,
                              const std::vector< std::pair<int,int> >& pairs,
                              const std::vector<double>& ycross,
@@ -2368,7 +2158,6 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
     const Eigen::CompleteOrthogonalDecomposition<Eigen::MatrixXd>& Tcod = gm.Tcod;
     const Eigen::MatrixXd& L = gm.L;
     const std::vector<Eigen::MatrixXd>& W = gm.W;
-    const std::vector<double>& Sb2 = gm.Sb2;
 
     std::vector<double> d0v(C), dmv(C);
     Eigen::MatrixXd Smat, Amat;
@@ -2388,60 +2177,6 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         }
     };
 
-    // The 4-cumulant setup is LAZY and PER CATEGORY: an eigensolve with vectors
-    // plus an O(nK^2) product, so doing it eagerly for every category of every
-    // chunk multiplied the run time by roughly (1 + A). Now a category pays it
-    // only when one of its tests actually reaches the saddlepoint.
-    // Six cumulants of Q are matched, which needs cumulants of u_k^2 up to order
-    // 6, hence moments of u_k up to order 12, hence power sums to order 12.
-    // The cache lives in the geometry, so it is also shared across variants.
-    const int NPOW = 12;
-    const int NCUM = 6;
-    std::vector<char>& cum4_tried = gm.cum4_tried;
-    std::vector<char>& have_cum4  = gm.have_cum4;
-    std::vector<Eigen::VectorXd>& lamB = gm.lamB;
-    std::vector<Eigen::MatrixXd>& Spow = gm.Spow;
-    auto ensure_cum4 = [&](int c) -> bool {
-        if (cum4_tried[c]) return have_cum4[c] != 0;
-        cum4_tried[c] = 1;
-        if (!(binary && spa && have_L) || kur.empty()) return false;
-        if (!use_wcache) return false;   // Qm below indexes W; empty without the cache
-        {
-            Eigen::MatrixXd Qm = Eigen::MatrixXd::Zero(K, K);
-            for (int a = 0; a < C; ++a) {
-                const double dm = Tinv(c, a) * g[a];
-                if (dm != 0.0) Qm.noalias() += dm * W[a];
-            }
-            Qm = (0.5 * (Qm + Qm.transpose())).eval();
-            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> esQ(Qm);
-            if (esQ.info() != Eigen::Success) return false;
-            lamB[c] = esQ.eigenvalues().array() + Tinv(c, env);
-            Eigen::MatrixXd Wmat =
-                L.transpose().triangularView<Eigen::Upper>().solve(esQ.eigenvectors());
-            Spow[c] = Eigen::MatrixXd::Zero(K, NPOW + 1);
-            Eigen::VectorXd nrm2 = Eigen::VectorXd::Zero(K);
-            const int BS = 4096;
-            for (int r0 = 0; r0 < n; r0 += BS) {
-                const int rr = std::min(BS, n - r0);
-                Eigen::MatrixXd Ablk = cd.V.middleRows(r0, rr).cast<double>() * Wmat;
-                nrm2 += Ablk.colwise().squaredNorm();
-                Eigen::MatrixXd Pw = Ablk;
-                for (int r = 2; r <= NPOW; ++r) {
-                    Pw = Pw.cwiseProduct(Ablk);
-                    Spow[c].col(r) += Pw.colwise().sum().transpose();
-                }
-            }
-            bool okc = true;
-            for (int k = 0; k < K; ++k) {
-                const double nn2 = nrm2[k];
-                if (!(nn2 > 0.0) || !std::isfinite(nn2)) { okc = false; break; }
-                const double nn = std::sqrt(nn2); double pw = nn2;
-                for (int r = 2; r <= NPOW; ++r) { Spow[c](k, r) /= pw; pw *= nn; }
-            }
-            have_cum4[c] = okc ? 1 : 0;
-        }
-        return have_cum4[c] != 0;
-    };
 
     Eigen::MatrixXd U = (cd.V.transpose() * Yf).cast<double>();      // K x P, one GEMM
 
@@ -2479,9 +2214,173 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 coher_block(L, W, use_wcache, off, C, K, dm, Tinv(c, env), Acat[c]);
             }
         }
-        const bool spec_ok = spa && have_L &&
-            ((double) 4 * K * K * 8.0 * 3.0 <= 2.0e9);
-
+        // ---- conditional null (see the supplement): condition on the first trait y1 ----
+        // sigma12_hat = y1' A_c y2 = h' y2 with h = A_c y1, which given y1 is LINEAR in y2.
+        // Per-trait quantities that do not depend on the pair are cached:
+        //   a_t = L^{-1} X' y_t (coordinates of y_t in the column space of X), ||r_t||^2 the
+        //   squared norm of its orthogonal part, and the Cholesky factor of Psi_t (trait t's
+        //   m-dimensional covariance part), and, for binary traits, h = A_c y_t (an n-vector).
+        std::vector<Eigen::VectorXd> acache(P); std::vector<double> rcache(P, 0.0), e1cache(P, 1.0);
+        std::vector<char> ahave(P, 0), phave(P, 0);
+        std::vector< Eigen::LLT<Eigen::MatrixXd> > pcache(P);
+        auto prep_trait = [&](int t) {
+            if (ahave[t]) return;
+            acache[t] = L.triangularView<Eigen::Lower>().solve(U.col(t));
+            rcache[t] = std::max(0.0, yty[t] - acache[t].squaredNorm());
+            ahave[t] = 1;
+        };
+        auto prep_psi1 = [&](int t) {
+            if (phave[t]) return;
+            std::vector<double> d1(C);
+            for (int a2 = 0; a2 < C; ++a2) d1[a2] = std::max(sg[t][a2], 0.0) * g[a2];
+            e1cache[t] = std::max(sg[t][env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
+            Eigen::MatrixXd Psi1; coher_block(L, W, use_wcache, off, C, K, d1, e1cache[t], Psi1);
+            pcache[t].compute(Psi1);
+            phave[t] = 1;
+        };
+        std::vector< std::map<int, Eigen::VectorXd> > hcache(A);
+        // ---- small genes: REML-GLS conditional test ------------------------------------
+        // Given y1, y2 - mu ~ N(0, Omega(s)) on the column space of X (coordinates a2 - m)
+        // and N(0, v_perp I) on its complement, with Omega(s) = P0 - Psi12 Psi1^{-1} Psi12 + s M_c,
+        // s the (unknown) tested component of trait 2. A genetic covariance in component c
+        // adds a term proportional to h to the conditional mean, so we test the fixed effect
+        // of the covariate h (column-space part b, orthogonal part eps_c r1) by generalised
+        // least squares, with s estimated by REML (which accounts for the fixed effect, so the
+        // estimate is not driven by the h-direction of y2) and a Satterthwaite t for its
+        // uncertainty. Omega is diagonalised once per pair (generalised eigenproblem).
+        const int KREML = 512;            // = default max_gene_snps: every gene block uses this test
+        auto coher_reml_test = [&](int c, int t1, int t2, const Eigen::VectorXd& b, const Eigen::VectorXd& a1,
+                                   double r1, double e1, double e2, double e12, const Eigen::VectorXd& w,
+                                   const Eigen::MatrixXd& Psi12, const Eigen::MatrixXd& P0, const Eigen::MatrixXd& M,
+                                   const Eigen::LLT<Eigen::MatrixXd>& l1, double ec,
+                                   const std::vector<double>& yty_, double y12, double& tst, double& nu) -> bool {
+            (void) t1; (void) w; (void) yty_;
+            prep_trait(t2);
+            const Eigen::VectorXd& a2 = acache[t2];
+            const double vperp = e2 - e12 * e12 / e1;
+            if (!(vperp > 0.0)) return false;
+            // conditional mean and covariance on the column space
+            const Eigen::VectorXd z = a2 - Psi12 * l1.solve(a1);
+            Eigen::MatrixXd P0c = P0 - Psi12 * l1.solve(Psi12);
+            P0c = (0.5 * (P0c + P0c.transpose())).eval();
+            Eigen::LLT<Eigen::MatrixXd> lp(P0c);
+            if (lp.info() != Eigen::Success) return false;
+            const Eigen::MatrixXd Fi = lp.matrixL().solve(Eigen::MatrixXd::Identity(K, K));   // F^{-1}
+            Eigen::MatrixXd Sm = Fi * M * Fi.transpose(); Sm = (0.5 * (Sm + Sm.transpose())).eval();
+            Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Sm);
+            if (es.info() != Eigen::Success) return false;
+            const Eigen::VectorXd lam = es.eigenvalues().cwiseMax(0.0);
+            const Eigen::VectorXd zt = es.eigenvectors().transpose() * (Fi * z);
+            const Eigen::VectorXd bt = es.eigenvectors().transpose() * (Fi * b);
+            // orthogonal part: covariate eps_c r1, response r1'(y2 - mu)
+            const double zo = (y12 - a1.dot(a2)) - (e12 / e1) * r1;   // r1'(y2 - mu)
+            const double No = ec * zo / vperp, Do = ec * ec * r1 / vperp;
+            auto parts = [&](double sv, double& N, double& D, double& zz, double& ld) {
+                N = No; D = Do; zz = 0.0; ld = 0.0;
+                for (int k = 0; k < K; ++k) {
+                    const double d = 1.0 + sv * lam[k];
+                    N += bt[k] * zt[k] / d; D += bt[k] * bt[k] / d; zz += zt[k] * zt[k] / d; ld += std::log(d);
+                }
+            };
+            auto reml = [&](double sv) {                      // REML log likelihood (up to a constant)
+                double N, D, zz, ld; parts(sv, N, D, zz, ld);
+                if (!(D > 0.0)) return -1e300;
+                return -0.5 * (ld + zz - N * N / D + std::log(D));
+            };
+            // maximise over s >= 0 on a log grid, then golden-section refinement
+            const double lmax = lam.maxCoeff();
+            if (!(lmax > 0.0)) {                              // no information on s: plain GLS
+                double N, D, zz, ld; parts(0.0, N, D, zz, ld);
+                tst = N / std::sqrt(D); nu = 1e300; return std::isfinite(tst);
+            }
+            double best = 0.0, fbest = reml(0.0);
+            for (int k = -6; k <= 6; ++k) {
+                const double sv = std::pow(10.0, k) / lmax, f = reml(sv);
+                if (f > fbest) { fbest = f; best = sv; }
+            }
+            double lo = (best > 0.0) ? best / 10.0 : 0.0, hi = (best > 0.0) ? best * 10.0 : 1e-6 / lmax;
+            const double gr = 0.5 * (std::sqrt(5.0) - 1.0);
+            double x1 = hi - gr * (hi - lo), x2 = lo + gr * (hi - lo), f1 = reml(x1), f2 = reml(x2);
+            for (int it = 0; it < 60; ++it) {
+                if (f1 > f2) { hi = x2; x2 = x1; f2 = f1; x1 = hi - gr * (hi - lo); f1 = reml(x1); }
+                else         { lo = x1; x1 = x2; f1 = f2; x2 = lo + gr * (hi - lo); f2 = reml(x2); }
+            }
+            double sh = (f1 > f2) ? x1 : x2;
+            if (reml(0.0) >= std::max(f1, f2)) sh = 0.0;
+            double N, D, zz, ld; parts(sh, N, D, zz, ld);
+            if (!(D > 0.0)) return false;
+            tst = N / std::sqrt(D);
+            // Satterthwaite: Var(beta_hat) = 1 / D(s); with the REML information on s,
+            //   nu = 2 Var(beta_hat)^2 info(s) / (d Var(beta_hat) / ds)^2   at s = s_hat.
+            // At (or near) the boundary s_hat = 0 this approximation breaks down, and an estimate
+            // of 0 can badly underestimate a real heritability of trait 2 in a small gene; there we
+            // use nu = K - 1 (the gene directions left after the fixed effect), which keeps such
+            // tests from being treated as exactly normal. For genes without heritability this is
+            // conservative for small genes, which costs no power: co-heritability needs both traits
+            // to be heritable at the gene.
+            auto curv = [&](double sv) {                       // -d2 REML / ds2 at sv (one-sided at 0)
+                const double hs = std::max(1e-3 * sv, 1e-4 / lmax);
+                const double f0 = reml(sv), fp = reml(sv + hs);
+                if (sv - hs >= 0.0) return -(fp - 2.0 * f0 + reml(sv - hs)) / (hs * hs);
+                return -(reml(sv + 2.0 * hs) - 2.0 * fp + f0) / (hs * hs);
+            };
+            const double info0 = curv(0.0);
+            const double se0 = (info0 > 0.0) ? 1.0 / std::sqrt(info0) : 1.0 / lmax;
+            nu = std::max(1.0, (double) K - 1.0);
+            if (sh > 0.1 * se0) {
+                const double info = curv(sh);
+                const double hs = std::max(1e-3 * sh, 1e-4 / lmax);
+                double N1, D1, z1, l1d, N2, D2, z2, l2d;
+                parts(sh, N1, D1, z1, l1d); parts(sh + hs, N2, D2, z2, l2d);
+                const double dv = (1.0 / D2 - 1.0 / D1) / hs;  // d Var(beta_hat) / ds
+                if (info > 0.0 && std::abs(dv) > 0.0) nu = 2.0 * (1.0 / D1) * (1.0 / D1) * info / (dv * dv);
+            }
+            if (nu < 1.0) nu = 1.0;
+            return std::isfinite(tst);
+        };
+        // trait-2 parts per (trait, category): P0 = m-dimensional covariance WITHOUT the tested
+        // component (background components and e2 from y2 itself), and the traces giving
+        // Var(sigma2_c hat) = 2 (tau0 + tau1 s + tau2 s^2) as a function of the tested
+        // component s (univariate null variance 2 tr((A_c Sigma2)^2), expanded in s)
+        std::vector<Eigen::MatrixXd> Mc(A);
+        std::vector<double> tau2c(A, 0.0);
+        std::vector<char> mhave(A, 0);
+        struct T2 { Eigen::MatrixXd P0; double e2, tau0, tau1; };
+        std::vector< std::map<int, T2> > t2cache(A);
+        auto get_M = [&](int c) {
+            if (mhave[c]) return;
+            std::vector<double> dt(C, 0.0); dt[c] = g[c];
+            coher_block(L, W, use_wcache, off, C, K, dt, 0.0, Mc[c]);
+            Eigen::MatrixXd RM = Acat[c] * Mc[c];
+            tau2c[c] = (RM.cwiseProduct(RM.transpose())).sum();
+            mhave[c] = 1;
+        };
+        auto get_t2 = [&](int c, int t) -> const T2& {
+            std::map<int, T2>::iterator it = t2cache[c].find(t);
+            if (it == t2cache[c].end()) {
+                get_M(c);
+                T2 v;
+                std::vector<double> d2(C);
+                for (int a2 = 0; a2 < C; ++a2) d2[a2] = (a2 == c) ? 0.0 : std::max(sg[t][a2], 0.0) * g[a2];
+                v.e2 = std::max(sg[t][env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
+                coher_block(L, W, use_wcache, off, C, K, d2, v.e2, v.P0);
+                Eigen::MatrixXd RP = Acat[c] * v.P0, RM = Acat[c] * Mc[c];
+                const double ec = Tinv(c, env);
+                v.tau0 = (RP.cwiseProduct(RP.transpose())).sum() + (double) (n - K) * ec * ec * v.e2 * v.e2;
+                v.tau1 = 2.0 * (RP.cwiseProduct(RM.transpose())).sum();
+                it = t2cache[c].insert(std::make_pair(t, v)).first;
+            }
+            return it->second;
+        };
+        auto get_h = [&](int c, int t) -> const Eigen::VectorXd& {
+            std::map<int, Eigen::VectorXd>::iterator it = hcache[c].find(t);
+            if (it == hcache[c].end()) {
+                Eigen::VectorXd wv;
+                coher_wvec(cd.V, off, C, K, g, Tinv, c, env, U.col(t), Y.col(t), wv);
+                it = hcache[c].insert(std::make_pair(t, wv)).first;
+            }
+            return it->second;
+        };
         for (int pi = 0; pi < (int) pairs.size(); ++pi) {
             const int t1 = pairs[pi].first, t2 = pairs[pi].second;
             Eigen::VectorXd q(C + 1);
@@ -2505,49 +2404,137 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             if (!spa || !have_L) continue;
 
             for (int c = 0; c < A; ++c) {
-                CoherFit F;
-                double Sb2c = 0.0;
+                const double Q = s12[c];
+                // ---- BINARY: exact conditional distribution given the lower-prevalence trait ----
+                // Q = c0 + sum_i delta h_i b_i, b_i ~ Bernoulli(pi_i) independently. The tail is
+                // driven by the few individuals with large |h_i| (carriers): up to 500 of them,
+                // with |delta h_i| >= 0.05 SD, are kept as exact two-point terms; the rest is
+                // Gaussian (exact mean and variance). The terms are combined by saddlepoint or,
+                // when that fails or p < 0.1, by the lattice convolution (as for single traits).
                 if (binary && cb.active) {
-                    Eigen::VectorXd md; coher_mdiag(cd.V, off, C, g, Tinv, c, env, n, md);
-                    Sb2c = md.squaredNorm();
-                }
-                coher_fit(c, Tinv, C, env, g, off, K, n, L, W, use_wcache, Acat[c],
-                          sg[t1], sg[t2], s12, Vp[t1], Vp[t2],
-                          (binary && cb.active) ? cb.k22[pi] : 0.0, Sb2c, F);
-                if (!F.ok) continue;
-                // Wald p from the closed-form variance: used ONLY as a fallback
-                // when the saddlepoint cannot be computed (flagged spa_used = 0).
-                const double p_wald =
-                    std::erfc(std::abs(s12[c] / std::sqrt(F.var0)) / std::sqrt(2.0));
-                // ---- BINARY: exact conditional saddlepoint ------------------
-                if (binary && cb.active) {
-                    const int tc = cb.cond_t[pi], trd = cb.rand_t[pi];
-                    Eigen::VectorXd wv;
-                    coher_wvec(cd.V, off, C, K, g, Tinv, c, env, U.col(tc),
-                                   Y.col(tc), wv);
-                    std::vector<double> cvec(n);
-                    double A = 0.0;
+                    const int tc = cb.cond_t[pi];
+                    const Eigen::VectorXd& wv = get_h(c, tc);
                     const double dl = cb.cdelta[pi];
+                    const std::vector<float>& cy = cb.cylo[pi];
+                    const std::vector<float>& cp = cb.cpi[pi];
+                    double c0 = 0.0, sd2 = 0.0;
                     for (int i = 0; i < n; ++i) {
-                        A += wv[i] * cb.cylo[pi][i];
-                        cvec[i] = dl * wv[i];
+                        c0 += wv[i] * cy[i];
+                        const double ci = dl * wv[i];
+                        sd2 += ci * ci * cp[i] * (1.0 - cp[i]);
                     }
-                    QuadSpaResult br = bern_spa_solve(s12[c], cvec, cb.cpi[pi], A);
-                    if (br.converged) { cr.p_spa[c][pi] = br.p; cr.spa_used[c][pi] = 4; }
-                    else                  { cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; }
+                    const double thr = 0.05 * std::sqrt(sd2);
+                    std::vector<int> big;
+                    for (int i = 0; i < n; ++i) if (std::abs(dl * wv[i]) > thr) big.push_back(i);
+                    const size_t MAXT = 500;
+                    if (big.size() > MAXT) {
+                        std::nth_element(big.begin(), big.begin() + MAXT, big.end(),
+                                         [&](int x, int y) { return std::abs(wv[x]) > std::abs(wv[y]); });
+                        big.resize(MAXT);
+                    }
+                    std::vector<char> isbig(n, 0);
+                    std::vector<ExactTerm> terms; terms.reserve(big.size());
+                    for (size_t r = 0; r < big.size(); ++r) {
+                        const int i = big[r]; isbig[i] = 1;
+                        const double pr = std::min(std::max((double) cp[i], 1e-12), 1.0 - 1e-12);
+                        ExactTerm e; e.v.resize(2); e.lp.resize(2);
+                        e.v[0] = 0.0; e.lp[0] = std::log1p(-pr);
+                        e.v[1] = dl * wv[i]; e.lp[1] = std::log(pr);
+                        terms.push_back(e);
+                    }
+                    double mr = 0.0, vr = 0.0;
+                    for (int i = 0; i < n; ++i) {
+                        if (isbig[i]) continue;
+                        const double ci = dl * wv[i];
+                        mr += ci * cp[i]; vr += ci * ci * cp[i] * (1.0 - cp[i]);
+                    }
+                    // the Gaussian rest as lambda (z + nu)^2 with large nu: mean and variance
+                    // exact, skewness 3 / nu (negligible), so the univariate machinery applies
+                    std::vector<double> lamd, nc2d; double Cc = c0 + mr;
+                    if (vr > 0.0) {
+                        const double nu = 1000.0, lam = std::sqrt(vr / (2.0 * (1.0 + 2.0 * nu * nu)));
+                        lamd.push_back(lam); nc2d.push_back(nu * nu); Cc -= lam * (1.0 + nu * nu);
+                    }
+                    ExactSpaResult er; er.converged = false;
+                    if (!terms.empty() || !lamd.empty()) {
+                        er = exact_spa_solve(Q, terms, lamd, nc2d, Cc);
+                        if (!terms.empty() && !er.exact &&
+                            (!er.converged || std::min(er.p_up, er.p_lo) < 0.1)) {
+                            ExactSpaResult eg = exact_grid_solve(Q, terms, lamd, nc2d, Cc);
+                            if (eg.converged) er = eg;
+                        }
+                    }
+                    if (er.converged) {
+                        cr.p_spa[c][pi] = std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo));
+                        cr.spa_used[c][pi] = 4;
+                    } else { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
                     continue;
                 }
-                if (!spec_ok) {
-                    cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; continue;
+
+                // ---- QUANTITATIVE: conditional null given y1 ----------------------------------
+                // y2 | y1 ~ N(S21 S1^{-1} y1, S2 - S21 S1^{-1} S12), so Q | y1 is EXACTLY normal
+                // with mean h'mu and variance h'V h. With b = R_c a1 (R_c the m-dimensional part of
+                // A_c) and r1 the part of y1 orthogonal to the columns of X (Lemma 1):
+                //   h'mu  = b' Psi12 Psi1^{-1} a1 + eps_c (e12 / e1) |r1|^2
+                //   h'V h = b' Psi2 b - (Psi12 b)' Psi1^{-1} (Psi12 b) + eps_c^2 |r1|^2 (e2 - e12^2 / e1)
+                // Psi1 is a function of y1 (conditioned on). The only nuisance from y2 that matters is
+                // the tested component of trait 2 (s), which enters h'V h as s * b' M_c b. It is
+                // estimated from y2 with its h-direction removed (so (nearly) independent of h'y2),
+                // and its uncertainty is propagated by a Satterthwaite approximation:
+                //   (Q - h'mu) / sqrt(V_hat) ~ t_nu,   nu = 2 V_hat^2 / ((b' M_c b)^2 Var(s_hat)).
+                // For genes with many variants nu is large and this is the normal test; for small
+                // genes where trait 2 is heritable, s_hat has few degrees of freedom and the t
+                // distribution prevents the inflation a plug-in normal test would have.
+                prep_trait(t1); prep_psi1(t1);
+                if (pcache[t1].info() != Eigen::Success) { cr.spa_used[c][pi] = -1; continue; }
+                const Eigen::VectorXd& a1 = acache[t1];
+                const double r1 = rcache[t1], e1 = e1cache[t1], ec = Tinv(c, env);
+                const Eigen::VectorXd b = Acat[c] * a1;
+                const double hh = b.squaredNorm() + ec * ec * r1;
+                if (!(hh > 0.0)) { cr.spa_used[c][pi] = -1; continue; }
+                const T2& t2p = get_t2(c, t2);
+                // tested component of trait 2 from y2 with the h-direction removed
+                const Eigen::VectorXd u2p = U.col(t2) - (L * b) * (Q / hh);
+                Eigen::VectorXd qp(C + 1);
+                for (int cc = 0; cc < C; ++cc) {
+                    double qa = 0.0;
+                    for (int j = off[cc]; j < off[cc + 1]; ++j) qa += u2p[j] * u2p[j];
+                    qp[cc] = g[cc] * qa;
                 }
-                std::vector<double> eig; double erep, l2, nrep;
-                if (!coher_spectrum(F, K, n, eig, erep, l2, nrep)) {
-                    cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; continue;
+                qp[env] = yty[t2] - Q * Q / hh;
+                const double s2 = Tcod.solve(qp)[c];
+                const double e2 = t2p.e2;
+                double e12 = s12[env];
+                const double ecap = 0.999 * std::sqrt(e1 * e2);
+                if (e12 > ecap) e12 = ecap; if (e12 < -ecap) e12 = -ecap;
+                std::vector<double> d12(C);
+                for (int a2 = 0; a2 < C; ++a2) d12[a2] = (a2 == c) ? 0.0 : s12[a2] * g[a2];   // null: no covariance in c
+                Eigen::MatrixXd Psi12;
+                coher_block(L, W, use_wcache, off, C, K, d12, e12, Psi12);
+                const Eigen::VectorXd w = Psi12 * b;
+                const double hm = w.dot(pcache[t1].solve(a1)) + ec * (e12 / e1) * r1;
+                const double V0 = b.dot(t2p.P0 * b) - w.dot(pcache[t1].solve(w)) + ec * ec * r1 * (e2 - e12 * e12 / e1);
+                const double bm = b.dot(Mc[c] * b);
+                if (!(V0 > 0.0) || !std::isfinite(V0)) { cr.spa_used[c][pi] = -1; continue; }
+                if (K <= KREML) {                 // small genes: REML-GLS test (below)
+                    double tst, nu;
+                    if (coher_reml_test(c, t1, t2, b, a1, r1, e1, e2, e12, w, Psi12, t2p.P0, Mc[c], pcache[t1],
+                                        ec, yty, ycross[pi], tst, nu)) {
+                        cr.p_spa[c][pi] = t_two_sided_p(tst, nu); cr.spa_used[c][pi] = 7;
+                    } else { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
+                    continue;
                 }
-                QuadSpaResult qr = quad_spa_solve(s12[c], eig, erep, nrep,
-                                                  100, 1e-8, l2, nrep);
-                if (qr.converged) { cr.p_spa[c][pi] = qr.p; cr.spa_used[c][pi] = 1; }
-                else              { cr.p_spa[c][pi] = p_wald; cr.spa_used[c][pi] = 0; }
+                // large genes: s_hat has many degrees of freedom; include it only when clearly
+                // positive (> 2 null SD), with a Satterthwaite t for its uncertainty
+                const double sd0 = std::sqrt(2.0 * t2p.tau0);
+                double V = V0, nu = 1e300;
+                if (s2 > 2.0 * sd0) {
+                    const double var_s = 2.0 * (t2p.tau0 + t2p.tau1 * s2 + tau2c[c] * s2 * s2);
+                    V = V0 + s2 * bm;
+                    nu = 2.0 * V * V / (bm * bm * var_s);
+                }
+                cr.p_spa[c][pi] = t_two_sided_p((Q - hm) / std::sqrt(V), nu);
+                cr.spa_used[c][pi] = 6;
             }
         }
         finish_se();
@@ -2771,12 +2758,6 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             if (n_rep > 0) var0 += (double) n_rep * 2.0 * eig_rep * eig_rep;
             if (!(var0 > 0.0)) continue;
 
-            double cscale = 1.0;                       // binary variance correction
-            if (binary && Sb2[c] > 0.0) {
-                const double d2 = kur[(size_t) t * (MAXCUM + 1) + 4] * Sb2[c];
-                if (var0 + d2 > 0.0) { cscale = std::sqrt((var0 + d2) / var0); var0 += d2; }
-            }
-
             // Every test goes to the saddlepoint (no Wald screen). The Wald p
             // from the closed-form variance is kept ONLY as the fallback for a
             // saddlepoint that fails (spa_used = 0).
@@ -2806,7 +2787,11 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     const int nd = (int) dns.size();
                     Eigen::MatrixXd LD(nd, K);
                     for (int r = 0; r < nd; ++r) LD.row(r) = L.row(dns[r]);
-                    Eigen::MatrixXd Sig = LD * Smat * LD.transpose();       // Cov of the dense scores
+                    // Cov of the dense scores under the Bernoulli null: delta^2 X_D' diag(pi(1-pi)) X_D,
+                    // approximated by vbar X_D' X_D (exact when pi is constant). NOT the Gaussian-null
+                    // Smat: its residual variance is estimated from y (minus any LOCO score), which
+                    // is not the Bernoulli variance when a polygenic score is subtracted.
+                    Eigen::MatrixXd Sig = bx.vbar[t] * (LD * LD.transpose());
                     Sig = (0.5 * (Sig + Sig.transpose())).eval();
                     Eigen::VectorXd ad(nd), md(nd);
                     for (int r = 0; r < nd; ++r) {
@@ -2859,77 +2844,12 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     }
                 }
             }
+            // binary phenotypes use the exact computation only: if it is not possible, the
+            // p value is reported as NA (spa_used = -1) rather than from an approximation
+            if (binary) { cr.p_spa[c][t] = NA_REAL; cr.spa_used[c][t] = -1; continue; }
 
-            // 4-cumulant path first: when it succeeds, none of the Cholesky of
-            // Smat, the Cf products, or the eigensolve below is needed.
-            bool used_cum4 = false;
-            if (binary && ensure_cum4(c) && lamB[c].size() == K) {
-                const double* kz = &kur[(size_t) t * (MAXCUM + 1)];
-                double KQ[NCUM + 1] = {0,0,0,0,0,0,0};
-                bool ok4 = true;
-                for (int k = 0; k < K && ok4; ++k) {
-                    double ku[MAXCUM + 1] = {0};
-                    for (int r = 2; r <= NPOW; ++r) ku[r] = kz[r] * Spow[c](k, r);
-                    double mu[MAXCUM + 1]; cums_to_moms(ku, mu, NPOW);
-                    double ms[NCUM + 1]; ms[0] = 1.0;
-                    for (int s2 = 1; s2 <= NCUM; ++s2) ms[s2] = mu[2 * s2];
-                    double csq[NCUM + 1]; moms_to_cums(ms, csq, NCUM);
-                    double lp = 1.0;
-                    for (int mm = 1; mm <= NCUM; ++mm) {
-                        lp *= lamB[c][k];
-                        if (!std::isfinite(csq[mm])) { ok4 = false; break; }
-                        KQ[mm] += lp * csq[mm];
-                    }
-                }
-                if (ok4) {
-                    const double cev = Tinv(c, env), Vpt = (Vp[t] > 0 ? Vp[t] : 1.0);
-                    const double fac[NCUM + 1] = {0, 1, 2, 8, 48, 384, 3840};
-                    double lp = 1.0, vp = 1.0;
-                    for (int mm = 1; mm <= NCUM; ++mm) {
-                        lp *= cev; vp *= Vpt;
-                        KQ[mm] += fac[mm] * (double)(n - K) * lp * vp;
-                    }
-                    // Pin kappa2 to the exact var0. Two variants (TEST SWITCH):
-                    //   default           : rescale ALL cumulants by s^m (keeps the standardized shape)
-                    //   SPARROW_PIN_VAR=1 : replace kappa2 only, keep kappa3..kappa6 as computed.
-                    //     The null-phenotype evaluation showed the default shrinks skewness /
-                    //     kurtosis by (kt2/var0)^{(m-2)/2} with kt2/var0 ~ 1.15-1.3, i.e. the
-                    //     independence step mainly overstates kappa2, not the higher cumulants.
-                    static const bool pin_var_only = (std::getenv("SPARROW_PIN_VAR") != 0);
-                    if (KQ[2] > 0.0 && var0 > 0.0 && std::isfinite(KQ[2])) {
-                        if (pin_var_only) {
-                            KQ[2] = var0;
-                        } else {
-                            const double s = std::sqrt(var0 / KQ[2]);
-                            double sp = 1.0;
-                            for (int mm = 1; mm <= NCUM; ++mm) { sp *= s; KQ[mm] *= sp; }
-                        }
-                    }
-                    if (std::isfinite(KQ[2]) && KQ[2] > 0) {
-                        std::vector<double> none;
-                        double L3[3], N3[3];
-                        if (fit_three_component(KQ, L3, N3)) {
-                            QuadSpaResult q6 = quad_spa_solve(sigma[c], none, L3[0], N3[0],
-                                                              100, 1e-8, L3[1], N3[1],
-                                                              L3[2], N3[2], one_sided ? 1 : 0);
-                            if (q6.converged) {
-                                cr.p_spa[c][t] = q6.p; cr.spa_used[c][t] = 3; used_cum4 = true;
-                            }
-                        }
-                        double l1, v1, l2, v2;
-                        if (!used_cum4 && fit_two_component(KQ, &l1, &v1, &l2, &v2)) {
-                            QuadSpaResult q4 = quad_spa_solve(sigma[c], none, l1, v1,
-                                                              100, 1e-8, l2, v2, 0.0, 0.0, one_sided ? 1 : 0);
-                            if (q4.converged) {
-                                cr.p_spa[c][t] = q4.p; cr.spa_used[c][t] = 2; used_cum4 = true;
-                            }
-                        }
-                    }
-                }
-            }
-            if (used_cum4) continue;
 
-            // ---- fallback: build Asym and solve the eigenproblem -------------
+            // ---- quantitative: build Asym and solve the eigenproblem ---------
             Eigen::LLT<Eigen::MatrixXd> lltS(Smat);
             if (lltS.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
             Eigen::MatrixXd Cf = lltS.matrixL();
@@ -2939,12 +2859,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             if (ses.info() != Eigen::Success) { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; continue; }
             const Eigen::VectorXd& ev = ses.eigenvalues();
             std::vector<double> eig(ev.data(), ev.data() + K);
-            double eig_rep_s = eig_rep;
-            if (cscale != 1.0) {
-                for (size_t e = 0; e < eig.size(); ++e) eig[e] *= cscale;
-                eig_rep_s *= cscale;
-            }
-            QuadSpaResult qr = quad_spa_solve(sigma[c], eig, eig_rep_s, n_rep, 100, 1e-8,
+            QuadSpaResult qr = quad_spa_solve(sigma[c], eig, eig_rep, n_rep, 100, 1e-8,
                                               0.0, 0.0, 0.0, 0.0, one_sided ? 1 : 0);
             if (qr.converged) { cr.p_spa[c][t] = qr.p; cr.spa_used[c][t] = 1; }
             else              { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; }
@@ -3061,7 +2976,7 @@ struct Worker : public RcppParallel::Worker {
             ChunkGeom gm; Eigen::MatrixXd G0;
             build_geom(cd, pr.cov_df, spa, pr.binary, gm, 0, multi ? &G0 : 0);   // may leave gm.ok false
             for (size_t v = 0; v < S.size(); ++v)
-                test_chunk_annot(cd, gm, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
+                test_chunk_annot(cd, gm, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty,
                                  pr.binary, spa, pr.coher, pr.pairs,
                                  S[v].ycross, S[v].cb, S[v].bx, pr.one_sided, out[v][w]);
             if (multi) {
@@ -3097,7 +3012,7 @@ struct Worker : public RcppParallel::Worker {
                         build_geom(ck, pr.cov_df, spa, pr.binary, gk, &Gk);
                         for (size_t v = 0; v < NVP; ++v) {
                             ChunkResultA tmp;
-                            test_chunk_annot(ck, gk, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty, S[v].kur,
+                            test_chunk_annot(ck, gk, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty,
                                              pr.binary, spa, pr.coher, pr.pairs,
                                              S[v].ycross, S[v].cb, S[v].bx, pr.one_sided, tmp);
                             ChunkResultA& R = out[v][w];
@@ -3667,6 +3582,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         if (!f3.is_open()) stop("Could not open " + pr.out_file + ".genes");
         f3 << "gene\tchr\tstart\tend\tblock\tn_blocks\tcategory\tm_cat\tphenotype\tvg\tse_vg\th2\tvg_env";
         if (pr.spa)        f3 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr;
+        if (pr.coher)      f3 << "\tvg_t1\tvg_t2";          // univariate estimates of both traits (for rg)
         if (pr.do_windows) f3 << "\tvg_adj\th2_adj";
         f3 << "\n";
         // Window overlap per gene block, computed ONCE. Windows tile each
@@ -3717,6 +3633,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                             wr_acv(f3, B, q, t);
                             pv.push_back(B.p_spa[q][t]); pw.push_back((double) B.cat_m[q]);
                         }
+                        if (pr.coher) { f3 << '\t'; wr(f3, B.vg_t1[q][t]); f3 << '\t'; wr(f3, B.vg_t2[q][t]); }
                         if (pr.do_windows) {
                             f3 << '\t'; wr(f3, a);
                             f3 << '\t'; wr(f3, (!std::isnan(a) && h2den(t) > 0) ? a / h2den(t) : NA_REAL);
@@ -3732,6 +3649,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                 wr(f3, acat_combine(pv, pw)); f3 << "\tNA";
                 if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f3 << "\tNA";
                 if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
+                if (pr.coher) f3 << "\tNA\tNA";
                 if (pr.do_windows) f3 << "\tNA\tNA";
                 f3 << '\n';
             }
@@ -3775,7 +3693,6 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          int collapse_mac = 0,
                          bool h2_without_prs = true,
                          bool one_sided = true,
-                         bool binary_exact = true,
                          double exact_ec = 10,
                          Rcpp::Nullable<Rcpp::NumericMatrix> covariates = R_NilValue,
                          double cov_df = NA_REAL,
@@ -3794,7 +3711,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
@@ -3933,8 +3850,8 @@ Rcpp::List stratgwas_run(const std::string& filename,
     }
     // ---- raw 0/1 phenotypes: binary co-heritability (required) and the exact ------
     // ---- per-variant saddlepoint for single binary traits (optional) ----------------
-    if (coher && binary && binary_raw.isNull())
-        stop("binary = TRUE with coher = TRUE needs binary_raw (0/1 matrix, one column per trait)");
+    if (binary && binary_raw.isNull())
+        stop("binary = TRUE needs binary_raw (the original 0/1 phenotypes, one column per trait); sparrow() passes it automatically");
     if (binary && binary_raw.isNotNull()) {
         Rcpp::NumericMatrix braw(binary_raw.get());
         if (braw.ncol() != P) stop("binary_raw must have one column per phenotype");
@@ -3983,7 +3900,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
             for (int t = 0; t < P; ++t) Rcout << " " << ctx.prev[t];
             Rcout << "\n";
         }
-        if (!coher && SPA && binary_exact) {
+        if (!coher && SPA) {
             ctx.bin_exact = true; ctx.car_max = 5000; ctx.ec_max = exact_ec;
             Rcout << "Binary phenotype: exact per-variant saddlepoint (spa_used = 5): exact case-count "
                   << "distribution for variants with <= " << exact_ec << " expected case carriers, "
@@ -3991,9 +3908,6 @@ Rcpp::List stratgwas_run(const std::string& filename,
                   << (binary_pi.isNotNull() ? "the logistic null model" : "the linear covariate fit (pass binary_pi)") << ".\n";
         }
     }
-    if (binary && !coher && !ctx.bin_exact)
-        Rcout << "Binary phenotype: 4th-cumulant variance correction + six-cumulant saddlepoint"
-              << (binary_raw.isNull() ? " (pass binary_raw to use the exact per-variant saddlepoint)" : "") << ".\n";
 
     if (!Rf_isNull(chr)) {
         Rcpp::CharacterVector cs(Rf_coerceVector(chr, STRSXP));
