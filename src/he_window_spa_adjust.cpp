@@ -1112,7 +1112,9 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
 // are on) < 1e-16 (from the exact distribution of the counts); that mass is added to both p.
 // ---------------------------------------------------------------------------
 static ExactSpaResult coher_grid_solve(double q, const std::vector<double>& v, const std::vector<double>& pr,
-                                       const BernRest* br, double C, int M = 8192) {
+                                       const BernRest* br, double C,
+                                       const std::vector<double>& lam = std::vector<double>(),
+                                       const std::vector<double>& nc2 = std::vector<double>(), int M = 8192) {
     ExactSpaResult res; res.p_up = res.p_lo = NA_REAL; res.converged = false;
     if (br && br->c.empty()) br = 0;
     double base = C;
@@ -1151,12 +1153,15 @@ static ExactSpaResult coher_grid_solve(double q, const std::vector<double>& v, c
         mG += w * c * p; vG += w * c * c * p * (1.0 - p);
         if (c < 0) Gmin += w * c; else Gmax += w * c;
     }
+    for (size_t k = 0; k < lam.size(); ++k) { mG += lam[k] * (1.0 + nc2[k]); vG += 2.0 * lam[k] * lam[k] * (1.0 + 2.0 * nc2[k]); }
+    const bool bounded = lam.empty();                // G = Bernoulli part only
+    const bool haveG = br || !lam.empty();
     const double x0 = q - base;                     // threshold for D + G
     const double span = Rp + Rn;
     const double sdG = std::sqrt(std::max(vG, 0.0));
     if (!(span > 0.0)) {                            // no discrete part: G only
-        if (!br) return res;
-        ExactSpaResult r = exact_spa_solve(x0, std::vector<ExactTerm>(), std::vector<double>(), std::vector<double>(), 0.0, br);
+        if (!haveG) return res;
+        ExactSpaResult r = exact_spa_solve(x0, std::vector<ExactTerm>(), lam, nc2, 0.0, br);
         return r;
     }
     const double h = span / M;
@@ -1183,7 +1188,7 @@ static ExactSpaResult coher_grid_solve(double q, const std::vector<double>& v, c
     for (size_t j = 0; j < dp.size(); ++j) add(dp[j], pp[j]);
     for (size_t j = 0; j < dn.size(); ++j) add(-dn[j], pn[j]);
     double pu = 0.0, pl = 0.0;
-    if (!br) {
+    if (!haveG) {
         const double tol = 2.0 * h;                 // counts the observed configuration (rounding)
         for (long k = lo; k <= hi; ++k) {
             const double D = (k - L0) * h;
@@ -1191,11 +1196,11 @@ static ExactSpaResult coher_grid_solve(double q, const std::vector<double>& v, c
             if (D <= x0 + tol) pl += pm[k];
         }
     } else {
-        const std::vector<ExactTerm> none; const std::vector<double> nolam;
+        const std::vector<ExactTerm> none;
         auto pg = [&](double x, double& up, double& lw) {
-            if (x > Gmax) { up = 0.0; lw = 1.0; return; }
-            if (x < Gmin) { up = 1.0; lw = 0.0; return; }
-            ExactSpaResult r = exact_spa_solve(x, none, nolam, nolam, 0.0, br);
+            if (bounded && x > Gmax) { up = 0.0; lw = 1.0; return; }
+            if (bounded && x < Gmin) { up = 1.0; lw = 0.0; return; }
+            ExactSpaResult r = exact_spa_solve(x, none, lam, nc2, 0.0, br);
             if (r.converged) { up = r.p_up; lw = r.p_lo; }
             else { const double z = (x - mG) / std::max(sdG, 1e-300);
                    up = 0.5 * std::erfc(z / std::sqrt(2.0)); lw = 1.0 - up; }
@@ -2650,9 +2655,54 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 // with |delta h_i| >= 0.05 SD, are kept as exact two-point terms; the rest enters
                 // through its exact (grouped) Bernoulli CGF. The terms are combined by saddlepoint
                 // or, when that fails or p < 0.1, by the lattice convolution of coher_grid_solve.
+                bool isbin = false; double pbin = NA_REAL;
                 if (binary && cb.active) {
                     const int tc = cb.cond_t[pi];
                     const Eigen::VectorXd& wv = get_h(c, tc);
+                    // GENETIC EFFECTS OF THE GENE ON THE RANDOM TRAIT. Given the fixed trait, case
+                    // status of the random trait is not exchangeable when that trait is heritable at
+                    // the gene (its carriers are more often cases), and the other components of the
+                    // gene (e.g. the common part) can carry genetic covariance. Both are added to the
+                    // Bernoulli null, on the observed scale estimated by Haseman-Elston:
+                    //   mean  + b' Psi12_bg Psi1^{-1} a1         (genetic covariance, other components)
+                    //   var   + b'(P0 - e2 I) b + s b' M_c b      (heritability of the random trait,
+                    //                                             other components and the tested one)
+                    // with b the column-space part of h, P0 the random trait's covariance without the
+                    // tested component, and s its tested component estimated from y with the
+                    // h-direction removed (inflated by one SE when the estimate is uncertain).
+                    double hmg = 0.0, Vg = 0.0;
+                    {
+                        const int trr = cb.rand_t[pi];
+                        prep_trait(tc); prep_psi1(tc); prep_trait(trr);
+                        if (pcache[tc].info() == Eigen::Success) {
+                            const Eigen::VectorXd& ab = acache[tc];
+                            const Eigen::VectorXd bb = Acat[c] * ab;
+                            const double ecb = Tinv(c, env);
+                            const double hhb = bb.squaredNorm() + ecb * ecb * rcache[tc];
+                            const T2& t2b = get_t2(c, trr);
+                            double s2b = 0.0;
+                            if (hhb > 0.0) {
+                                const Eigen::VectorXd u2p = U.col(trr) - (L * bb) * (Q / hhb);
+                                Eigen::VectorXd qp(C + 1);
+                                for (int cc = 0; cc < C; ++cc) {
+                                    double qa = 0.0;
+                                    for (int j = off[cc]; j < off[cc + 1]; ++j) qa += u2p[j] * u2p[j];
+                                    qp[cc] = g[cc] * qa;
+                                }
+                                qp[env] = yty[trr] - Q * Q / hhb;
+                                s2b = Tcod.solve(qp)[c];
+                            }
+                            const double sp = std::max(s2b, 0.0);
+                            const double se_s = std::sqrt(std::max(0.0, 2.0 * (t2b.tau0 + t2b.tau1 * sp + tau2c[c] * sp * sp)));
+                            const double s_use = sp + se_s;
+                            const double bm = bb.dot(Mc[c] * bb);
+                            Vg = std::max(0.0, bb.dot(t2b.P0 * bb) - t2b.e2 * bb.squaredNorm()) + s_use * bm;
+                            std::vector<double> d12(C);
+                            for (int a2 = 0; a2 < C; ++a2) d12[a2] = (a2 == c) ? 0.0 : s12[a2] * g[a2];
+                            Eigen::MatrixXd P12; coher_block(L, W, use_wcache, off, C, K, d12, 0.0, P12);
+                            hmg = (P12 * bb).dot(pcache[tc].solve(ab));
+                        }
+                    }
                     const double dl = cb.cdelta[pi];
                     const std::vector<float>& cy = cb.cylo[pi];
                     const std::vector<float>& cp = cb.cpi[pi];
@@ -2709,17 +2759,21 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                             br.w.push_back(it->second.second);
                         }
                     }
-                    const std::vector<double> nolam;
+                    std::vector<double> glam, gnc2; double Cg = c0 + hmg;
+                    if (Vg > 0.0) {                     // Gaussian genetic part as lambda (z + nu)^2
+                        const double nu = 1000.0, lam = std::sqrt(Vg / (2.0 * (1.0 + 2.0 * nu * nu)));
+                        glam.push_back(lam); gnc2.push_back(nu * nu); Cg -= lam * (1.0 + nu * nu);
+                    }
                     ExactSpaResult er; er.converged = false;
                     if (!terms.empty() || !br.c.empty()) {
-                        er = exact_spa_solve(Q, terms, nolam, nolam, c0, &br);
+                        er = exact_spa_solve(Q, terms, glam, gnc2, Cg, &br);
                         // saddlepoint first; for p < 0.1 (or if it fails) the lattice convolution
                         // (coher_grid_solve: terms centred at their most likely value)
                         if (!terms.empty() && !er.exact &&
                             (!er.converged || std::min(er.p_up, er.p_lo) < 0.1)) {
                             std::vector<double> tv(terms.size()), tp(terms.size());
                             for (size_t r = 0; r < terms.size(); ++r) { tv[r] = terms[r].v[1]; tp[r] = std::exp(terms[r].lp[1]); }
-                            ExactSpaResult eg = coher_grid_solve(Q, tv, tp, &br, c0);
+                            ExactSpaResult eg = coher_grid_solve(Q, tv, tp, &br, Cg, glam, gnc2);
                             if (eg.converged) er = eg;
                         }
                     }
@@ -2741,7 +2795,13 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         cr.p_spa[c][pi] = std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo));
                         cr.spa_used[c][pi] = 4;
                     } else { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
-                    continue;
+                    // ... and the quantitative REML-GLS test below on the same (0/1) phenotypes;
+                    // the reported p is the LARGER of the two. The exact test is accurate for
+                    // sparse carriers but models the genetic effects of the gene only roughly; the
+                    // REML-GLS test models them (with the small-gene protection) but treats the
+                    // 0/1 phenotypes as Gaussian. P(max(p1, p2) < alpha) <= min of the two type I
+                    // errors, so the combination is valid whenever either test is.
+                    isbin = true; pbin = cr.p_spa[c][pi];
                 }
 
                 // ---- QUANTITATIVE: conditional null given y1 ----------------------------------
@@ -2759,12 +2819,12 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 // genes where trait 2 is heritable, s_hat has few degrees of freedom and the t
                 // distribution prevents the inflation a plug-in normal test would have.
                 prep_trait(t1); prep_psi1(t1);
-                if (pcache[t1].info() != Eigen::Success) { cr.spa_used[c][pi] = -1; continue; }
+                if (pcache[t1].info() != Eigen::Success) { if (!isbin) cr.spa_used[c][pi] = -1; continue; }
                 const Eigen::VectorXd& a1 = acache[t1];
                 const double r1 = rcache[t1], e1 = e1cache[t1], ec = Tinv(c, env);
                 const Eigen::VectorXd b = Acat[c] * a1;
                 const double hh = b.squaredNorm() + ec * ec * r1;
-                if (!(hh > 0.0)) { cr.spa_used[c][pi] = -1; continue; }
+                if (!(hh > 0.0)) { if (!isbin) cr.spa_used[c][pi] = -1; continue; }
                 const T2& t2p = get_t2(c, t2);
                 // tested component of trait 2 from y2 with the h-direction removed
                 const Eigen::VectorXd u2p = U.col(t2) - (L * b) * (Q / hh);
@@ -2788,7 +2848,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 const double hm = w.dot(pcache[t1].solve(a1)) + ec * (e12 / e1) * r1;
                 const double V0 = b.dot(t2p.P0 * b) - w.dot(pcache[t1].solve(w)) + ec * ec * r1 * (e2 - e12 * e12 / e1);
                 const double bm = b.dot(Mc[c] * b);
-                if (!(V0 > 0.0) || !std::isfinite(V0)) { cr.spa_used[c][pi] = -1; continue; }
+                if (!(V0 > 0.0) || !std::isfinite(V0)) { if (!isbin) cr.spa_used[c][pi] = -1; continue; }
                 if (K <= KREML) {                 // small genes: REML-GLS test (below)
                     double tst, nu;
                     // sensitivity of the conditional mean to trait 1's tested component, and the
@@ -2805,8 +2865,10 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     }
                     if (coher_reml_test(c, t1, t2, b, a1, r1, e1, e2, e12, w, Psi12, t2p.P0, Mc[c], pcache[t1],
                                         ec, yty, ycross[pi], msl, vth[t1], xbg, tst, nu)) {
-                        cr.p_spa[c][pi] = t_two_sided_p(tst, nu); cr.spa_used[c][pi] = 7;
-                    } else { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
+                        const double pq = t_two_sided_p(tst, nu);
+                        if (isbin) { if (std::isfinite(pbin)) cr.p_spa[c][pi] = std::max(pbin, pq); }
+                        else { cr.p_spa[c][pi] = pq; cr.spa_used[c][pi] = 7; }
+                    } else if (!isbin) { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
                     continue;
                 }
                 // large genes: s_hat has many degrees of freedom; include it only when clearly
@@ -2818,8 +2880,11 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     V = V0 + s2 * bm;
                     nu = 2.0 * V * V / (bm * bm * var_s);
                 }
-                cr.p_spa[c][pi] = t_two_sided_p((Q - hm) / std::sqrt(V), nu);
-                cr.spa_used[c][pi] = 6;
+                {
+                    const double pq = t_two_sided_p((Q - hm) / std::sqrt(V), nu);
+                    if (isbin) { if (std::isfinite(pbin)) cr.p_spa[c][pi] = std::max(pbin, pq); }
+                    else { cr.p_spa[c][pi] = pq; cr.spa_used[c][pi] = 6; }
+                }
             }
         }
         finish_se();
@@ -3996,7 +4061,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components; binary: gene genetic part + max with REML-GLS], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
