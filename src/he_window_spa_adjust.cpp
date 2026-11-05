@@ -19,6 +19,10 @@
 #include <utility>
 #include <cstdint>
 #include <map>
+#include <climits>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <functional>
 
@@ -1088,6 +1092,130 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
             pl += pk * std::exp(ll0 + f * (ll1 - ll0));
         }
         { double u, l; pg(Dq - Mc * h, u, l); pl += ovf * l; }
+    }
+    res.p_up = std::min(1.0, std::max(pu + dropped, 1e-300));
+    res.p_lo = std::min(1.0, std::max(pl + dropped, 1e-300));
+    res.converged = std::isfinite(res.p_up) && std::isfinite(res.p_lo);
+    return res;
+}
+
+// ---------------------------------------------------------------------------
+// Lattice convolution for BINARY CO-HERITABILITY: Q = C + sum_j v_j b_j + G, with b_j ~
+// Bernoulli(p_j) two-point terms (the carriers) and G the Bernoulli rest (BernRest, tail by
+// saddlepoint). Unlike exact_grid_solve (which shifts every term to its minimum, fine for
+// the squared counts of single traits), each term is centred at its MOST LIKELY value, so
+// that the lattice only has to resolve the few terms that are "on": with hundreds of terms
+// with the same negative coefficient, shifting to the minimum puts the bulk of the
+// distribution far from zero, and the rounding errors of all terms then add up instead of
+// cancelling. The lattice spans [-R-, R+], where R+ (R-) is the sum of the k largest positive
+// (negative) increments and k is chosen such that P(more than k positive (negative) terms
+// are on) < 1e-16 (from the exact distribution of the counts); that mass is added to both p.
+// ---------------------------------------------------------------------------
+static ExactSpaResult coher_grid_solve(double q, const std::vector<double>& v, const std::vector<double>& pr,
+                                       const BernRest* br, double C, int M = 8192) {
+    ExactSpaResult res; res.p_up = res.p_lo = NA_REAL; res.converged = false;
+    if (br && br->c.empty()) br = 0;
+    double base = C;
+    std::vector<double> dp, pp, dn, pn;             // positive / negative increments, probabilities
+    for (size_t j = 0; j < v.size(); ++j) {
+        double d = v[j], p = pr[j];
+        if (p > 0.5) { base += d; d = -d; p = 1.0 - p; }
+        if (d == 0.0 || p <= 0.0) continue;
+        if (d > 0) { dp.push_back(d); pp.push_back(p); } else { dn.push_back(-d); pn.push_back(p); }
+    }
+    double dropped = 0.0;
+    // range of one side: sum of the k largest increments, k from the count distribution
+    auto side_range = [&](const std::vector<double>& d, const std::vector<double>& p) -> double {
+        if (d.empty()) return 0.0;
+        const int J = (int) d.size(), KC = std::min(J, 400);
+        std::vector<double> cnt(KC + 2, 0.0); cnt[0] = 1.0;      // P(N = k), k <= KC, last = overflow
+        for (int j = 0; j < J; ++j) {
+            for (int k = KC + 1; k >= 1; --k) {
+                if (k == KC + 1) cnt[k] += cnt[k - 1] * p[j];         // absorbing
+                else cnt[k] = cnt[k] * (1.0 - p[j]) + cnt[k - 1] * p[j];
+            }
+            cnt[0] *= (1.0 - p[j]);
+        }
+        double tail = cnt[KC + 1]; int k = KC;
+        while (k > 0 && tail + cnt[k] < 1e-16) { tail += cnt[k]; --k; }
+        dropped += tail;
+        std::vector<double> ds(d); std::sort(ds.begin(), ds.end(), std::greater<double>());
+        double r = 0.0; for (int i = 0; i < std::min(k, J); ++i) r += ds[i];
+        return r;
+    };
+    const double Rp = side_range(dp, pp), Rn = side_range(dn, pn);
+    // the Bernoulli rest G: moments and support
+    double mG = 0.0, vG = 0.0, Gmin = 0.0, Gmax = 0.0;
+    if (br) for (size_t g = 0; g < br->c.size(); ++g) {
+        const double c = br->c[g], p = br->p[g], w = br->w[g];
+        mG += w * c * p; vG += w * c * c * p * (1.0 - p);
+        if (c < 0) Gmin += w * c; else Gmax += w * c;
+    }
+    const double x0 = q - base;                     // threshold for D + G
+    const double span = Rp + Rn;
+    const double sdG = std::sqrt(std::max(vG, 0.0));
+    if (!(span > 0.0)) {                            // no discrete part: G only
+        if (!br) return res;
+        ExactSpaResult r = exact_spa_solve(x0, std::vector<ExactTerm>(), std::vector<double>(), std::vector<double>(), 0.0, br);
+        return r;
+    }
+    const double h = span / M;
+    const long L0 = std::lround(Rn / h);            // index of D = 0
+    const long NB = M + 1;
+    std::vector<double> pm(NB, 0.0), nx(NB, 0.0);
+    pm[L0] = 1.0; long lo = L0, hi = L0;
+    auto add = [&](double d, double p) {
+        const long sh = std::lround(d / h);
+        if (sh == 0) return;                        // below lattice resolution: no effect
+        std::fill(nx.begin() + std::max(0L, std::min(lo, lo + sh)), nx.begin() + std::min(NB, std::max(hi, hi + sh) + 1), 0.0);
+        long nlo = NB, nhi = -1;
+        for (long k = lo; k <= hi; ++k) {
+            const double pk = pm[k]; if (pk == 0.0) continue;
+            nx[k] += pk * (1.0 - p);
+            const long t = k + sh;
+            if (t < 0 || t >= NB) dropped += pk * p;
+            else { nx[t] += pk * p; nlo = std::min(nlo, t); nhi = std::max(nhi, t); }
+            nlo = std::min(nlo, k); nhi = std::max(nhi, k);
+        }
+        for (long k = std::max(0L, std::min(lo, lo + sh)); k < std::min(NB, std::max(hi, hi + sh) + 1); ++k) { pm[k] = nx[k]; }
+        lo = nlo; hi = nhi;
+    };
+    for (size_t j = 0; j < dp.size(); ++j) add(dp[j], pp[j]);
+    for (size_t j = 0; j < dn.size(); ++j) add(-dn[j], pn[j]);
+    double pu = 0.0, pl = 0.0;
+    if (!br) {
+        const double tol = 2.0 * h;                 // counts the observed configuration (rounding)
+        for (long k = lo; k <= hi; ++k) {
+            const double D = (k - L0) * h;
+            if (D >= x0 - tol) pu += pm[k];
+            if (D <= x0 + tol) pl += pm[k];
+        }
+    } else {
+        const std::vector<ExactTerm> none; const std::vector<double> nolam;
+        auto pg = [&](double x, double& up, double& lw) {
+            if (x > Gmax) { up = 0.0; lw = 1.0; return; }
+            if (x < Gmin) { up = 1.0; lw = 0.0; return; }
+            ExactSpaResult r = exact_spa_solve(x, none, nolam, nolam, 0.0, br);
+            if (r.converged) { up = r.p_up; lw = r.p_lo; }
+            else { const double z = (x - mG) / std::max(sdG, 1e-300);
+                   up = 0.5 * std::erfc(z / std::sqrt(2.0)); lw = 1.0 - up; }
+        };
+        const long stride = 8;
+        double lu0 = 0, ll0 = 0, lu1 = 0, ll1 = 0; long k0 = LONG_MIN;
+        for (long k = lo; k <= hi; ++k) {
+            const double pk = pm[k]; if (pk < 1e-300) continue;
+            const long kb = lo + ((k - lo) / stride) * stride;
+            if (kb != k0) {
+                double u0, l0, u1, l1;
+                pg(x0 - (kb - L0) * h, u0, l0); pg(x0 - (kb + stride - L0) * h, u1, l1);
+                lu0 = std::log(std::max(u0, 1e-300)); ll0 = std::log(std::max(l0, 1e-300));
+                lu1 = std::log(std::max(u1, 1e-300)); ll1 = std::log(std::max(l1, 1e-300));
+                k0 = kb;
+            }
+            const double f = (double) (k - kb) / stride;
+            pu += pk * std::exp(lu0 + f * (lu1 - lu0));
+            pl += pk * std::exp(ll0 + f * (ll1 - ll0));
+        }
     }
     res.p_up = std::min(1.0, std::max(pu + dropped, 1e-300));
     res.p_lo = std::min(1.0, std::max(pl + dropped, 1e-300));
@@ -2443,7 +2571,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 // driven by the few individuals with large |h_i| (carriers): up to 500 of them,
                 // with |delta h_i| >= 0.05 SD, are kept as exact two-point terms; the rest enters
                 // through its exact (grouped) Bernoulli CGF. The terms are combined by saddlepoint
-                // (lattice convolution only if the saddlepoint equation cannot be solved).
+                // or, when that fails or p < 0.1, by the lattice convolution of coher_grid_solve.
                 if (binary && cb.active) {
                     const int tc = cb.cond_t[pi];
                     const Eigen::VectorXd& wv = get_h(c, tc);
@@ -2507,15 +2635,29 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     ExactSpaResult er; er.converged = false;
                     if (!terms.empty() || !br.c.empty()) {
                         er = exact_spa_solve(Q, terms, nolam, nolam, c0, &br);
-                        // the statistic is LINEAR in the Bernoulli variables, so its MGF is finite and
-                        // the saddlepoint is accurate even when one carrier dominates (checked against
-                        // Monte Carlo). The lattice shifts each term to its minimum, which for the many
-                        // negative coefficients puts the bulk far from 0 and makes rounding errors add
-                        // up; it is only a fallback when the saddlepoint equation cannot be solved.
-                        if (!terms.empty() && !er.exact && !er.converged) {
-                            ExactSpaResult eg = exact_grid_solve(Q, terms, nolam, nolam, c0, 8192, &br);
+                        // saddlepoint first; for p < 0.1 (or if it fails) the lattice convolution
+                        // (coher_grid_solve: terms centred at their most likely value)
+                        if (!terms.empty() && !er.exact &&
+                            (!er.converged || std::min(er.p_up, er.p_lo) < 0.1)) {
+                            std::vector<double> tv(terms.size()), tp(terms.size());
+                            for (size_t r = 0; r < terms.size(); ++r) { tv[r] = terms[r].v[1]; tp[r] = std::exp(terms[r].lp[1]); }
+                            ExactSpaResult eg = coher_grid_solve(Q, tv, tp, &br, c0);
                             if (eg.converged) er = eg;
                         }
+                    }
+                    // diagnostics: SPARROW_COHER_DUMP=<dir> writes the null model of every binary
+                    // co-heritability test with p < 1e-6 (first 200) for checking against Monte Carlo
+                    if (er.converged && 2.0 * std::min(er.p_up, er.p_lo) < 1e-6) {
+                        static const char* ddir = std::getenv("SPARROW_COHER_DUMP");
+                        static std::atomic<int> ndump(0);
+                        if (ddir) { const int id = ndump++; if (id < 200) {
+                            char fn[1024]; std::snprintf(fn, sizeof(fn), "%s/coher_dump_%d.txt", ddir, id);
+                            if (FILE* f = std::fopen(fn, "w")) {
+                                std::fprintf(f, "%.17g %.17g %zu %zu %d %d %d %d %.6g\n", Q, c0, terms.size(), br.c.size(), t1, t2, c, K, 2.0 * std::min(er.p_up, er.p_lo));
+                                for (size_t r = 0; r < terms.size(); ++r) std::fprintf(f, "%.17g %.17g\n", terms[r].v[1], std::exp(terms[r].lp[1]));
+                                for (size_t g2 = 0; g2 < br.c.size(); ++g2) std::fprintf(f, "%.17g %.17g %.17g\n", br.c[g2], br.p[g2], br.w[g2]);
+                                std::fclose(f);
+                            } } }
                     }
                     if (er.converged) {
                         cr.p_spa[c][pi] = std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo));
@@ -3764,7 +3906,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
