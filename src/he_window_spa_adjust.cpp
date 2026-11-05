@@ -2390,14 +2390,39 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             rcache[t] = std::max(0.0, yty[t] - acache[t].squaredNorm());
             ahave[t] = 1;
         };
+        // Psi1 uses the UNCLAMPED estimates of trait 1 (clamping at 0 biases the conditional
+        // mean in one direction when the true component is 0; the estimation error itself is
+        // propagated in the test, see coher_reml_test). Clamped only if Psi1 is not PD.
+        std::vector<Eigen::MatrixXd> psi1m(P);
         auto prep_psi1 = [&](int t) {
             if (phave[t]) return;
             std::vector<double> d1(C);
-            for (int a2 = 0; a2 < C; ++a2) d1[a2] = std::max(sg[t][a2], 0.0) * g[a2];
+            for (int a2 = 0; a2 < C; ++a2) d1[a2] = sg[t][a2] * g[a2];
             e1cache[t] = std::max(sg[t][env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
-            Eigen::MatrixXd Psi1; coher_block(L, W, use_wcache, off, C, K, d1, e1cache[t], Psi1);
-            pcache[t].compute(Psi1);
+            coher_block(L, W, use_wcache, off, C, K, d1, e1cache[t], psi1m[t]);
+            pcache[t].compute(psi1m[t]);
+            if (pcache[t].info() != Eigen::Success) {
+                for (int a2 = 0; a2 < C; ++a2) d1[a2] = std::max(sg[t][a2], 0.0) * g[a2];
+                coher_block(L, W, use_wcache, off, C, K, d1, e1cache[t], psi1m[t]);
+                pcache[t].compute(psi1m[t]);
+            }
             phave[t] = 1;
+        };
+        // sampling covariance of trait 1's component estimates (categories 0..A-1):
+        //   Cov(sigma_a, sigma_b) = 2 tr(A_a Psi1 A_b Psi1) + 2 (n - K) T(a,env) T(b,env) e1^2
+        std::vector<Eigen::MatrixXd> vth(P); std::vector<char> vhave(P, 0);
+        auto prep_vth = [&](int t) {
+            if (vhave[t]) return;
+            prep_psi1(t);
+            std::vector<Eigen::MatrixXd> AP(A);
+            for (int a2 = 0; a2 < A; ++a2) AP[a2] = Acat[a2] * psi1m[t];
+            vth[t].setZero(A, A);
+            for (int a2 = 0; a2 < A; ++a2) for (int b2 = a2; b2 < A; ++b2) {
+                const double v = 2.0 * (AP[a2].cwiseProduct(AP[b2].transpose())).sum()
+                               + 2.0 * (double) (n - K) * Tinv(a2, env) * Tinv(b2, env) * e1cache[t] * e1cache[t];
+                vth[t](a2, b2) = vth[t](b2, a2) = v;
+            }
+            vhave[t] = 1;
         };
         std::vector< std::map<int, Eigen::VectorXd> > hcache(A);
         // ---- small genes: REML-GLS conditional test ------------------------------------
@@ -2414,7 +2439,9 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                                    double r1, double e1, double e2, double e12, const Eigen::VectorXd& w,
                                    const Eigen::MatrixXd& Psi12, const Eigen::MatrixXd& P0, const Eigen::MatrixXd& M,
                                    const Eigen::LLT<Eigen::MatrixXd>& l1, double ec,
-                                   const std::vector<double>& yty_, double y12, double& tst, double& nu) -> bool {
+                                   const std::vector<double>& yty_, double y12,
+                                   const std::vector<Eigen::VectorXd>& msl, const Eigen::MatrixXd& Vth,
+                                   const std::vector<Eigen::VectorXd>& xbg, double& tst, double& nu) -> bool {
             (void) t1; (void) w; (void) yty_;
             prep_trait(t2);
             const Eigen::VectorXd& a2 = acache[t2];
@@ -2431,28 +2458,78 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Sm);
             if (es.info() != Eigen::Success) return false;
             const Eigen::VectorXd lam = es.eigenvalues().cwiseMax(0.0);
-            const Eigen::VectorXd zt = es.eigenvectors().transpose() * (Fi * z);
-            const Eigen::VectorXd bt = es.eigenvectors().transpose() * (Fi * b);
-            // orthogonal part: covariate eps_c r1, response r1'(y2 - mu)
-            const double zo = (y12 - a1.dot(a2)) - (e12 / e1) * r1;   // r1'(y2 - mu)
-            const double No = ec * zo / vperp, Do = ec * ec * r1 / vperp;
-            auto parts = [&](double sv, double& N, double& D, double& zz, double& ld) {
-                N = No; D = Do; zz = 0.0; ld = 0.0;
+            const Eigen::MatrixXd Vt = es.eigenvectors().transpose() * Fi;      // whitening + eigenbasis
+            const Eigen::VectorXd zt = Vt * z;
+            // FIXED EFFECTS. Column 0 = the tested covariate h. The cross-covariances that the
+            // conditional mean was built from (e12 and the genetic covariances of the other
+            // components of the block) are estimated from the same two phenotypes; plugging them
+            // in ignores their estimation error, which inflates the test when the phenotypes are
+            // correlated. They are therefore re-estimated JOINTLY with the test, as nuisance
+            // covariates in the same GLS (z is the residual after the plug-in mean, so their
+            // coefficients estimate the plug-in errors):
+            //   env:          column part Psi1^{-1} a1, orthogonal part |r1|^2 / e1
+            //   component a:  column part B_a Psi1^{-1} a1  (B_a = kernel of component a), a != c
+            // Covariates are only added while at least 4 dimensions remain for the residual.
+            const Eigen::VectorXd p1a = l1.solve(a1);
+            std::vector<Eigen::VectorXd> xc; std::vector<double> xo;    // column / orthogonal parts
+            const double sr1 = std::sqrt(std::max(r1, 0.0));
+            xc.push_back(b); xo.push_back(ec * sr1);
+            xc.push_back(p1a); xo.push_back(sr1 / e1);
+            for (size_t q = 0; q < xbg.size(); ++q) {
+                if ((int) xc.size() + 4 > K + 1) break;
+                xc.push_back(xbg[q]); xo.push_back(0.0);
+            }
+            const int NX = (int) xc.size();
+            Eigen::MatrixXd Xt(K, NX); Eigen::VectorXd Xo(NX);
+            for (int q = 0; q < NX; ++q) { Xt.col(q) = Vt * xc[q]; Xo[q] = xo[q]; }
+            // UNCERTAINTY OF TRAIT 1's COMPONENTS. The conditional mean Psi12 Psi1^{-1} a1 uses the
+            // components of trait 1 estimated from y1; their errors move the mean (for the tested
+            // component almost exactly along the tested direction, when the phenotypes are
+            // correlated), which no covariate can absorb without absorbing the signal. Their effect
+            // is propagated by the delta method:
+            //   beta_hat changes by -sum_a (d beta / d z)' m_a (sigma1_a_hat - sigma1_a),
+            //   m_a = d mean / d sigma1_a = -Psi12 Psi1^{-1} (g_a B_a) Psi1^{-1} a1,
+            // which adds  s' Cov(sigma1_hat) s  (s_a = (d beta / d z)' m_a) to Var(beta_hat).
+            const int NA = (int) msl.size();
+            std::vector<Eigen::VectorXd> mtl(NA);
+            for (int q = 0; q < NA; ++q) mtl[q] = Vt * msl[q];
+            // orthogonal part: response r1'(y2 - mu) / |r1|, variance v_perp
+            const double zo = ((y12 - a1.dot(a2)) - (e12 / e1) * r1) / std::max(sr1, 1e-300);
+            auto parts = [&](double sv, Eigen::VectorXd& N, Eigen::MatrixXd& D, double& zz, double& ld) {
+                N = Xo * (zo / vperp); D = Xo * Xo.transpose() / vperp; zz = zo * zo / vperp; ld = 0.0;
                 for (int k = 0; k < K; ++k) {
                     const double d = 1.0 + sv * lam[k];
-                    N += bt[k] * zt[k] / d; D += bt[k] * bt[k] / d; zz += zt[k] * zt[k] / d; ld += std::log(d);
+                    N.noalias() += Xt.row(k).transpose() * (zt[k] / d);
+                    D.noalias() += Xt.row(k).transpose() * Xt.row(k) / d;
+                    zz += zt[k] * zt[k] / d; ld += std::log(d);
                 }
             };
-            auto reml = [&](double sv) {                      // REML log likelihood (up to a constant)
-                double N, D, zz, ld; parts(sv, N, D, zz, ld);
-                if (!(D > 0.0)) return -1e300;
-                return -0.5 * (ld + zz - N * N / D + std::log(D));
+            auto gls = [&](double sv, double& beta, double& var, double& rl) -> bool {   // beta_h, Var, REML
+                Eigen::VectorXd N; Eigen::MatrixXd D; double zz, ld; parts(sv, N, D, zz, ld);
+                Eigen::LDLT<Eigen::MatrixXd> ldl(D);
+                if (ldl.info() != Eigen::Success || !(ldl.vectorD().minCoeff() > 0.0)) return false;
+                const Eigen::VectorXd bh = ldl.solve(N);
+                Eigen::VectorXd e0 = Eigen::VectorXd::Zero(NX); e0[0] = 1.0;
+                const Eigen::VectorXd de = ldl.solve(e0);
+                var = de[0]; beta = bh[0];
+                if (NA > 0) {
+                    Eigen::VectorXd sens = Eigen::VectorXd::Zero(NA);
+                    for (int k = 0; k < K; ++k) {
+                        const double wk = Xt.row(k).dot(de) / (1.0 + sv * lam[k]);
+                        for (int q = 0; q < NA; ++q) sens[q] += wk * mtl[q][k];
+                    }
+                    var += sens.dot(Vth * sens);
+                }
+                rl = -0.5 * (ld + zz - N.dot(bh) + ldl.vectorD().array().log().sum());
+                return var > 0.0 && std::isfinite(beta);
             };
+            auto reml = [&](double sv) { double bb, vv, rl; return gls(sv, bb, vv, rl) ? rl : -1e300; };
+            auto varb = [&](double sv) { double bb, vv, rl; return gls(sv, bb, vv, rl) ? vv : NA_REAL; };
             // maximise over s >= 0 on a log grid, then golden-section refinement
             const double lmax = lam.maxCoeff();
             if (!(lmax > 0.0)) {                              // no information on s: plain GLS
-                double N, D, zz, ld; parts(0.0, N, D, zz, ld);
-                tst = N / std::sqrt(D); nu = 1e300; return std::isfinite(tst);
+                double bb, vv, rl; if (!gls(0.0, bb, vv, rl)) return false;
+                tst = bb / std::sqrt(vv); nu = 1e300; return std::isfinite(tst);
             }
             double best = 0.0, fbest = reml(0.0);
             for (int k = -6; k <= 6; ++k) {
@@ -2468,17 +2545,18 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             }
             double sh = (f1 > f2) ? x1 : x2;
             if (reml(0.0) >= std::max(f1, f2)) sh = 0.0;
-            double N, D, zz, ld; parts(sh, N, D, zz, ld);
-            if (!(D > 0.0)) return false;
-            tst = N / std::sqrt(D);
-            // Satterthwaite: Var(beta_hat) = 1 / D(s); with the REML information on s,
+            double bh, vh, rlh;
+            if (!gls(sh, bh, vh, rlh)) return false;
+            tst = bh / std::sqrt(vh);
+            // Satterthwaite degrees of freedom for the uncertainty of s:
             //   nu = 2 Var(beta_hat)^2 info(s) / (d Var(beta_hat) / ds)^2   at s = s_hat.
-            // At (or near) the boundary s_hat = 0 this approximation breaks down, and an estimate
-            // of 0 can badly underestimate a real heritability of trait 2 in a small gene; there we
-            // use nu = K - 1 (the gene directions left after the fixed effect), which keeps such
-            // tests from being treated as exactly normal. For genes without heritability this is
-            // conservative for small genes, which costs no power: co-heritability needs both traits
-            // to be heritable at the gene.
+            // At (or near) the boundary s_hat = 0 this breaks down. In SMALL blocks (K <= 30), s_hat = 0
+            // can badly underestimate a real heritability of trait 2 at the gene (inflation up to ~8x
+            // at p = 1e-3 in simulations with h2 = 0.0002 for a 6-variant gene), so there we use
+            // nu = K - 1 (conservative for small genes without heritability, which costs little power:
+            // co-heritability needs both traits to be heritable at the gene). In larger blocks s is
+            // estimated precisely enough and the test at s_hat = 0 was calibrated (and was very
+            // conservative with nu = K - 1), so it is normal.
             auto curv = [&](double sv) {                       // -d2 REML / ds2 at sv (one-sided at 0)
                 const double hs = std::max(1e-3 * sv, 1e-4 / lmax);
                 const double f0 = reml(sv), fp = reml(sv + hs);
@@ -2487,14 +2565,14 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             };
             const double info0 = curv(0.0);
             const double se0 = (info0 > 0.0) ? 1.0 / std::sqrt(info0) : 1.0 / lmax;
-            nu = std::max(1.0, (double) K - 1.0);
             if (sh > 0.1 * se0) {
+                nu = std::max(1.0, (double) K - 1.0);
                 const double info = curv(sh);
                 const double hs = std::max(1e-3 * sh, 1e-4 / lmax);
-                double N1, D1, z1, l1d, N2, D2, z2, l2d;
-                parts(sh, N1, D1, z1, l1d); parts(sh + hs, N2, D2, z2, l2d);
-                const double dv = (1.0 / D2 - 1.0 / D1) / hs;  // d Var(beta_hat) / ds
-                if (info > 0.0 && std::abs(dv) > 0.0) nu = 2.0 * (1.0 / D1) * (1.0 / D1) * info / (dv * dv);
+                const double v1 = varb(sh), v2 = varb(sh + hs), dv = (v2 - v1) / hs;   // d Var(beta_hat) / ds
+                if (info > 0.0 && std::isfinite(dv) && std::abs(dv) > 0.0) nu = 2.0 * v1 * v1 * info / (dv * dv);
+            } else {
+                nu = (K <= 30) ? std::max(1.0, (double) K - 1.0) : 1e300;
             }
             if (nu < 1.0) nu = 1.0;
             return std::isfinite(tst);
@@ -2713,8 +2791,20 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 if (!(V0 > 0.0) || !std::isfinite(V0)) { cr.spa_used[c][pi] = -1; continue; }
                 if (K <= KREML) {                 // small genes: REML-GLS test (below)
                     double tst, nu;
+                    // sensitivity of the conditional mean to trait 1's tested component, and the
+                    // sampling variance of its estimate (same trace formula as for trait 2)
+                    prep_vth(t1);
+                    std::vector<Eigen::VectorXd> msl(A);
+                    const Eigen::VectorXd p1a = pcache[t1].solve(a1);
+                    std::vector<Eigen::VectorXd> xbg;          // background covariates B_a Psi1^{-1} a1, a != c
+                    for (int a2 = 0; a2 < A; ++a2) {
+                        get_M(a2);
+                        const Eigen::VectorXd mp = Mc[a2] * p1a;
+                        msl[a2] = -(Psi12 * pcache[t1].solve(mp));
+                        if (a2 != c && g[a2] != 0.0 && off[a2 + 1] > off[a2]) xbg.push_back(mp);
+                    }
                     if (coher_reml_test(c, t1, t2, b, a1, r1, e1, e2, e12, w, Psi12, t2p.P0, Mc[c], pcache[t1],
-                                        ec, yty, ycross[pi], tst, nu)) {
+                                        ec, yty, ycross[pi], msl, vth[t1], xbg, tst, nu)) {
                         cr.p_spa[c][pi] = t_two_sided_p(tst, nu); cr.spa_used[c][pi] = 7;
                     } else { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
                     continue;
@@ -3906,7 +3996,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
