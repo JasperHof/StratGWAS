@@ -1,2 +1,6 @@
-PKG_CXXFLAGS += $(SHLIB_OPENMP_CXXFLAGS) $(shell "${R_HOME}/bin${R_ARCH_BIN}/Rscript.exe" -e "RcppParallel::RcppParallelLibs()")
-PKG_LIBS += $(SHLIB_OPENMP_CXXFLAGS) $(shell "${R_HOME}/bin${R_ARCH_BIN}/Rscript.exe" -e "RcppParallel::RcppParallelLibs()")
+## Makevars.win for StratGWAS (RcppParallel + RcppEigen)
+
+# Silence harmless warnings that GCC/clang emit from inside the Eigen headers
+PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS) -Wno-ignored-attributes -Wno-unused-but-set-variable
+
+PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS) $(shell "${R_HOME}/bin${R_ARCH_BIN}/Rscript.exe" -e "RcppParallel::RcppParallelLibs()")

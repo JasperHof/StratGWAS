@@ -251,7 +251,8 @@ sparrow <- function(filename, pheno, out_file,
     h2_without_prs = h2_without_prs,
     covariates = C, cov_df = cov_df,
     SPA = spa, binary = binary, binary_raw = binary_raw, binary_pi = binary_pi, coher = coher,
-    chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
+    chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads,
+    cond_common = TRUE, cond_p = 1e-4, cond_max = 10, cond_maf = 0.01)
 
   files <- c(regions = out_file,
              genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA,

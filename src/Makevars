@@ -1,2 +1,6 @@
-## Makevars for your R package with RcppParallel support
+## Makevars for StratGWAS (RcppParallel + RcppEigen)
+
+# Silence harmless warnings that GCC/clang emit from inside the Eigen headers
+PKG_CXXFLAGS = -Wno-ignored-attributes -Wno-unused-but-set-variable
+
 PKG_LIBS = `${R_HOME}/bin/Rscript -e "RcppParallel::RcppParallelLibs()"`
