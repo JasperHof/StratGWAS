@@ -29,8 +29,12 @@ sparrow(
   collapse_mac = 0,
   spa = TRUE,
   chr = NULL,
+  cond_common = FALSE,
+  cond_p = 1e-04,
+  cond_max = 10,
+  cond_maf = 0.01,
   n_threads = 0,
-  batch_size = 16
+  batch_size = 64
 )
 }
 \arguments{
@@ -53,7 +57,7 @@ column of variant IDs, which is matched to the .bim. NULL = one category with al
 \item{genes}{Optional data frame or file: gene, chr, start, end (extra columns ignored).
 Must be on the same genome build as the .bim.}
 
-\item{alpha}{Heritability models tested; \code{alpha[1]} is used for the estimates.}
+\item{alpha}{Heritability models tested; alpha\link{1} is used for the estimates.}
 
 \item{loco_prs}{Optional LDAK-KVIK Step 1 \code{.loco.prs} files: one per phenotype
 (character vector), or a matrix with one row per phenotype and one column per source.}
@@ -86,6 +90,20 @@ ACAT-V still uses all variants individually.}
 \item{spa}{Compute saddlepoint p-values (FALSE = estimates only, much faster).}
 
 \item{chr}{Optional single chromosome to analyse.}
+
+\item{cond_common}{Genes only: test (and estimate) each gene conditional on its lead
+common variants, which are projected out of the genotypes and phenotypes as fixed
+effects (as conditioning in SAIGE-GENE+ / REGENIE). Removes rare-variant signal that
+is only due to LD with causal common variants. The variants are selected with the
+\code{kvik_summaries} p-values if given (one per phenotype; also with coher = TRUE),
+otherwise by their correlation with each phenotype (z = r sqrt(n)). ACAT-V is not used.}
+
+\item{cond_p}{Lead common variants: p-value (KVIK or correlation) below this for any phenotype.}
+
+\item{cond_max}{At most this many variants per gene block (in order of p-value; a
+variant with r^2 > 0.9 with those already selected is skipped).}
+
+\item{cond_maf}{Variants with MAF >= cond_maf count as common.}
 
 \item{n_threads}{Number of threads (0 = RcppParallel default).}
 
