@@ -2461,25 +2461,17 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             // estimate of a large component (e.g. a flank) can make it nearly singular, and its
             // inverse then blows up the conditional mean. The negative estimates are shrunk (by the
             // largest factor in [0, 1], bisection) until the smallest eigenvalue is >= e1 / 2.
-            auto mineig = [&](const Eigen::MatrixXd& M) {
-                Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ev(M, Eigen::EigenvaluesOnly);
-                return ev.info() == Eigen::Success ? ev.eigenvalues().minCoeff() : -1.0;
-            };
+            // test smallest eigenvalue >= e1/2 by one Cholesky of Psi1 - e1/2 I; else clamp at 0
             bool anyneg = false;
             for (int a2 = 0; a2 < C; ++a2) if (sg[t][a2] < 0.0) anyneg = true;
-            if (anyneg && !(pcache[t].info() == Eigen::Success && mineig(psi1m[t]) >= 0.5 * e1cache[t])) {
-                auto build = [&](double gm) {
-                    for (int a2 = 0; a2 < C; ++a2) d1[a2] = (sg[t][a2] < 0.0 ? gm : 1.0) * sg[t][a2] * g[a2];
+            if (anyneg) {
+                Eigen::MatrixXd Mt = psi1m[t]; Mt.diagonal().array() -= 0.5 * e1cache[t];
+                Eigen::LLT<Eigen::MatrixXd> lt(Mt);
+                if (pcache[t].info() != Eigen::Success || lt.info() != Eigen::Success) {
+                    for (int a2 = 0; a2 < C; ++a2) d1[a2] = std::max(sg[t][a2], 0.0) * g[a2];
                     coher_block(L, W, use_wcache, off, C, K, d1, e1cache[t], psi1m[t]);
-                };
-                double lo = 0.0, hi = 1.0;
-                for (int it = 0; it < 12; ++it) {
-                    const double mid = 0.5 * (lo + hi);
-                    build(mid);
-                    if (mineig(psi1m[t]) >= 0.5 * e1cache[t]) lo = mid; else hi = mid;
+                    pcache[t].compute(psi1m[t]);
                 }
-                build(lo);
-                pcache[t].compute(psi1m[t]);
             }
             phave[t] = 1;
         };
@@ -2509,10 +2501,13 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         // least squares, with s estimated by REML (which accounts for the fixed effect, so the
         // estimate is not driven by the h-direction of y2) and a Satterthwaite t for its
         // uncertainty. Omega is diagonalised once per pair (generalised eigenproblem).
-        // REML-GLS for every block. (Blocks larger than this used a conditional-normal test with
-        // plug-in nuisance parameters; with gene flanks blocks can exceed 512 columns, and that
-        // test is not calibrated, so it is no longer used.)
-        const int KREML = 1 << 30;
+        // TWO-STAGE p-values (speed). Blocks with more than KREML columns (large genes, or genes
+        // with a flank) first get the fast conditional-normal test with plug-in nuisance
+        // parameters; it is not reliable in the tail (it can return spuriously small p-values), so
+        // every p < refine_p is recomputed with the REML-GLS test. Likewise, binary tests are
+        // recomputed with the background-refitted case probabilities only when p < refine_p.
+        const int KREML = 512;
+        const double refine_p = 1e-3;
         auto coher_reml_test = [&](int c, int t1, int t2, const Eigen::VectorXd& b, const Eigen::VectorXd& a1,
                                    double r1, double e1, double e2, double e12, const Eigen::VectorXd& w,
                                    const Eigen::MatrixXd& Psi12, const Eigen::MatrixXd& P0, const Eigen::MatrixXd& M,
@@ -2766,128 +2761,135 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     const Eigen::VectorXd& wv = get_h(c, tc);
                     const double dl = cb.cdelta[pi];
                     const std::vector<float>& cy = cb.cylo[pi];
-                    // Genetic effects of the BACKGROUND (other components of the gene, flank) on
+                    // the exact test for given null case probabilities of the random trait
+                    auto bin_test = [&](const std::vector<float>& cp) -> ExactSpaResult {
+                        double c0 = 0.0, sd2 = 0.0;
+                        for (int i = 0; i < n; ++i) {
+                            c0 += wv[i] * cy[i];
+                            const double ci = dl * wv[i];
+                            sd2 += ci * ci * cp[i] * (1.0 - cp[i]);
+                        }
+                        const double thr = 0.05 * std::sqrt(sd2);
+                        std::vector<int> big;
+                        for (int i = 0; i < n; ++i) if (std::abs(dl * wv[i]) > thr) big.push_back(i);
+                        const size_t MAXT = 500;
+                        if (big.size() > MAXT) {
+                            std::nth_element(big.begin(), big.begin() + MAXT, big.end(),
+                                             [&](int x, int y) { return std::abs(wv[x]) > std::abs(wv[y]); });
+                            big.resize(MAXT);
+                        }
+                        std::vector<char> isbig(n, 0);
+                        std::vector<ExactTerm> terms; terms.reserve(big.size());
+                        for (size_t r = 0; r < big.size(); ++r) {
+                            const int i = big[r]; isbig[i] = 1;
+                            const double pr = std::min(std::max((double) cp[i], 1e-12), 1.0 - 1e-12);
+                            ExactTerm e; e.v.resize(2); e.lp.resize(2);
+                            e.v[0] = 0.0; e.lp[0] = std::log1p(-pr);
+                            e.v[1] = dl * wv[i]; e.lp[1] = std::log(pr);
+                            terms.push_back(e);
+                        }
+                        // the rest: EXACT CGF of its Bernoulli terms, grouped by (pi, coefficient rounded
+                        // to 1e-3 of its SD; the group uses the mean coefficient). A Gaussian for the rest
+                        // is not good enough at low prevalence: the rest is then a sum of many
+                        // Bernoulli(0.01) terms, i.e. Poisson-like and skewed (anti-conservative tails).
+                        double vr = 0.0;
+                        for (int i = 0; i < n; ++i) {
+                            if (isbig[i]) continue;
+                            const double ci = dl * wv[i];
+                            vr += ci * ci * cp[i] * (1.0 - cp[i]);
+                        }
+                        BernRest br;
+                        if (vr > 0.0) {
+                            const double step = 1e-3 * std::sqrt(vr);
+                            std::map< std::pair<float, long>, std::pair<double, double> > grp;
+                            for (int i = 0; i < n; ++i) {
+                                if (isbig[i]) continue;
+                                const double ci = dl * wv[i];
+                                if (ci == 0.0) continue;
+                                std::pair<double, double>& gg = grp[std::make_pair(cp[i], std::lround(ci / step))];
+                                gg.first += ci; gg.second += 1.0;
+                            }
+                            br.c.reserve(grp.size()); br.p.reserve(grp.size()); br.w.reserve(grp.size());
+                            for (std::map< std::pair<float, long>, std::pair<double, double> >::const_iterator it = grp.begin(); it != grp.end(); ++it) {
+                                br.c.push_back(it->second.first / it->second.second);
+                                br.p.push_back(std::min(std::max((double) it->first.first, 1e-12), 1.0 - 1e-12));
+                                br.w.push_back(it->second.second);
+                            }
+                        }
+                        const std::vector<double> nolam;
+                        ExactSpaResult er; er.converged = false;
+                        if (!terms.empty() || !br.c.empty()) {
+                            er = exact_spa_solve(Q, terms, nolam, nolam, c0, &br);
+                            // saddlepoint first; for p < 0.1 (or if it fails) the lattice convolution
+                            // (coher_grid_solve: terms centred at their most likely value)
+                            if (!terms.empty() && !er.exact &&
+                                (!er.converged || std::min(er.p_up, er.p_lo) < 0.1)) {
+                                std::vector<double> tv(terms.size()), tp(terms.size());
+                                for (size_t r = 0; r < terms.size(); ++r) { tv[r] = terms[r].v[1]; tp[r] = std::exp(terms[r].lp[1]); }
+                                ExactSpaResult eg = coher_grid_solve(Q, tv, tp, &br, c0);
+                                if (eg.converged) er = eg;
+                            }
+                        }
+                        // diagnostics: SPARROW_COHER_DUMP=<dir> writes the null model of every binary
+                        // co-heritability test with p < 1e-6 (first 200) for checking against Monte Carlo
+                        if (er.converged && 2.0 * std::min(er.p_up, er.p_lo) < 1e-6) {
+                            static const char* ddir = std::getenv("SPARROW_COHER_DUMP");
+                            static std::atomic<int> ndump(0);
+                            if (ddir) { const int id = ndump++; if (id < 200) {
+                                char fn[1024]; std::snprintf(fn, sizeof(fn), "%s/coher_dump_%d.txt", ddir, id);
+                                if (FILE* f = std::fopen(fn, "w")) {
+                                    std::fprintf(f, "%.17g %.17g %zu %zu %d %d %d %d %.6g\n", Q, c0, terms.size(), br.c.size(), t1, t2, c, K, 2.0 * std::min(er.p_up, er.p_lo));
+                                    for (size_t r = 0; r < terms.size(); ++r) std::fprintf(f, "%.17g %.17g\n", terms[r].v[1], std::exp(terms[r].lp[1]));
+                                    for (size_t g2 = 0; g2 < br.c.size(); ++g2) std::fprintf(f, "%.17g %.17g %.17g\n", br.c[g2], br.p[g2], br.w[g2]);
+                                    std::fclose(f);
+                                } } }
+                        }
+                        return er;
+                    };
+                    ExactSpaResult er = bin_test(cb.cpi[pi]);
+                    // TWO-STAGE: only when p < refine_p. Genetic effects of the BACKGROUND (other components of the gene, flank) on
                     // the random trait: its carriers of causal common alleles are more often cases,
                     // so case status is not exchangeable given the fixed trait alone. The null case
                     // probabilities are refitted by a logistic regression of b on the local genetic
                     // score of the random trait (as for the LOCO PRS), with the current
                     // probabilities as offset. No background signal -> score 0 -> unchanged.
-                    std::vector<float> cploc;
-                    {
-                        const int trr = cb.rand_t[pi];
-                        const Eigen::VectorXd& gs = get_gbg(c, trr);
-                        if (gs.size() == n && dl != 0.0) {
-                            const std::vector<float>& cp0 = cb.cpi[pi];
-                            std::vector<double> l0(n), bb(n);
-                            for (int i = 0; i < n; ++i) {
-                                const double q = std::min(std::max((double) cp0[i], 1e-8), 1.0 - 1e-8);
-                                l0[i] = std::log(q / (1.0 - q));
-                                bb[i] = std::round((Y(i, trr) - (double) cy[i]) / dl);
-                            }
-                            double a0 = 0.0, c1 = 0.0;
-                            for (int it = 0; it < 25; ++it) {
-                                double g0 = 0, g1 = 0, h00 = 0, h01 = 0, h11 = 0;
+                    if (er.converged && 2.0 * std::min(er.p_up, er.p_lo) < refine_p) {
+                        std::vector<float> cploc;
+                        {
+                            const int trr = cb.rand_t[pi];
+                            const Eigen::VectorXd& gs = get_gbg(c, trr);
+                            if (gs.size() == n && dl != 0.0) {
+                                const std::vector<float>& cp0 = cb.cpi[pi];
+                                std::vector<double> l0(n), bb(n);
                                 for (int i = 0; i < n; ++i) {
-                                    const double o = gs[i], e = l0[i] + a0 + c1 * o, pq = 1.0 / (1.0 + std::exp(-e));
-                                    const double wq = pq * (1.0 - pq), r = bb[i] - pq;
-                                    g0 += r; g1 += r * o; h00 += wq; h01 += wq * o; h11 += wq * o * o;
+                                    const double q = std::min(std::max((double) cp0[i], 1e-8), 1.0 - 1e-8);
+                                    l0[i] = std::log(q / (1.0 - q));
+                                    bb[i] = std::round((Y(i, trr) - (double) cy[i]) / dl);
                                 }
-                                const double det = h00 * h11 - h01 * h01;
-                                if (!(det > 0.0)) break;
-                                const double da = (h11 * g0 - h01 * g1) / det, dc = (h00 * g1 - h01 * g0) / det;
-                                a0 += da; c1 += dc;
-                                if (std::abs(da) + std::abs(dc) < 1e-10) break;
-                            }
-                            if (std::isfinite(a0) && std::isfinite(c1)) {
-                                cploc.resize(n);
-                                for (int i = 0; i < n; ++i) {
-                                    const double e = l0[i] + a0 + c1 * gs[i];
-                                    cploc[i] = (float) std::min(std::max(1.0 / (1.0 + std::exp(-e)), 1e-8), 1.0 - 1e-8);
+                                double a0 = 0.0, c1 = 0.0;
+                                for (int it = 0; it < 25; ++it) {
+                                    double g0 = 0, g1 = 0, h00 = 0, h01 = 0, h11 = 0;
+                                    for (int i = 0; i < n; ++i) {
+                                        const double o = gs[i], e = l0[i] + a0 + c1 * o, pq = 1.0 / (1.0 + std::exp(-e));
+                                        const double wq = pq * (1.0 - pq), r = bb[i] - pq;
+                                        g0 += r; g1 += r * o; h00 += wq; h01 += wq * o; h11 += wq * o * o;
+                                    }
+                                    const double det = h00 * h11 - h01 * h01;
+                                    if (!(det > 0.0)) break;
+                                    const double da = (h11 * g0 - h01 * g1) / det, dc = (h00 * g1 - h01 * g0) / det;
+                                    a0 += da; c1 += dc;
+                                    if (std::abs(da) + std::abs(dc) < 1e-10) break;
+                                }
+                                if (std::isfinite(a0) && std::isfinite(c1)) {
+                                    cploc.resize(n);
+                                    for (int i = 0; i < n; ++i) {
+                                        const double e = l0[i] + a0 + c1 * gs[i];
+                                        cploc[i] = (float) std::min(std::max(1.0 / (1.0 + std::exp(-e)), 1e-8), 1.0 - 1e-8);
+                                    }
                                 }
                             }
                         }
-                    }
-                    const std::vector<float>& cp = cploc.empty() ? cb.cpi[pi] : cploc;
-                    double c0 = 0.0, sd2 = 0.0;
-                    for (int i = 0; i < n; ++i) {
-                        c0 += wv[i] * cy[i];
-                        const double ci = dl * wv[i];
-                        sd2 += ci * ci * cp[i] * (1.0 - cp[i]);
-                    }
-                    const double thr = 0.05 * std::sqrt(sd2);
-                    std::vector<int> big;
-                    for (int i = 0; i < n; ++i) if (std::abs(dl * wv[i]) > thr) big.push_back(i);
-                    const size_t MAXT = 500;
-                    if (big.size() > MAXT) {
-                        std::nth_element(big.begin(), big.begin() + MAXT, big.end(),
-                                         [&](int x, int y) { return std::abs(wv[x]) > std::abs(wv[y]); });
-                        big.resize(MAXT);
-                    }
-                    std::vector<char> isbig(n, 0);
-                    std::vector<ExactTerm> terms; terms.reserve(big.size());
-                    for (size_t r = 0; r < big.size(); ++r) {
-                        const int i = big[r]; isbig[i] = 1;
-                        const double pr = std::min(std::max((double) cp[i], 1e-12), 1.0 - 1e-12);
-                        ExactTerm e; e.v.resize(2); e.lp.resize(2);
-                        e.v[0] = 0.0; e.lp[0] = std::log1p(-pr);
-                        e.v[1] = dl * wv[i]; e.lp[1] = std::log(pr);
-                        terms.push_back(e);
-                    }
-                    // the rest: EXACT CGF of its Bernoulli terms, grouped by (pi, coefficient rounded
-                    // to 1e-3 of its SD; the group uses the mean coefficient). A Gaussian for the rest
-                    // is not good enough at low prevalence: the rest is then a sum of many
-                    // Bernoulli(0.01) terms, i.e. Poisson-like and skewed (anti-conservative tails).
-                    double vr = 0.0;
-                    for (int i = 0; i < n; ++i) {
-                        if (isbig[i]) continue;
-                        const double ci = dl * wv[i];
-                        vr += ci * ci * cp[i] * (1.0 - cp[i]);
-                    }
-                    BernRest br;
-                    if (vr > 0.0) {
-                        const double step = 1e-3 * std::sqrt(vr);
-                        std::map< std::pair<float, long>, std::pair<double, double> > grp;
-                        for (int i = 0; i < n; ++i) {
-                            if (isbig[i]) continue;
-                            const double ci = dl * wv[i];
-                            if (ci == 0.0) continue;
-                            std::pair<double, double>& gg = grp[std::make_pair(cp[i], std::lround(ci / step))];
-                            gg.first += ci; gg.second += 1.0;
-                        }
-                        br.c.reserve(grp.size()); br.p.reserve(grp.size()); br.w.reserve(grp.size());
-                        for (std::map< std::pair<float, long>, std::pair<double, double> >::const_iterator it = grp.begin(); it != grp.end(); ++it) {
-                            br.c.push_back(it->second.first / it->second.second);
-                            br.p.push_back(std::min(std::max((double) it->first.first, 1e-12), 1.0 - 1e-12));
-                            br.w.push_back(it->second.second);
-                        }
-                    }
-                    const std::vector<double> nolam;
-                    ExactSpaResult er; er.converged = false;
-                    if (!terms.empty() || !br.c.empty()) {
-                        er = exact_spa_solve(Q, terms, nolam, nolam, c0, &br);
-                        // saddlepoint first; for p < 0.1 (or if it fails) the lattice convolution
-                        // (coher_grid_solve: terms centred at their most likely value)
-                        if (!terms.empty() && !er.exact &&
-                            (!er.converged || std::min(er.p_up, er.p_lo) < 0.1)) {
-                            std::vector<double> tv(terms.size()), tp(terms.size());
-                            for (size_t r = 0; r < terms.size(); ++r) { tv[r] = terms[r].v[1]; tp[r] = std::exp(terms[r].lp[1]); }
-                            ExactSpaResult eg = coher_grid_solve(Q, tv, tp, &br, c0);
-                            if (eg.converged) er = eg;
-                        }
-                    }
-                    // diagnostics: SPARROW_COHER_DUMP=<dir> writes the null model of every binary
-                    // co-heritability test with p < 1e-6 (first 200) for checking against Monte Carlo
-                    if (er.converged && 2.0 * std::min(er.p_up, er.p_lo) < 1e-6) {
-                        static const char* ddir = std::getenv("SPARROW_COHER_DUMP");
-                        static std::atomic<int> ndump(0);
-                        if (ddir) { const int id = ndump++; if (id < 200) {
-                            char fn[1024]; std::snprintf(fn, sizeof(fn), "%s/coher_dump_%d.txt", ddir, id);
-                            if (FILE* f = std::fopen(fn, "w")) {
-                                std::fprintf(f, "%.17g %.17g %zu %zu %d %d %d %d %.6g\n", Q, c0, terms.size(), br.c.size(), t1, t2, c, K, 2.0 * std::min(er.p_up, er.p_lo));
-                                for (size_t r = 0; r < terms.size(); ++r) std::fprintf(f, "%.17g %.17g\n", terms[r].v[1], std::exp(terms[r].lp[1]));
-                                for (size_t g2 = 0; g2 < br.c.size(); ++g2) std::fprintf(f, "%.17g %.17g %.17g\n", br.c[g2], br.p[g2], br.w[g2]);
-                                std::fclose(f);
-                            } } }
+                        if (!cploc.empty()) { ExactSpaResult e2 = bin_test(cploc); if (e2.converged) er = e2; }
                     }
                     if (er.converged) {
                         cr.p_spa[c][pi] = std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo));
@@ -2941,7 +2943,18 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 const double V0 = b.dot(t2p.P0 * b) - w.dot(pcache[t1].solve(w)) + ec * ec * r1 * (e2 - e12 * e12 / e1);
                 const double bm = b.dot(Mc[c] * b);
                 if (!(V0 > 0.0) || !std::isfinite(V0)) { cr.spa_used[c][pi] = -1; continue; }
-                if (K <= KREML) {                 // small genes: REML-GLS test (below)
+                if (K > KREML) {                  // large blocks: fast test first
+                    const double sd0 = std::sqrt(2.0 * t2p.tau0);
+                    double V = V0, nu6 = 1e300;
+                    if (s2 > 2.0 * sd0) {
+                        const double var_s = 2.0 * (t2p.tau0 + t2p.tau1 * s2 + tau2c[c] * s2 * s2);
+                        V = V0 + s2 * bm;
+                        nu6 = 2.0 * V * V / (bm * bm * var_s);
+                    }
+                    const double p6 = t_two_sided_p((Q - hm) / std::sqrt(V), nu6);
+                    if (std::isfinite(p6) && p6 >= refine_p) { cr.p_spa[c][pi] = p6; cr.spa_used[c][pi] = 6; continue; }
+                }
+                {                                 // REML-GLS test (all small blocks; large blocks with p < refine_p)
                     double tst, nu;
                     // sensitivity of the conditional mean to trait 1's tested component, and the
                     // sampling variance of its estimate (same trace formula as for trait 2)
@@ -2967,17 +2980,6 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     } else { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
                     continue;
                 }
-                // large genes: s_hat has many degrees of freedom; include it only when clearly
-                // positive (> 2 null SD), with a Satterthwaite t for its uncertainty
-                const double sd0 = std::sqrt(2.0 * t2p.tau0);
-                double V = V0, nu = 1e300;
-                if (s2 > 2.0 * sd0) {
-                    const double var_s = 2.0 * (t2p.tau0 + t2p.tau1 * s2 + tau2c[c] * s2 * s2);
-                    V = V0 + s2 * bm;
-                    nu = 2.0 * V * V / (bm * bm * var_s);
-                }
-                cr.p_spa[c][pi] = t_two_sided_p((Q - hm) / std::sqrt(V), nu);
-                cr.spa_used[c][pi] = 6;
             }
         }
         finish_se();
@@ -4165,7 +4167,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; REML-GLS for all block sizes), binary coher: P(case) refitted on the local background score, binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < 1e-3), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
