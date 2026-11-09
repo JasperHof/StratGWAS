@@ -2084,7 +2084,6 @@ struct ChunkResultA {
     // ACAT-V p-values (p_acv). p_spa then holds the omnibus of all of them.
     std::vector< std::vector< std::vector<double> > > p_acatv;
     std::vector< std::vector<double> > p_vc, p_acv;
-    int n_cond = 0; std::string cond_snps;     // cond_common: variants conditioned on
 };
 
 // Read a SNP index range, project covariates, apply alpha; return false on error.
@@ -2100,8 +2099,24 @@ static bool read_block(const ChunkContext& ctx, int lo, int hi, Cell& c, bool co
     return true;
 }
 
+// keep only the columns of a cell with MAF >= mmin (used for gene flanks: common variants only)
+static void keep_common_cols(Cell& c, double mmin) {
+    if (mmin <= 0.0 || c.X.cols() == 0) return;
+    std::vector<int> k;
+    for (int j = 0; j < (int) c.X.cols(); ++j) if (c.maf[j] >= mmin) k.push_back(j);
+    if ((int) k.size() == (int) c.X.cols()) return;
+    GenoMat X2(c.X.rows(), (int) k.size()); std::vector<float> m2(k.size());
+    std::vector< std::vector<int> > car2; std::vector< std::vector<unsigned char> > dos2;
+    for (size_t q = 0; q < k.size(); ++q) {
+        X2.col((int) q) = c.X.col(k[q]); m2[q] = c.maf[k[q]];
+        if (k[q] < (int) c.car.size()) { car2.push_back(c.car[k[q]]); dos2.push_back(c.dos[k[q]]); }
+    }
+    c.X = X2; c.maf = m2;
+    if (!c.car.empty()) { c.car = car2; c.dos = dos2; }
+}
+
 static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
-                       int fL0, int fL1, int fR0, int fR1, ChunkDataA& cd) {
+                       int fL0, int fL1, int fR0, int fR1, ChunkDataA& cd, double flank_maf = 0.0) {
     cd = ChunkDataA();
     cd.chr = ctx.chr_order[ci];
     cd.start = ctx.bim.bp[a]; cd.end = ctx.bim.bp[b - 1];
@@ -2135,6 +2150,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     Cell fl, fr;
     if (!read_block(ctx, fL0, fL1, fl)) return false;
     if (!read_block(ctx, fR0, fR1, fr)) return false;
+    keep_common_cols(fl, flank_maf); keep_common_cols(fr, flank_maf);
     const int m_flank = (int) bg_cols.size() + (int) fl.X.cols() + (int) fr.X.cols();
 
     int Kt = 0; for (size_t k = 0; k < act.size(); ++k) Kt += (int) cat_cols[act[k]].size();
@@ -2192,245 +2208,6 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     return true;
 }
 
-
-// ===========================================================================
-// CONDITIONING ON THE GENE'S LEAD COMMON VARIANTS (cond_common = TRUE)
-// ===========================================================================
-// Rare variants sit on haplotypes that carry common alleles, so a gene whose COMMON
-// variants are causal shows rare-variant signal through LD, even in a model that also
-// contains a common-variant category (a single infinitesimal common kernel cannot
-// absorb a few strong causal variants). The standard remedy, as in SAIGE-GENE+ and
-// REGENIE, is to condition on the lead common variants: they become fixed effects.
-//
-// Selection (per gene block): common variants of the block (MAF >= cond_maf) whose
-// LDAK-KVIK single-variant p-value is < cond_p for ANY trait, in order of their smallest
-// p-value; a variant is skipped if it is (nearly) a linear combination of those already
-// selected (r^2 > 0.9 with their span); at most cond_max variants. With Q an orthonormal
-// basis of the selected (covariate-projected, weighted) genotype columns:
-//   V <- (I - QQ') V      (the selected columns themselves are dropped)
-//   y <- (I - QQ') y      (via the offset in build_pheno_stats, every phenotype)
-//   T(env, env) = n - cov_df - r
-//   binary: P(case) <- P(case) + QQ'(b - P(case))  (linear-probability update), for the
-//           exact single-trait test (PiF) and the conditional co-heritability test (cpi).
-// Returns r (0 = nothing selected; cd unchanged).
-struct CondOpt { double p, maf; int max; long window = 0; size_t ci = 0; int a = 0, b = 0; };
-// p-values: LDAK-KVIK single-variant tests when kvik_summaries are given; otherwise the
-// correlation test of each common variant with each phenotype in the data (Y: the
-// phenotypes as analysed, i.e. after covariates and any LOCO PRS), z = r sqrt(n).
-static int cond_common_apply(const ChunkContext& ctx, const CondOpt& pr, ChunkDataA& cd,
-                             Eigen::MatrixXd& Q, std::string& names, const Eigen::MatrixXd* Y = 0) {
-    names.clear();
-    const bool use_kvik = !ctx.kz.empty();
-    const int n = (int) cd.V.rows(), P = use_kvik ? (int) ctx.kz.size() : (Y ? (int) Y->cols() : 0);
-    if (P == 0 || n <= 0) return 0;
-    Eigen::RowVectorXd ynorm;
-    if (!use_kvik) {
-        ynorm.resize(P);
-        for (int t = 0; t < P; ++t) { const double m = Y->col(t).mean(); ynorm[t] = std::sqrt((Y->col(t).array() - m).square().sum()); }
-    }
-    int mcat = 0; for (size_t c = 0; c < cd.cat_m.size(); ++c) mcat += cd.cat_m[c];
-    // candidates: (p, column of the block) for variants in the block, (p, -1 - .bim index) for
-    // variants in the flanking window (cond_window; needs single-variant p-values in ctx.kz)
-    std::vector< std::pair<double,int> > cand;
-    auto pmin_kz = [&](int bi) -> double {
-        double pm = 1.0;
-        for (int t = 0; t < P; ++t) {
-            const float z = ctx.kz[t][bi];
-            if (std::isnan(z)) continue;
-            pm = std::min(pm, std::erfc(std::abs((double) z) / std::sqrt(2.0)));
-        }
-        return pm;
-    };
-    for (int k = 0; k < mcat; ++k) {
-        const int bi = cd.colbim[k];
-        if (bi < 0 || !(cd.colmaf[k] >= pr.maf)) continue;
-        double pmin = 1.0;
-        if (use_kvik) pmin = pmin_kz(bi);
-        else {
-            Eigen::VectorXd x = cd.V.col(k).cast<double>(); x.array() -= x.mean();
-            const double xn = x.norm();
-            if (!(xn > 0.0)) continue;
-            const Eigen::RowVectorXd xy = x.transpose() * (*Y);       // centring x is enough
-            for (int t = 0; t < P; ++t) {
-                if (!(ynorm[t] > 0.0)) continue;
-                const double z = xy[t] / (xn * ynorm[t]) * std::sqrt((double) n);
-                pmin = std::min(pmin, std::erfc(std::abs(z) / std::sqrt(2.0)));
-            }
-        }
-        if (pmin < pr.p) cand.push_back(std::make_pair(pmin, k));
-    }
-    if (pr.window > 0 && use_kvik && pr.ci < ctx.chr_lo.size()) {
-        const int lo = ctx.chr_lo[pr.ci], hi = ctx.chr_hi[pr.ci];
-        const int w0 = lower_index(ctx.bim.bp, lo, hi, ctx.bim.bp[pr.a] - pr.window);
-        const int w1 = lower_index(ctx.bim.bp, lo, hi, ctx.bim.bp[pr.b - 1] + pr.window + 1);
-        for (int bi = w0; bi < w1; ++bi) {
-            if (bi >= pr.a && bi < pr.b) continue;                     // in the block: done above
-            bool common = false;
-            for (int t = 0; t < P && !common; ++t) {
-                const float mc = ctx.kmac[t][bi];
-                if (!std::isnan(mc) && mc / (2.0 * ctx.n_inds) >= pr.maf) common = true;
-            }
-            if (!common) continue;
-            const double pm = pmin_kz(bi);
-            if (pm < pr.p) cand.push_back(std::make_pair(pm, -1 - bi));
-        }
-    }
-    if (cand.empty()) return 0;
-    std::sort(cand.begin(), cand.end());
-    std::vector<Eigen::VectorXd> qs; std::vector<int> sel, selbim;
-    for (size_t c = 0; c < cand.size() && (int) qs.size() < pr.max; ++c) {
-        Eigen::VectorXd x;
-        const int k = cand[c].second;
-        if (k >= 0) x = cd.V.col(k).cast<double>();
-        else {                                                         // flanking variant: read it
-            Cell one;
-            if (!read_block(ctx, -1 - k, -k, one) || one.X.cols() != 1) continue;
-            x = one.X.col(0).cast<double>();
-        }
-        const double x2 = x.squaredNorm();
-        if (!(x2 > 0.0)) continue;
-        for (int it = 0; it < 2; ++it)                       // Gram-Schmidt, twice for stability
-            for (size_t q = 0; q < qs.size(); ++q) x -= qs[q] * qs[q].dot(x);
-        const double r2 = x.squaredNorm();
-        if (r2 < 0.1 * x2) continue;                         // r^2 > 0.9 with the selected span
-        qs.push_back(x / std::sqrt(r2));
-        if (k >= 0) { sel.push_back(k); selbim.push_back(cd.colbim[k]); } else selbim.push_back(-1 - k);
-    }
-    const int r = (int) qs.size();
-    if (r == 0) return 0;
-    Q.resize(n, r);
-    for (int q = 0; q < r; ++q) Q.col(q) = qs[q];
-    for (int q = 0; q < r; ++q) { if (q) names += ","; names += ctx.bim.id[selbim[q]]; }
-
-    // drop the selected columns of the block (flanking ones are not part of it), project the rest
-    std::vector<char> drop(cd.K, 0); for (size_t q = 0; q < sel.size(); ++q) drop[sel[q]] = 1;
-    std::vector<int> keep; for (int k = 0; k < cd.K; ++k) if (!drop[k]) keep.push_back(k);
-    const int K2 = (int) keep.size();
-    GenoMat V2(n, K2);
-    for (int k0 = 0; k0 < K2; k0 += 64) {
-        const int kb = std::min(64, K2 - k0);
-        Eigen::MatrixXd B(n, kb);
-        for (int c = 0; c < kb; ++c) B.col(c) = cd.V.col(keep[k0 + c]).cast<double>();
-        B.noalias() -= Q * (Q.transpose() * B);
-        V2.middleCols(k0, kb) = B.cast<float>();
-    }
-    // per-category bookkeeping
-    std::vector<int> cm2; std::vector<int> cid2; std::vector<std::string> cn2; std::vector<double> cw2;
-    std::vector< std::vector<int> > cob2; std::vector< std::vector<float> > com2;
-    int off = 0;
-    for (size_t c = 0; c < cd.cat_m.size(); ++c) {
-        int m2 = 0; for (int k = off; k < off + cd.cat_m[c]; ++k) if (!drop[k]) ++m2;
-        off += cd.cat_m[c];
-        if (m2 == 0) continue;                               // category emptied: no longer tested
-        cm2.push_back(m2); cid2.push_back(cd.cat_id[c]); cn2.push_back(cd.cat_name[c]); cw2.push_back(cd.cat_w[c]);
-        if (c < cd.cat_obim.size()) { cob2.push_back(cd.cat_obim[c]); com2.push_back(cd.cat_omaf[c]); }
-    }
-    if (cm2.empty()) return -1;
-    std::vector<float> mf2(K2); std::vector<int> cb2(K2);
-    std::vector< std::vector<int> > car2; std::vector< std::vector<unsigned char> > dos2;
-    const bool hc = !cd.car.empty();
-    if (hc) { car2.resize(K2); dos2.resize(K2); }
-    for (int k = 0; k < K2; ++k) {
-        mf2[k] = cd.colmaf[keep[k]]; cb2[k] = cd.colbim[keep[k]];
-        if (hc) { car2[k] = cd.car[keep[k]]; dos2[k] = cd.dos[keep[k]]; }
-    }
-    cd.V = V2; cd.K = K2; cd.colmaf = mf2; cd.colbim = cb2;
-    if (hc) { cd.car = car2; cd.dos = dos2; }
-    cd.cat_m = cm2; cd.cat_id = cid2; cd.cat_name = cn2; cd.cat_w = cw2; cd.cat_obim = cob2; cd.cat_omaf = com2;
-    cd.cj.resize(K2);
-    for (int j = 0; j < K2; ++j) cd.cj[j] = cd.V.col(j).cast<double>().squaredNorm();
-    if (!cd.colsum.empty() || hc) {
-        cd.colsum.resize(K2);
-        for (int j = 0; j < K2; ++j) cd.colsum[j] = cd.V.col(j).cast<double>().sum();
-    }
-    return r;
-}
-
-// Single-variant z-scores for cond_common without kvik_summaries: one pass over the genotypes,
-// z = r sqrt(n) for every variant with MAF >= maf_min (correlation of the covariate-projected
-// genotype with the phenotype), stored in ctx.kz / ctx.kmac exactly as KVIK summaries would be.
-// Needed for a flanking window (cond_window), where the variants are not otherwise read.
-struct CondZWorker : public RcppParallel::Worker {
-    ChunkContext& ctx; const std::vector< std::pair<int,int> >& blocks; const Eigen::MatrixXf& Yc;
-    const Eigen::VectorXf& ynorm; double maf_min;
-    CondZWorker(ChunkContext& c, const std::vector< std::pair<int,int> >& b, const Eigen::MatrixXf& y,
-                const Eigen::VectorXf& yn, double mm) : ctx(c), blocks(b), Yc(y), ynorm(yn), maf_min(mm) {}
-    void operator()(std::size_t b0, std::size_t b1) {
-        const int P = (int) Yc.cols(); const double n = (double) ctx.n_inds;
-        for (std::size_t w = b0; w < b1; ++w) {
-            Cell c;
-            if (!read_block(ctx, blocks[w].first, blocks[w].second, c)) continue;
-            const int m = (int) c.X.cols();
-            if (m == 0) continue;
-            Eigen::MatrixXf XY = c.X.transpose() * Yc;                       // m x P
-            for (int j = 0; j < m; ++j) {
-                const double f = c.maf[j];
-                if (!(f >= maf_min)) continue;
-                const double xn = c.X.col(j).cast<double>().norm();
-                if (!(xn > 0.0)) continue;
-                const int bi = blocks[w].first + j;
-                for (int t = 0; t < P; ++t) {
-                    if (!(ynorm[t] > 0.0f)) continue;
-                    ctx.kz[t][bi]   = (float) (XY(j, t) / (xn * ynorm[t]) * std::sqrt(n));
-                    ctx.kmac[t][bi] = (float) (2.0 * n * f);
-                }
-            }
-        }
-    }
-};
-static void cond_precompute_z(ChunkContext& ctx, double maf_min, const std::string& chr_only) {
-    const int n = ctx.n_inds, P = ctx.n_pheno;
-    Eigen::MatrixXf Yc = ctx.Y.cast<float>();
-    Eigen::VectorXf yn(P);
-    for (int t = 0; t < P; ++t) { Yc.col(t).array() -= Yc.col(t).mean(); yn[t] = Yc.col(t).norm(); }
-    const float nanf = std::numeric_limits<float>::quiet_NaN();
-    ctx.kz.assign(P, std::vector<float>(ctx.n_snps, nanf));
-    ctx.kmac.assign(P, std::vector<float>(ctx.n_snps, nanf));
-    std::vector< std::pair<int,int> > blocks;
-    for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
-        if (!chr_only.empty() && strip_chr(ctx.chr_order[ci]) != strip_chr(chr_only)) continue;
-        for (int lo = ctx.chr_lo[ci]; lo <= ctx.chr_hi[ci]; lo += 256)
-            blocks.push_back(std::make_pair(lo, std::min(ctx.chr_hi[ci] + 1, lo + 256)));
-    }
-    (void) n;
-    CondZWorker wk(ctx, blocks, Yc, yn, maf_min);
-    RcppParallel::parallelFor(0, blocks.size(), wk);
-}
-
-// Phenotype statistics conditional on the selected variants (basis Q): y <- (I - QQ')y,
-// and the binary null probabilities updated by the linear-probability fit on Q.
-static void cond_pheno_stats(const ChunkContext& ctx, bool binary, bool coher,
-                             const std::vector< std::pair<int,int> >& pairs, const PhenoStats& S0,
-                             const Eigen::MatrixXd& Q, PhenoStats& S) {
-    const int n = ctx.n_inds, P = ctx.n_pheno;
-    Eigen::MatrixXd off = ctx.Y - S0.Y;                       // the LOCO offset already applied
-    off.noalias() += Q * (Q.transpose() * S0.Y);
-    build_pheno_stats(ctx, off, binary, coher, pairs, S);
-    auto upd = [&](std::vector<double>& pv, const std::vector<unsigned char>& b) {
-        Eigen::VectorXd d(n);
-        for (int i = 0; i < n; ++i) d[i] = (double) b[i] - pv[i];
-        const Eigen::VectorXd a = Q * (Q.transpose() * d);
-        for (int i = 0; i < n; ++i) pv[i] = std::min(std::max(pv[i] + a[i], 1e-8), 1.0 - 1e-8);
-    };
-    if (S.bx.active) {
-        for (int t = 0; t < P; ++t) {
-            std::vector<double> pv(n);
-            for (int i = 0; i < n; ++i) pv[i] = S.bx.PiF(i, t);
-            upd(pv, ctx.braw[t]);
-            double vb = 0.0;
-            for (int i = 0; i < n; ++i) { S.bx.PiF(i, t) = (float) pv[i]; vb += pv[i] * (1.0 - pv[i]); }
-            S.bx.vbar[t] = S.bx.delta[t] * S.bx.delta[t] * vb / n;
-        }
-    }
-    if (S.cb.active) {
-        for (size_t q = 0; q < S.cb.cpi.size(); ++q) {
-            std::vector<double> pv(n);
-            for (int i = 0; i < n; ++i) pv[i] = S.cb.cpi[q][i];
-            upd(pv, ctx.braw[S.cb.rand_t[q]]);
-            for (int i = 0; i < n; ++i) S.cb.cpi[q][i] = (float) pv[i];
-        }
-    }
-}
 
 // ===========================================================================
 // Chunk geometry: everything that depends on the GENOTYPES and cov_df but NOT
@@ -3082,6 +2859,12 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         msl[a2] = -(Psi12 * pcache[t1].solve(mp));
                         if (a2 != c && g[a2] != 0.0 && off[a2 + 1] > off[a2]) xbg.push_back(mp);
                     }
+                    for (int a2 = A; a2 < C; ++a2) {          // flank (background) component
+                        if (g[a2] == 0.0 || off[a2 + 1] <= off[a2]) continue;
+                        std::vector<double> du(C, 0.0); du[a2] = g[a2];
+                        Eigen::MatrixXd Bf; coher_block(L, W, use_wcache, off, C, K, du, 0.0, Bf);
+                        xbg.push_back(Bf * p1a);
+                    }
                     if (coher_reml_test(c, t1, t2, b, a1, r1, e1, e2, e12, w, Psi12, t2p.P0, Mc[c], pcache[t1],
                                         ec, yty, ycross[pi], msl, vth[t1], xbg, tst, nu)) {
                         cr.p_spa[c][pi] = t_two_sided_p(tst, nu); cr.spa_used[c][pi] = 7;
@@ -3449,10 +3232,9 @@ struct ChunkParams {
     bool coher;
     std::vector< std::pair<int,int> > pairs;
     std::vector<std::string> pair_names;
-    // conditioning of gene tests on the gene's lead common variants (see cond_common_apply)
-    bool cond_common = false; double cond_p = 1e-4; int cond_max = 10; double cond_maf = 0.01;
-    long cond_window = 0;      // bp: lead variants may also lie this far outside the gene
-    bool use_acatv = false;    // ACAT-V (marginal single-variant tests): off with coher or cond_common
+    long gene_flank = 0;       // bp: common variants this far outside a gene enter as a background component
+    double gene_flank_maf = 0.01;
+    bool use_acatv = false;    // ACAT-V (marginal single-variant tests): univariate, with KVIK summaries
 };
 
 // One unit of work: its own range [a,b) plus two flank ranges. `win` is the
@@ -3532,23 +3314,8 @@ struct Worker : public RcppParallel::Worker {
         for (std::size_t w = begin; w < end; ++w) {
             const Job& j = jobs[job0 + w];
             ChunkDataA cd;
-            if (!make_chunk(ctx, j.ci, j.a, j.b, j.fL0, j.fL1, j.fR0, j.fR1, cd)) { ok[w] = 0; continue; }
-            // cond_common: gene blocks are tested conditional on their lead common variants
-            Eigen::MatrixXd Qc; std::string cnames; int rc = 0;
-            std::vector<PhenoStats> Sloc;
-            if (pr.cond_common && j.gene) {
-                CondOpt co; co.p = pr.cond_p; co.maf = pr.cond_maf; co.max = pr.cond_max;
-                co.window = pr.cond_window; co.ci = j.ci; co.a = j.a; co.b = j.b;
-                rc = cond_common_apply(ctx, co, cd, Qc, cnames, S.empty() ? 0 : &S[0].Y);
-                if (rc < 0) { ok[w] = 0; continue; }
-                if (rc > 0) {
-                    Sloc.resize(S.size());
-                    for (size_t v = 0; v < S.size(); ++v)
-                        cond_pheno_stats(ctx, pr.binary, pr.coher, pr.pairs, S[v], Qc, Sloc[v]);
-                }
-            }
-            const std::vector<PhenoStats>& SS = (rc > 0) ? Sloc : S;
-            const int cdf = pr.cov_df + std::max(rc, 0);
+            if (!make_chunk(ctx, j.ci, j.a, j.b, j.fL0, j.fL1, j.fR0, j.fR1, cd,
+                            j.gene ? pr.gene_flank_maf : 0.0)) { ok[w] = 0; continue; }
             // Multi-alpha applies to ASSOCIATION passes only (spa = true). The
             // heritability pass runs with spa = false and stays single-alpha.
             const bool multi = spa && ctx.alphas.size() > 1;
@@ -3556,13 +3323,13 @@ struct Worker : public RcppParallel::Worker {
             // alphas and ACAT-V only concern p-values, so they run on variant 0 only;
             // variant 1 is tested once, at the primary alpha, which is all its
             // reported se_vg needs.
-            const size_t NVP = (spa && pr.h2_raw) ? std::min<size_t>(1, SS.size()) : SS.size();
+            const size_t NVP = (spa && pr.h2_raw) ? std::min<size_t>(1, S.size()) : S.size();
             ChunkGeom gm; Eigen::MatrixXd G0;
-            build_geom(cd, cdf, spa, pr.binary, gm, 0, multi ? &G0 : 0);   // may leave gm.ok false
-            for (size_t v = 0; v < SS.size(); ++v)
-                test_chunk_annot(cd, gm, SS[v].Y, SS[v].Yf, SS[v].Vp, SS[v].yty,
+            build_geom(cd, pr.cov_df, spa, pr.binary, gm, 0, multi ? &G0 : 0);   // may leave gm.ok false
+            for (size_t v = 0; v < S.size(); ++v)
+                test_chunk_annot(cd, gm, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty,
                                  pr.binary, spa, pr.coher, pr.pairs,
-                                 SS[v].ycross, SS[v].cb, SS[v].bx, pr.one_sided, out[v][w]);
+                                 S[v].ycross, S[v].cb, S[v].bx, pr.one_sided, out[v][w]);
             if (multi) {
                 // ---- ACAT over alpha ------------------------------------------
                 // V was read at alphas[0]. Another alpha only rescales columns:
@@ -3593,12 +3360,12 @@ struct Worker : public RcppParallel::Worker {
                         }
                         Eigen::MatrixXd Gk = d.asDiagonal() * G0 * d.asDiagonal();
                         ChunkGeom gk;
-                        build_geom(ck, cdf, spa, pr.binary, gk, &Gk);
+                        build_geom(ck, pr.cov_df, spa, pr.binary, gk, &Gk);
                         for (size_t v = 0; v < NVP; ++v) {
                             ChunkResultA tmp;
-                            test_chunk_annot(ck, gk, SS[v].Y, SS[v].Yf, SS[v].Vp, SS[v].yty,
+                            test_chunk_annot(ck, gk, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty,
                                              pr.binary, spa, pr.coher, pr.pairs,
-                                             SS[v].ycross, SS[v].cb, SS[v].bx, pr.one_sided, tmp);
+                                             S[v].ycross, S[v].cb, S[v].bx, pr.one_sided, tmp);
                             ChunkResultA& R = out[v][w];
                             for (size_t q = 0; q < R.p_alpha.size() && q < tmp.p_spa.size(); ++q)
                                 for (size_t t = 0; t < R.p_alpha[q].size() && t < tmp.p_spa[q].size(); ++t)
@@ -3654,7 +3421,6 @@ struct Worker : public RcppParallel::Worker {
                     }
                 }
             }
-            for (size_t v = 0; v < out.size(); ++v) { out[v][w].n_cond = rc; out[v][w].cond_snps = cnames; }
             ok[w] = 1;
         }
     }
@@ -3827,6 +3593,10 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     const int e = std::min(b, s + pr.max_gene_snps);
                     Job j; j.ci = ci; j.a = s; j.b = e;
                     j.fL0 = j.fL1 = j.fR0 = j.fR1 = 0;
+                    if (pr.gene_flank > 0) {               // flanks outside the GENE (not the block)
+                        j.fL0 = lower_index(ctx.bim.bp, lo, hi, ctx.gene_start[g] - pr.gene_flank); j.fL1 = a;
+                        j.fR0 = b; j.fR1 = lower_index(ctx.bim.bp, lo, hi, ctx.gene_end[g] + pr.gene_flank + 1);
+                    }
                     j.win = (int) grec.size(); j.gene = true;
                     gj.push_back(j); s = e;
                 }
@@ -3835,7 +3605,8 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
             chr_g1.push_back(gj.size());
         }
         Rcout << "Genes: " << grec.size() << " with >= " << pr.min_gene_snps << " SNPs -> "
-              << gj.size() << " blocks (split at " << pr.max_gene_snps << " SNPs), no flanks, "
+              << gj.size() << " blocks (split at " << pr.max_gene_snps << " SNPs), "
+              << (pr.gene_flank > 0 ? "common-variant flanks, " : "no flanks, ")
               << "phenotype = y - LOCO PRS.\n";
         if (n_gene_drop_small) Rcout << "  " << n_gene_drop_small << " genes skipped: fewer than "
                                      << pr.min_gene_snps << " SNPs in the genotype file.\n";
@@ -4169,7 +3940,6 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         if (pr.spa)        f3 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr;
         if (pr.coher)      f3 << "\tvg_t1\tvg_t2";          // univariate estimates of both traits (for rg)
         if (pr.do_windows) f3 << "\tvg_adj\th2_adj";
-        if (pr.cond_common) f3 << "\tn_cond\tcond_snps";
         f3 << "\n";
         // Window overlap per gene block, computed ONCE. Windows tile each
         // chromosome, so a block's SNP range intersects a short contiguous run
@@ -4224,7 +3994,6 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                             f3 << '\t'; wr(f3, a);
                             f3 << '\t'; wr(f3, (!std::isnan(a) && h2den(t) > 0) ? a / h2den(t) : NA_REAL);
                         }
-                        if (pr.cond_common) f3 << '\t' << B.n_cond << '\t' << (B.cond_snps.empty() ? std::string("-") : B.cond_snps);
                         f3 << '\n';
                     }
                 }
@@ -4238,7 +4007,6 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                 if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
                 if (pr.coher) f3 << "\tNA\tNA";
                 if (pr.do_windows) f3 << "\tNA\tNA";
-                if (pr.cond_common) f3 << "\tNA\tNA";
                 f3 << '\n';
             }
         }
@@ -4290,11 +4058,8 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          Rcpp::Nullable<Rcpp::NumericMatrix> binary_raw = R_NilValue,
                          Rcpp::Nullable<Rcpp::NumericMatrix> binary_pi = R_NilValue,
                          bool coher = false,
-                         bool cond_common = false,
-                         double cond_p = 1e-4,
-                         int cond_max = 10,
-                         double cond_maf = 0.01,
-                         double cond_window = 0,
+                         double gene_flank = 0,
+                         double flank_maf = 0.01,
                          SEXP chr = R_NilValue,
                          std::string out_file = "",
                          int batch_size = 64,
@@ -4304,7 +4069,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], cond_common (lead common variants as fixed effects; KVIK or correlation p; cond_window), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
@@ -4383,17 +4148,11 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (pr.cov_df >= ctx.n_inds) stop("cov_df must be smaller than the sample size");
     Rcout << "Environment moment: T(env,env) = n - " << pr.cov_df << "\n";
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads;
-    pr.cond_common = cond_common; pr.cond_p = cond_p; pr.cond_max = cond_max; pr.cond_maf = cond_maf;
-    pr.cond_window = (long) std::max(0.0, cond_window);
-    if (cond_common) {
-        if (kvik_summaries.isNull())
-            Rcout << "cond_common: lead common variants selected by their correlation with the phenotypes "
-                  << "(z = r sqrt(n); no kvik_summaries given), p < " << cond_p << " for any phenotype, at most "
-                  << cond_max << " per gene block, MAF >= " << cond_maf << ".\n";
-        if (!(cond_p > 0.0 && cond_p < 1.0)) stop("cond_p must be in (0, 1)");
-        if (cond_max < 1) stop("cond_max must be >= 1");
-    }
-    pr.use_acatv = SPA && !coher && !cond_common && kvik_summaries.isNotNull();
+    pr.gene_flank = (long) std::max(0.0, gene_flank); pr.gene_flank_maf = std::max(0.0, flank_maf);
+    if (pr.gene_flank > 0)
+        Rcout << "Gene flanks: all variants with MAF >= " << pr.gene_flank_maf << " within " << pr.gene_flank
+              << " bp of each gene form a background component (estimated, not tested).\n";
+    pr.use_acatv = SPA && !coher && kvik_summaries.isNotNull();
 
     // ---- LOCO PRS sources: a character matrix, P rows (traits) x G columns ----
     // (sources). A single row is recycled over traits with a warning, since a
@@ -4526,7 +4285,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     // ---- LDAK-KVIK single-variant summaries -> ACAT-V --------------------------
     if (kvik_summaries.isNotNull()) {
         Rcpp::CharacterVector kv(kvik_summaries.get());
-        if (!pr.use_acatv && !pr.cond_common) {
+        if (!pr.use_acatv) {
             if (coher) Rcpp::warning("kvik_summaries is ignored with coher = TRUE (ACAT-V is univariate)");
             else Rcpp::warning("kvik_summaries is ignored with SPA = FALSE");
         } else {
@@ -4539,35 +4298,11 @@ Rcpp::List stratgwas_run(const std::string& filename,
             if (dup) Rcout << "NOTE: " << dup << " duplicated SNP names in the .bim; KVIK results are matched to the first.\n";
             ctx.kz.resize(P); ctx.kmac.resize(P);
             for (int t = 0; t < P; ++t) kvik_load(as<std::string>(kv[t]), ctx, t, idx);
-            if (pr.cond_common)
-                Rcout << "cond_common: each gene block is tested conditional on its lead common variants "
-                      << "(MAF >= " << pr.cond_maf << ", KVIK p < " << pr.cond_p << " for any trait, at most "
-                      << pr.cond_max << ", r^2 < 0.9 with those already selected), projected out of genotypes "
-                      << "and phenotypes" << (pr.binary ? " (binary: null P(case) updated)" : "") << ".\n"
-                      << "  ACAT-V (marginal single-variant tests) is not used with cond_common.\n";
-            if (pr.use_acatv) Rcout << "ACAT-V: KVIK single-variant tests, weights [2f(1-f)]^(1+alpha) for each alpha, "
+            Rcout << "ACAT-V: KVIK single-variant tests, weights [2f(1-f)]^(1+alpha) for each alpha, "
                   << "variants with MAC < " << acatv_mac << " collapsed into a burden.\n"
                   << "  p_spa = ACAT over " << 2 * ctx.alphas.size() << " p-values ("
                   << ctx.alphas.size() << " variance-component + " << ctx.alphas.size() << " ACAT-V).\n";
         }
     }
-    if (pr.cond_common && ctx.kz.empty()) {
-        Rcout << "cond_common: single-variant z = r sqrt(n) for all variants with MAF >= " << pr.cond_maf
-              << " (one pass over the genotypes) ..." << std::flush;
-        Eigen::setNbThreads(1);
-        if (pr.n_threads > 0) {
-            std::string nt = std::to_string(pr.n_threads);
-#ifdef _WIN32
-            _putenv_s("RCPP_PARALLEL_NUM_THREADS", nt.c_str());
-#else
-            setenv("RCPP_PARALLEL_NUM_THREADS", nt.c_str(), 1);
-#endif
-        }
-        cond_precompute_z(ctx, pr.cond_maf, pr.chr);
-        Rcout << " done.\n";
-    }
-    if (pr.cond_common && pr.cond_window > 0)
-        Rcout << "cond_common: lead variants selected within the gene and up to " << pr.cond_window
-              << " bp on either side (flanking variants are projected out but not tested).\n";
     return run_all(ctx, pr);
 }

@@ -36,19 +36,11 @@
 #' @param collapse_mac Variance-component test: variants with MAC <= collapse_mac are summed
 #'   into one pseudo-variant per category of each gene (as SAIGE-GENE+). 0 = off (default).
 #'   ACAT-V still uses all variants individually.
-#' @param cond_common Genes only: test (and estimate) each gene conditional on its lead
-#'   common variants, which are projected out of the genotypes and phenotypes as fixed
-#'   effects (as conditioning in SAIGE-GENE+ / REGENIE). Removes rare-variant signal that
-#'   is only due to LD with causal common variants. The variants are selected with the
-#'   `kvik_summaries` p-values if given (one per phenotype; also with coher = TRUE),
-#'   otherwise by their correlation with each phenotype (z = r sqrt(n)). ACAT-V is not used.
-#' @param cond_p Lead common variants: p-value (KVIK or correlation) below this for any phenotype.
-#' @param cond_max At most this many variants per gene block (in order of p-value; a
-#'   variant with r^2 > 0.9 with those already selected is skipped).
-#' @param cond_maf Variants with MAF >= cond_maf count as common.
-#' @param cond_window Lead common variants may also lie up to this many bp outside the gene
-#'   (they are projected out, not tested). 0 = within the gene only. Without kvik_summaries,
-#'   single-variant p-values are first computed for all common variants (one pass).
+#' @param gene_flank Genes only: variants within this many bp of each gene (all variants in
+#'   the genotype file, whatever their annotation) enter the model as a background variance
+#'   component -- estimated, not tested. Absorbs signal of nearby common variants that rare
+#'   variants of the gene tag through LD. 0 = no flanks (default).
+#' @param flank_maf Only flanking variants with MAF >= flank_maf are used (default 0.01).
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -87,8 +79,7 @@ sparrow <- function(filename, pheno, out_file,
                     max_window_chunks = 8,
                     max_gene_snps = 512, min_gene_snps = 2,
                     acatv_mac = 10, collapse_mac = 0, spa = TRUE, chr = NULL,
-                    cond_common = FALSE, cond_p = 1e-4, cond_max = 10, 
-                    cond_maf = 0.01, cond_window = 0,
+                    gene_flank = 0, flank_maf = 0.01,
                     n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
@@ -249,9 +240,7 @@ sparrow <- function(filename, pheno, out_file,
     miss <- kvik_summaries[!file.exists(kvik_summaries)]
     if (length(miss)) stop("kvik_summaries file(s) not found: ", paste(miss, collapse = ", "))
   }
-  if (cond_common) {
-    if (is.null(genes)) warning("cond_common only applies to genes; no genes given")
-  }
+  if (gene_flank > 0 && is.null(genes)) warning("gene_flank only applies to genes; no genes given")
 
   message(sprintf("SPARROW: %d individuals, %d phenotype(s), %d covariate df, alpha = %s",
                   n, P, cov_df, paste(alpha, collapse = ", ")))
@@ -269,8 +258,7 @@ sparrow <- function(filename, pheno, out_file,
     h2_without_prs = h2_without_prs,
     covariates = C, cov_df = cov_df,
     SPA = spa, binary = binary, binary_raw = binary_raw, binary_pi = binary_pi, coher = coher,
-    cond_common = cond_common, cond_p = cond_p, cond_max = as.integer(cond_max), cond_maf = cond_maf,
-    cond_window = cond_window,
+    gene_flank = gene_flank, flank_maf = flank_maf,
     chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
 
   files <- c(regions = out_file,
