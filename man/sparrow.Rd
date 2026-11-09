@@ -33,6 +33,7 @@ sparrow(
   cond_p = 1e-04,
   cond_max = 10,
   cond_maf = 0.01,
+  cond_window = 0,
   n_threads = 0,
   batch_size = 64
 )
@@ -104,6 +105,10 @@ otherwise by their correlation with each phenotype (z = r sqrt(n)). ACAT-V is no
 variant with r^2 > 0.9 with those already selected is skipped).}
 
 \item{cond_maf}{Variants with MAF >= cond_maf count as common.}
+
+\item{cond_window}{Lead common variants may also lie up to this many bp outside the gene
+(they are projected out, not tested). 0 = within the gene only. Without kvik_summaries,
+single-variant p-values are first computed for all common variants (one pass).}
 
 \item{n_threads}{Number of threads (0 = RcppParallel default).}
 

@@ -46,6 +46,9 @@
 #' @param cond_max At most this many variants per gene block (in order of p-value; a
 #'   variant with r^2 > 0.9 with those already selected is skipped).
 #' @param cond_maf Variants with MAF >= cond_maf count as common.
+#' @param cond_window Lead common variants may also lie up to this many bp outside the gene
+#'   (they are projected out, not tested). 0 = within the gene only. Without kvik_summaries,
+#'   single-variant p-values are first computed for all common variants (one pass).
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -84,7 +87,8 @@ sparrow <- function(filename, pheno, out_file,
                     max_window_chunks = 8,
                     max_gene_snps = 512, min_gene_snps = 2,
                     acatv_mac = 10, collapse_mac = 0, spa = TRUE, chr = NULL,
-                    cond_common = FALSE, cond_p = 1e-4, cond_max = 10, cond_maf = 0.01,
+                    cond_common = FALSE, cond_p = 1e-4, cond_max = 10, 
+                    cond_maf = 0.01, cond_window = 0,
                     n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
@@ -266,6 +270,7 @@ sparrow <- function(filename, pheno, out_file,
     covariates = C, cov_df = cov_df,
     SPA = spa, binary = binary, binary_raw = binary_raw, binary_pi = binary_pi, coher = coher,
     cond_common = cond_common, cond_p = cond_p, cond_max = as.integer(cond_max), cond_maf = cond_maf,
+    cond_window = cond_window,
     chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
 
   files <- c(regions = out_file,
