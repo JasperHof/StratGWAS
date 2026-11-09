@@ -2525,7 +2525,15 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             Eigen::MatrixXd P0c = P0 - Psi12 * l1.solve(Psi12);
             P0c = (0.5 * (P0c + P0c.transpose())).eval();
             Eigen::LLT<Eigen::MatrixXd> lp(P0c);
-            if (lp.info() != Eigen::Success) return false;
+            if (lp.info() != Eigen::Success) {          // plug-in noise: floor the eigenvalues
+                Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ev(P0c);
+                if (ev.info() != Eigen::Success) return false;
+                const double fl = 1e-3 * std::max(vperp, ev.eigenvalues().maxCoeff() * 1e-3);
+                P0c = ev.eigenvectors() * ev.eigenvalues().cwiseMax(fl).asDiagonal() * ev.eigenvectors().transpose();
+                P0c = (0.5 * (P0c + P0c.transpose())).eval();
+                lp.compute(P0c);
+                if (lp.info() != Eigen::Success) return false;
+            }
             const Eigen::MatrixXd Fi = lp.matrixL().solve(Eigen::MatrixXd::Identity(K, K));   // F^{-1}
             Eigen::MatrixXd Sm = Fi * M * Fi.transpose(); Sm = (0.5 * (Sm + Sm.transpose())).eval();
             Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(Sm);
@@ -2935,15 +2943,19 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 const double ecap = 0.999 * std::sqrt(e1 * e2);
                 if (e12 > ecap) e12 = ecap; if (e12 < -ecap) e12 = -ecap;
                 std::vector<double> d12(C);
-                for (int a2 = 0; a2 < C; ++a2) d12[a2] = (a2 == c) ? 0.0 : s12[a2] * g[a2];   // null: no covariance in c
+                for (int a2 = 0; a2 < C; ++a2) {        // null: no covariance in c
+                    // each component's 2 x 2 genetic covariance must be PSD: |s12| <= sqrt(s1+ s2+)
+                    const double cap = std::sqrt(std::max(sg[t1][a2], 0.0) * std::max(sg[t2][a2], 0.0));
+                    d12[a2] = (a2 == c) ? 0.0 : std::max(-cap, std::min(cap, s12[a2])) * g[a2];
+                }
                 Eigen::MatrixXd Psi12;
                 coher_block(L, W, use_wcache, off, C, K, d12, e12, Psi12);
                 const Eigen::VectorXd w = Psi12 * b;
                 const double hm = w.dot(pcache[t1].solve(a1)) + ec * (e12 / e1) * r1;
                 const double V0 = b.dot(t2p.P0 * b) - w.dot(pcache[t1].solve(w)) + ec * ec * r1 * (e2 - e12 * e12 / e1);
                 const double bm = b.dot(Mc[c] * b);
-                if (!(V0 > 0.0) || !std::isfinite(V0)) { cr.spa_used[c][pi] = -1; continue; }
-                if (K > KREML) {                  // large blocks: fast test first
+                const bool v0ok = (V0 > 0.0) && std::isfinite(V0);
+                if (K > KREML && v0ok) {          // large blocks: fast test first (needs V0 > 0)
                     const double sd0 = std::sqrt(2.0 * t2p.tau0);
                     double V = V0, nu6 = 1e300;
                     if (s2 > 2.0 * sd0) {
@@ -4167,7 +4179,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < 1e-3), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < 1e-3; capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
