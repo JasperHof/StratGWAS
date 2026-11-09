@@ -2862,38 +2862,78 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     // score of the random trait (as for the LOCO PRS), with the current
                     // probabilities as offset. No background signal -> score 0 -> unchanged.
                     if (er.converged && 2.0 * std::min(er.p_up, er.p_lo) < refine_p) {
+                        // Refit of the random trait's null case probabilities (flagged tests only):
+                        //   logit pi = logit pi0 + a + c g_bg + sum_k d_k x_k
+                        // g_bg = local genetic score of the background components (random effects),
+                        // x_k  = up to 10 LEAD background variants (MAF >= 1%, largest |correlation|
+                        //        with the random trait, r^2 < 0.9 with those already chosen) as FIXED
+                        //        effects: a few strong causal common variants are underfitted by g_bg.
                         std::vector<float> cploc;
                         {
                             const int trr = cb.rand_t[pi];
                             const Eigen::VectorXd& gs = get_gbg(c, trr);
-                            if (gs.size() == n && dl != 0.0) {
+                            std::vector<Eigen::VectorXd> cov;                    // centred, unit-variance covariates
+                            std::vector<Eigen::VectorXd> qs;                     // orthonormal basis of cov
+                            {
+                                std::vector< std::pair<double,int> > cand;
+                                for (int a2 = 0; a2 < C; ++a2) {
+                                    if (a2 == c) continue;
+                                    for (int j = off[a2]; j < off[a2 + 1]; ++j) {
+                                        if (j < (int) cd.colmaf.size() && cd.colmaf[j] < 0.01f) continue;
+                                        if (!(cd.cj[j] > 0.0)) continue;
+                                        cand.push_back(std::make_pair(-std::abs(U(j, trr)) / std::sqrt(cd.cj[j]), j));
+                                    }
+                                }
+                                std::sort(cand.begin(), cand.end());
+                                for (size_t q = 0; q < cand.size() && q < 30 && (int) qs.size() < 10; ++q) {
+                                    Eigen::VectorXd x = cd.V.col(cand[q].second).cast<double>(); x.array() -= x.mean();
+                                    const double x2 = x.squaredNorm(); if (!(x2 > 0.0)) continue;
+                                    Eigen::VectorXd r = x;
+                                    for (int it2 = 0; it2 < 2; ++it2)
+                                        for (size_t u = 0; u < qs.size(); ++u) r -= qs[u] * qs[u].dot(r);
+                                    if (r.squaredNorm() < 0.1 * x2) continue;          // r^2 > 0.9 with the chosen
+                                    qs.push_back(r / r.norm()); cov.push_back(x / std::sqrt(x2 / n));
+                                }
+                            }
+                            // the background score is a combination of the background columns: keep only
+                            // the part not explained by the lead variants (else the fit is collinear)
+                            if (gs.size() == n) {
+                                Eigen::VectorXd r = gs; const double g2 = gs.squaredNorm();
+                                for (int it2 = 0; it2 < 2; ++it2)
+                                    for (size_t u = 0; u < qs.size(); ++u) r -= qs[u] * qs[u].dot(r);
+                                if (g2 > 0.0 && r.squaredNorm() >= 0.1 * g2) cov.push_back(r / std::sqrt(r.squaredNorm() / n));
+                            }
+                            if (!cov.empty() && dl != 0.0) {
                                 const std::vector<float>& cp0 = cb.cpi[pi];
-                                std::vector<double> l0(n), bb(n);
+                                const int pq = 1 + (int) cov.size();
+                                Eigen::MatrixXd Dm(n, pq); Dm.col(0).setOnes();
+                                for (int k = 0; k < (int) cov.size(); ++k) Dm.col(k + 1) = cov[k];
+                                Eigen::VectorXd l0(n), bb(n);
                                 for (int i = 0; i < n; ++i) {
                                     const double q = std::min(std::max((double) cp0[i], 1e-8), 1.0 - 1e-8);
                                     l0[i] = std::log(q / (1.0 - q));
                                     bb[i] = std::round((Y(i, trr) - (double) cy[i]) / dl);
                                 }
-                                double a0 = 0.0, c1 = 0.0;
-                                for (int it = 0; it < 25; ++it) {
-                                    double g0 = 0, g1 = 0, h00 = 0, h01 = 0, h11 = 0;
-                                    for (int i = 0; i < n; ++i) {
-                                        const double o = gs[i], e = l0[i] + a0 + c1 * o, pq = 1.0 / (1.0 + std::exp(-e));
-                                        const double wq = pq * (1.0 - pq), r = bb[i] - pq;
-                                        g0 += r; g1 += r * o; h00 += wq; h01 += wq * o; h11 += wq * o * o;
-                                    }
-                                    const double det = h00 * h11 - h01 * h01;
-                                    if (!(det > 0.0)) break;
-                                    const double da = (h11 * g0 - h01 * g1) / det, dc = (h00 * g1 - h01 * g0) / det;
-                                    a0 += da; c1 += dc;
-                                    if (std::abs(da) + std::abs(dc) < 1e-10) break;
+                                Eigen::VectorXd th = Eigen::VectorXd::Zero(pq);
+                                bool okf = true;
+                                for (int it = 0; it < 30; ++it) {
+                                    const Eigen::VectorXd eta = l0 + Dm * th;
+                                    Eigen::VectorXd pv(n), wv2(n);
+                                    for (int i = 0; i < n; ++i) { pv[i] = 1.0 / (1.0 + std::exp(-eta[i])); wv2[i] = pv[i] * (1.0 - pv[i]); }
+                                    const Eigen::VectorXd gr = Dm.transpose() * (bb - pv);
+                                    const Eigen::MatrixXd H = Dm.transpose() * wv2.asDiagonal() * Dm;
+                                    Eigen::LDLT<Eigen::MatrixXd> ld(H);
+                                    if (ld.info() != Eigen::Success) { okf = false; break; }
+                                    const Eigen::VectorXd st = ld.solve(gr);
+                                    if (!st.allFinite()) { okf = false; break; }
+                                    th += st;
+                                    if (st.cwiseAbs().maxCoeff() < 1e-8) break;
                                 }
-                                if (std::isfinite(a0) && std::isfinite(c1)) {
+                                if (okf && th.allFinite()) {
+                                    const Eigen::VectorXd eta = l0 + Dm * th;
                                     cploc.resize(n);
-                                    for (int i = 0; i < n; ++i) {
-                                        const double e = l0[i] + a0 + c1 * gs[i];
-                                        cploc[i] = (float) std::min(std::max(1.0 / (1.0 + std::exp(-e)), 1e-8), 1.0 - 1e-8);
-                                    }
+                                    for (int i = 0; i < n; ++i)
+                                        cploc[i] = (float) std::min(std::max(1.0 / (1.0 + std::exp(-eta[i])), 1e-8), 1.0 - 1e-8);
                                 }
                             }
                         }
@@ -4179,7 +4219,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < 1e-3; capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit + lead variants for p < 1e-3; capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
