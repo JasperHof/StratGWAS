@@ -2457,9 +2457,28 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             e1cache[t] = std::max(sg[t][env], 1e-8 * (Vp[t] > 0 ? Vp[t] : 1.0));
             coher_block(L, W, use_wcache, off, C, K, d1, e1cache[t], psi1m[t]);
             pcache[t].compute(psi1m[t]);
-            if (pcache[t].info() != Eigen::Success) {
-                for (int a2 = 0; a2 < C; ++a2) d1[a2] = std::max(sg[t][a2], 0.0) * g[a2];
-                coher_block(L, W, use_wcache, off, C, K, d1, e1cache[t], psi1m[t]);
+            // the unclamped Psi1 must be well conditioned, not merely positive definite: a negative
+            // estimate of a large component (e.g. a flank) can make it nearly singular, and its
+            // inverse then blows up the conditional mean. The negative estimates are shrunk (by the
+            // largest factor in [0, 1], bisection) until the smallest eigenvalue is >= e1 / 2.
+            auto mineig = [&](const Eigen::MatrixXd& M) {
+                Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ev(M, Eigen::EigenvaluesOnly);
+                return ev.info() == Eigen::Success ? ev.eigenvalues().minCoeff() : -1.0;
+            };
+            bool anyneg = false;
+            for (int a2 = 0; a2 < C; ++a2) if (sg[t][a2] < 0.0) anyneg = true;
+            if (anyneg && !(pcache[t].info() == Eigen::Success && mineig(psi1m[t]) >= 0.5 * e1cache[t])) {
+                auto build = [&](double gm) {
+                    for (int a2 = 0; a2 < C; ++a2) d1[a2] = (sg[t][a2] < 0.0 ? gm : 1.0) * sg[t][a2] * g[a2];
+                    coher_block(L, W, use_wcache, off, C, K, d1, e1cache[t], psi1m[t]);
+                };
+                double lo = 0.0, hi = 1.0;
+                for (int it = 0; it < 12; ++it) {
+                    const double mid = 0.5 * (lo + hi);
+                    build(mid);
+                    if (mineig(psi1m[t]) >= 0.5 * e1cache[t]) lo = mid; else hi = mid;
+                }
+                build(lo);
                 pcache[t].compute(psi1m[t]);
             }
             phave[t] = 1;
@@ -2490,7 +2509,10 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         // least squares, with s estimated by REML (which accounts for the fixed effect, so the
         // estimate is not driven by the h-direction of y2) and a Satterthwaite t for its
         // uncertainty. Omega is diagonalised once per pair (generalised eigenproblem).
-        const int KREML = 512;            // = default max_gene_snps: every gene block uses this test
+        // REML-GLS for every block. (Blocks larger than this used a conditional-normal test with
+        // plug-in nuisance parameters; with gene flanks blocks can exceed 512 columns, and that
+        // test is not calibrated, so it is no longer used.)
+        const int KREML = 1 << 30;
         auto coher_reml_test = [&](int c, int t1, int t2, const Eigen::VectorXd& b, const Eigen::VectorXd& a1,
                                    double r1, double e1, double e2, double e12, const Eigen::VectorXd& w,
                                    const Eigen::MatrixXd& Psi12, const Eigen::MatrixXd& P0, const Eigen::MatrixXd& M,
@@ -2676,6 +2698,39 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             }
             return it->second;
         };
+        // LOCAL GENETIC SCORE of trait t from the BACKGROUND components of the block (every
+        // component other than the tested one c: e.g. the common variants of the gene and the
+        // flank): the best linear predictor  g_bg = V D_bg V' Sigma_t^{-1} y_t,  with
+        // Sigma_t = V D V' + e_t I and D the (clamped) variance components of trait t. In
+        // K-space, with G = V'V:  V' Sigma^{-1} y = (u - G w) / e_t,  (e_t I + D G) w = D u.
+        // Centred; empty if the block has no background component with a positive estimate.
+        std::vector< std::map<int, Eigen::VectorXd> > gbgcache(A);
+        Eigen::MatrixXd Gk; bool haveGk = false;
+        auto get_gbg = [&](int c, int t) -> const Eigen::VectorXd& {
+            std::map<int, Eigen::VectorXd>::iterator it = gbgcache[c].find(t);
+            if (it != gbgcache[c].end()) return it->second;
+            Eigen::VectorXd out;
+            Eigen::VectorXd dv = Eigen::VectorXd::Zero(K), db = Eigen::VectorXd::Zero(K);
+            bool anybg = false;
+            for (int a2 = 0; a2 < C; ++a2) {
+                const double sv = std::max(sg[t][a2], 0.0) * g[a2];
+                for (int j = off[a2]; j < off[a2 + 1]; ++j) { dv[j] = sv; if (a2 != c) db[j] = sv; }
+                if (a2 != c && sv > 0.0 && off[a2 + 1] > off[a2]) anybg = true;
+            }
+            const double e = sg[t][env];
+            if (anybg && e > 0.0 && have_L) {
+                if (!haveGk) { Gk = L * L.transpose(); haveGk = true; }
+                const Eigen::VectorXd u = U.col(t);
+                Eigen::MatrixXd M = dv.asDiagonal() * Gk;
+                M.diagonal().array() += e;
+                const Eigen::VectorXd w = M.partialPivLu().solve(dv.cwiseProduct(u));
+                const Eigen::VectorXd beta = db.cwiseProduct((u - Gk * w) / e);
+                out = (cd.V * beta.cast<float>()).cast<double>();
+                out.array() -= out.mean();
+                if (!out.allFinite() || !(out.squaredNorm() > 0.0)) out.resize(0);
+            }
+            return gbgcache[c].insert(std::make_pair(t, out)).first->second;
+        };
         for (int pi = 0; pi < (int) pairs.size(); ++pi) {
             const int t1 = pairs[pi].first, t2 = pairs[pi].second;
             Eigen::VectorXd q(C + 1);
@@ -2711,7 +2766,48 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     const Eigen::VectorXd& wv = get_h(c, tc);
                     const double dl = cb.cdelta[pi];
                     const std::vector<float>& cy = cb.cylo[pi];
-                    const std::vector<float>& cp = cb.cpi[pi];
+                    // Genetic effects of the BACKGROUND (other components of the gene, flank) on
+                    // the random trait: its carriers of causal common alleles are more often cases,
+                    // so case status is not exchangeable given the fixed trait alone. The null case
+                    // probabilities are refitted by a logistic regression of b on the local genetic
+                    // score of the random trait (as for the LOCO PRS), with the current
+                    // probabilities as offset. No background signal -> score 0 -> unchanged.
+                    std::vector<float> cploc;
+                    {
+                        const int trr = cb.rand_t[pi];
+                        const Eigen::VectorXd& gs = get_gbg(c, trr);
+                        if (gs.size() == n && dl != 0.0) {
+                            const std::vector<float>& cp0 = cb.cpi[pi];
+                            std::vector<double> l0(n), bb(n);
+                            for (int i = 0; i < n; ++i) {
+                                const double q = std::min(std::max((double) cp0[i], 1e-8), 1.0 - 1e-8);
+                                l0[i] = std::log(q / (1.0 - q));
+                                bb[i] = std::round((Y(i, trr) - (double) cy[i]) / dl);
+                            }
+                            double a0 = 0.0, c1 = 0.0;
+                            for (int it = 0; it < 25; ++it) {
+                                double g0 = 0, g1 = 0, h00 = 0, h01 = 0, h11 = 0;
+                                for (int i = 0; i < n; ++i) {
+                                    const double o = gs[i], e = l0[i] + a0 + c1 * o, pq = 1.0 / (1.0 + std::exp(-e));
+                                    const double wq = pq * (1.0 - pq), r = bb[i] - pq;
+                                    g0 += r; g1 += r * o; h00 += wq; h01 += wq * o; h11 += wq * o * o;
+                                }
+                                const double det = h00 * h11 - h01 * h01;
+                                if (!(det > 0.0)) break;
+                                const double da = (h11 * g0 - h01 * g1) / det, dc = (h00 * g1 - h01 * g0) / det;
+                                a0 += da; c1 += dc;
+                                if (std::abs(da) + std::abs(dc) < 1e-10) break;
+                            }
+                            if (std::isfinite(a0) && std::isfinite(c1)) {
+                                cploc.resize(n);
+                                for (int i = 0; i < n; ++i) {
+                                    const double e = l0[i] + a0 + c1 * gs[i];
+                                    cploc[i] = (float) std::min(std::max(1.0 / (1.0 + std::exp(-e)), 1e-8), 1.0 - 1e-8);
+                                }
+                            }
+                        }
+                    }
+                    const std::vector<float>& cp = cploc.empty() ? cb.cpi[pi] : cploc;
                     double c0 = 0.0, sd2 = 0.0;
                     for (int i = 0; i < n; ++i) {
                         c0 += wv[i] * cy[i];
@@ -4069,7 +4165,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; REML-GLS for all block sizes), binary coher: P(case) refitted on the local background score, binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
