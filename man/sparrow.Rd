@@ -31,6 +31,7 @@ sparrow(
   chr = NULL,
   gene_flank = 0,
   flank_maf = 0.01,
+  refine_p = 0.05,
   n_threads = 0,
   batch_size = 64
 )
@@ -95,6 +96,10 @@ component -- estimated, not tested. Absorbs signal of nearby common variants tha
 variants of the gene tag through LD. 0 = no flanks (default).}
 
 \item{flank_maf}{Only flanking variants with MAF >= flank_maf are used (default 0.01).}
+
+\item{refine_p}{Co-heritability: tests with p below this are recomputed with the refined
+(slower) null -- REML-GLS for blocks with > 512 columns, and for binary traits case
+probabilities refitted on the lead background variants. 1 = always (slowest).}
 
 \item{n_threads}{Number of threads (0 = RcppParallel default).}
 

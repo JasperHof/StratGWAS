@@ -41,6 +41,9 @@
 #'   component -- estimated, not tested. Absorbs signal of nearby common variants that rare
 #'   variants of the gene tag through LD. 0 = no flanks (default).
 #' @param flank_maf Only flanking variants with MAF >= flank_maf are used (default 0.01).
+#' @param refine_p Co-heritability: tests with p below this are recomputed with the refined
+#'   (slower) null -- REML-GLS for blocks with > 512 columns, and for binary traits case
+#'   probabilities refitted on the lead background variants. 1 = always (slowest).
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -79,7 +82,7 @@ sparrow <- function(filename, pheno, out_file,
                     max_window_chunks = 8,
                     max_gene_snps = 512, min_gene_snps = 2,
                     acatv_mac = 10, collapse_mac = 0, spa = TRUE, chr = NULL,
-                    gene_flank = 0, flank_maf = 0.01,
+                    gene_flank = 0, flank_maf = 0.01, refine_p = 0.05,
                     n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
@@ -258,7 +261,7 @@ sparrow <- function(filename, pheno, out_file,
     h2_without_prs = h2_without_prs,
     covariates = C, cov_df = cov_df,
     SPA = spa, binary = binary, binary_raw = binary_raw, binary_pi = binary_pi, coher = coher,
-    gene_flank = gene_flank, flank_maf = flank_maf,
+    gene_flank = gene_flank, flank_maf = flank_maf, refine_p = refine_p,
     chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
 
   files <- c(regions = out_file,

@@ -2318,6 +2318,10 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
 }
 
 
+// co-heritability: tests with p below this get the refined (slower) computation; set once in
+// stratgwas_run before any worker starts, read-only afterwards
+static double g_refine_p = 0.05;
+
 static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                              const Eigen::MatrixXd& Y, const GenoMat& Yf,
                              const std::vector<double>& Vp, const std::vector<double>& yty,
@@ -2507,7 +2511,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         // every p < refine_p is recomputed with the REML-GLS test. Likewise, binary tests are
         // recomputed with the background-refitted case probabilities only when p < refine_p.
         const int KREML = 512;
-        const double refine_p = 1e-3;
+        const double refine_p = g_refine_p;
         auto coher_reml_test = [&](int c, int t1, int t2, const Eigen::VectorXd& b, const Eigen::VectorXd& a1,
                                    double r1, double e1, double e2, double e12, const Eigen::VectorXd& w,
                                    const Eigen::MatrixXd& Psi12, const Eigen::MatrixXd& P0, const Eigen::MatrixXd& M,
@@ -4210,6 +4214,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          bool coher = false,
                          double gene_flank = 0,
                          double flank_maf = 0.01,
+                         double refine_p = 0.05,
                          SEXP chr = R_NilValue,
                          std::string out_file = "",
                          int batch_size = 64,
@@ -4219,7 +4224,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit + lead variants for p < 1e-3; capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit + lead variants for p < refine_p; capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
@@ -4299,6 +4304,10 @@ Rcpp::List stratgwas_run(const std::string& filename,
     Rcout << "Environment moment: T(env,env) = n - " << pr.cov_df << "\n";
     pr.out_file = out_file; pr.batch_size = batch_size; pr.n_threads = n_threads;
     pr.gene_flank = (long) std::max(0.0, gene_flank); pr.gene_flank_maf = std::max(0.0, flank_maf);
+    if (!(refine_p >= 0.0 && refine_p <= 1.0)) stop("refine_p must be in [0, 1]");
+    g_refine_p = refine_p;
+    if (coher) Rcout << "Co-heritability: tests with p < " << refine_p << " are recomputed with the refined null "
+                     << "(REML-GLS for large blocks; binary: case probabilities refitted on lead background variants).\n";
     if (pr.gene_flank > 0)
         Rcout << "Gene flanks: all variants with MAF >= " << pr.gene_flank_maf << " within " << pr.gene_flank
               << " bp of each gene form a background component (estimated, not tested).\n";
