@@ -2431,8 +2431,10 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
     const double refine_p = g_refine_p;
     const double lead_chi2 = 15.137;
     // js: chosen columns; qs: orthonormal basis of their centred values; cov: centred, unit variance
+    // thresh = false: no p-value threshold (top 10 by association), used for the covariates of the
+    // binary refit, whose decision to refit is made separately (see refit_covs)
     auto select_leads = [&](int c, int t, std::vector<int>& js, std::vector<Eigen::VectorXd>& qs,
-                            std::vector<Eigen::VectorXd>& cov) {
+                            std::vector<Eigen::VectorXd>& cov, bool thresh) {
         js.clear(); qs.clear(); cov.clear();
         std::vector< std::pair<double,int> > cand;
         for (int a2 = 0; a2 < C; ++a2) {
@@ -2441,7 +2443,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 if (j < (int) cd.colmaf.size() && cd.colmaf[j] < 0.01f) continue;
                 if (!(cd.cj[j] > 0.0)) continue;
                 const double z2 = U(j, t) * U(j, t) / (cd.cj[j] * std::max(yty[t], 1e-300) / n);
-                if (!(z2 >= lead_chi2)) continue;
+                if (thresh && !(z2 >= lead_chi2)) continue;
                 cand.push_back(std::make_pair(-std::abs(U(j, t)) / std::sqrt(cd.cj[j]), j));
             }
         }
@@ -2460,9 +2462,9 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
     // lead variants of two traits (trait tb first), at most 20 distinct columns
     auto lead_union = [&](int c, int ta, int tb) -> std::vector<int> {
         std::vector<int> js, j2; std::vector<Eigen::VectorXd> qs, cv;
-        select_leads(c, tb, js, qs, cv);
+        select_leads(c, tb, js, qs, cv, true);
         if (ta >= 0 && ta != tb) {
-            select_leads(c, ta, j2, qs, cv);
+            select_leads(c, ta, j2, qs, cv, true);
             for (size_t k = 0; k < j2.size(); ++k)
                 if (std::find(js.begin(), js.end(), j2[k]) == js.end()) js.push_back(j2[k]);
         }
@@ -2573,11 +2575,14 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         }
         return out;
     };
-    // covariates of the binary refit: the lead variants and the part of the background score
-    // that they do not explain (else the fit is collinear)
+    // covariates of the binary refit: the 10 background variants most associated with trait t
+    // (NO p-value threshold: moderately associated causal variants matter too, and a fixed
+    // effect for a null variant costs little in the logistic refit) and the part of the
+    // background score that they do not explain (else the fit is collinear). The threshold only
+    // decides whether the refit is ALWAYS done (lead with p < 1e-4) or only for p < refine_p.
     auto refit_covs = [&](int c, int t, const Eigen::VectorXd& gs) -> std::vector<Eigen::VectorXd> {
         std::vector<int> js; std::vector<Eigen::VectorXd> qs, cov;
-        select_leads(c, t, js, qs, cov);
+        select_leads(c, t, js, qs, cov, false);
         if (gs.size() == n) {
             Eigen::VectorXd r = gs; const double g2 = gs.squaredNorm();
             for (int it2 = 0; it2 < 2; ++it2)
@@ -3072,7 +3077,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     bool haslead = false;
                     {
                         std::vector<int> jl; std::vector<Eigen::VectorXd> q1, c1;
-                        select_leads(c, cb.rand_t[pi], jl, q1, c1); haslead = !jl.empty();
+                        select_leads(c, cb.rand_t[pi], jl, q1, c1, true); haslead = !jl.empty();
                     }
                     if (er.converged && (haslead || 2.0 * std::min(er.p_up, er.p_lo) < refine_p)) {
                         // Refit of the random trait's null case probabilities (flagged tests only):
@@ -3526,7 +3531,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     bool haslead = false;
                     if (g_cond_lead) {
                         std::vector<int> jl; std::vector<Eigen::VectorXd> q1, c1;
-                        select_leads(c, t, jl, q1, c1); haslead = !jl.empty();
+                        select_leads(c, t, jl, q1, c1, true); haslead = !jl.empty();
                     }
                     if (g_cond_lead && tl_refine_depth == 0 && (haslead || pe < refine_p) && bx.delta[t] != 0.0) {
                         const std::vector<unsigned char>& bb = *bx.b[t];
@@ -4443,7 +4448,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < refine_p; conditional on lead variants (p<1e-4) whenever present [quant: projected + re-estimated, spa_used 8; binary refit]; univariate conditional=TRUE (spa_used 8/9); capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < refine_p; conditional on lead variants (p<1e-4) whenever present [quant: projected + re-estimated, spa_used 8; binary refit on top-10 background variants, no threshold]; univariate conditional=TRUE (spa_used 8/9); capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
