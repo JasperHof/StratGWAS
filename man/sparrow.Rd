@@ -32,6 +32,7 @@ sparrow(
   gene_flank = 0,
   flank_maf = 0.01,
   refine_p = 0.05,
+  conditional = FALSE,
   n_threads = 0,
   batch_size = 64
 )
@@ -97,9 +98,20 @@ variants of the gene tag through LD. 0 = no flanks (default).}
 
 \item{flank_maf}{Only flanking variants with MAF >= flank_maf are used (default 0.01).}
 
-\item{refine_p}{Co-heritability: tests with p below this are recomputed with the refined
-(slower) null -- REML-GLS for blocks with > 512 columns, and for binary traits case
-probabilities refitted on the lead background variants. 1 = always (slowest).}
+\item{refine_p}{Tests with p below this are recomputed with the refined (slower) null --
+co-heritability: REML-GLS for blocks with > 512 columns, and for binary traits case
+probabilities refitted on the background genetic score; univariate binary traits with
+\code{conditional = TRUE}: the same refit. 1 = always (slowest).
+Independently of refine_p, co-heritability tests are always computed conditional on the
+LEAD background variants (MAF >= 1\%, marginal p < 1e-4, at most 10 per trait; from the
+other categories of the gene and the flank) when there are any.}
+
+\item{conditional}{Univariate only (SPARROW-cond): compute every test conditional on the
+lead background variants (as above) when there are any. Quantitative traits: the lead
+variants are projected out of genotypes and phenotype and all components re-estimated;
+binary traits: the null case probabilities are refitted on the lead variants and the
+background score. Tests rare-variant signal beyond the nearby strong common associations;
+best combined with \code{gene_flank} and without \code{kvik_summaries} (ACAT-V is not conditional).}
 
 \item{n_threads}{Number of threads (0 = RcppParallel default).}
 

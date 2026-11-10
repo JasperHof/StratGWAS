@@ -41,9 +41,19 @@
 #'   component -- estimated, not tested. Absorbs signal of nearby common variants that rare
 #'   variants of the gene tag through LD. 0 = no flanks (default).
 #' @param flank_maf Only flanking variants with MAF >= flank_maf are used (default 0.01).
-#' @param refine_p Co-heritability: tests with p below this are recomputed with the refined
-#'   (slower) null -- REML-GLS for blocks with > 512 columns, and for binary traits case
-#'   probabilities refitted on the lead background variants. 1 = always (slowest).
+#' @param refine_p Tests with p below this are recomputed with the refined (slower) null --
+#'   co-heritability: REML-GLS for blocks with > 512 columns, and for binary traits case
+#'   probabilities refitted on the background genetic score; univariate binary traits with
+#'   `conditional = TRUE`: the same refit. 1 = always (slowest).
+#'   Independently of refine_p, co-heritability tests are always computed conditional on the
+#'   LEAD background variants (MAF >= 1%, marginal p < 1e-4, at most 10 per trait; from the
+#'   other categories of the gene and the flank) when there are any.
+#' @param conditional Univariate only (SPARROW-cond): compute every test conditional on the
+#'   lead background variants (as above) when there are any. Quantitative traits: the lead
+#'   variants are projected out of genotypes and phenotype and all components re-estimated;
+#'   binary traits: the null case probabilities are refitted on the lead variants and the
+#'   background score. Tests rare-variant signal beyond the nearby strong common associations;
+#'   best combined with `gene_flank` and without `kvik_summaries` (ACAT-V is not conditional).
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -82,7 +92,7 @@ sparrow <- function(filename, pheno, out_file,
                     max_window_chunks = 8,
                     max_gene_snps = 512, min_gene_snps = 2,
                     acatv_mac = 10, collapse_mac = 0, spa = TRUE, chr = NULL,
-                    gene_flank = 0, flank_maf = 0.01, refine_p = 0.05,
+                    gene_flank = 0, flank_maf = 0.01, refine_p = 0.05, conditional = FALSE,
                     n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
@@ -244,6 +254,11 @@ sparrow <- function(filename, pheno, out_file,
     if (length(miss)) stop("kvik_summaries file(s) not found: ", paste(miss, collapse = ", "))
   }
   if (gene_flank > 0 && is.null(genes)) warning("gene_flank only applies to genes; no genes given")
+  if (conditional && coher) message("conditional = TRUE is for univariate tests; co-heritability tests ",
+                                    "are always conditional on lead variants when there are any")
+  if (conditional && !coher && !is.null(kvik_summaries))
+    warning("conditional = TRUE: the ACAT-V part (kvik_summaries) uses marginal single-variant ",
+            "statistics and is NOT conditional; leave kvik_summaries out for SPARROW-cond")
 
   message(sprintf("SPARROW: %d individuals, %d phenotype(s), %d covariate df, alpha = %s",
                   n, P, cov_df, paste(alpha, collapse = ", ")))
@@ -262,6 +277,7 @@ sparrow <- function(filename, pheno, out_file,
     covariates = C, cov_df = cov_df,
     SPA = spa, binary = binary, binary_raw = binary_raw, binary_pi = binary_pi, coher = coher,
     gene_flank = gene_flank, flank_maf = flank_maf, refine_p = refine_p,
+    conditional = conditional,
     chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
 
   files <- c(regions = out_file,

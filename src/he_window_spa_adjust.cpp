@@ -2223,6 +2223,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
 struct ChunkGeom {
     bool ok;
     int K, A, C, env;
+    int cov_df;                      // covariate degrees of freedom (T(env, env) = n - cov_df)
     bool has_f;
     std::vector<int> off;            // component column offsets in V
     std::vector<double> g;           // trace normalisers n / tr(S_a)
@@ -2232,7 +2233,8 @@ struct ChunkGeom {
     bool have_L, use_wcache;
     Eigen::MatrixXd L;
     std::vector<Eigen::MatrixXd> W;
-    ChunkGeom() : ok(false), K(0), A(0), C(0), env(0), has_f(false),
+    Eigen::MatrixXd G;               // the Gram V'V (SPA, K <= 3000): reused by the conditional tests
+    ChunkGeom() : ok(false), K(0), A(0), C(0), env(0), cov_df(0), has_f(false),
                   have_L(false), use_wcache(false) {}
 };
 
@@ -2252,7 +2254,7 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
     // Components: the A tested categories, then the flank ONLY if present. With no
     // flank (pass 1) the model is { cat_0, ..., cat_{A-1}, sigma_e I }.
     const int C = A + (has_f ? 1 : 0), env = C;
-    gm.K = K; gm.A = A; gm.C = C; gm.env = env; gm.has_f = has_f;
+    gm.K = K; gm.A = A; gm.C = C; gm.env = env; gm.has_f = has_f; gm.cov_df = cov_df;
 
     gm.off.assign(C + 1, 0);
     for (int c = 0; c < A; ++c) gm.off[c + 1] = gm.off[c] + cd.cat_m[c];
@@ -2267,6 +2269,7 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
         G = GenoMat(Gf.selfadjointView<Eigen::Upper>()).cast<double>();
     }
     if (Gout != 0) *Gout = G;
+    if (spa && K <= 3000) gm.G = G;
 
     {
         Eigen::MatrixXd G2 = G.array().square();
@@ -2321,6 +2324,10 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
 // co-heritability: tests with p below this get the refined (slower) computation; set once in
 // stratgwas_run before any worker starts, read-only afterwards
 static double g_refine_p = 0.05;
+// univariate tests: recompute flagged tests (p < refine_p) conditional on lead variants
+static bool g_cond_lead = false;
+// the conditional recomputation calls test_chunk_annot on the projected data: one level only
+static thread_local int tl_refine_depth = 0;
 
 static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                              const Eigen::MatrixXd& Y, const GenoMat& Yf,
@@ -2411,6 +2418,208 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         Upi = (cd.V.transpose() * bx.PiF).cast<double>();
         for (int a = 0; a < C; ++a) for (int j = off[a]; j < off[a + 1]; ++j) comp_of[j] = a;
     }
+
+    // ---- LEAD VARIANTS: shared by the refinements of flagged tests (p < refine_p) ----------
+    // A few strong causal common variants are underfitted by the background variance
+    // components (which spread a component's heritability evenly over its variants); rare
+    // variants that tag them then carry their signal. Flagged tests are therefore recomputed
+    // with up to 10 LEAD background variants as fixed effects: columns of the components other
+    // than the tested one c (other categories of the gene, flank), MAF >= 1%, marginal
+    // association p < 1e-4 with trait t (chi2 >= 15.14), largest |correlation| first, r^2 < 0.9
+    // with those already chosen (out of the top 30). The p-value threshold keeps the
+    // refinement from removing chance associations under the null (which deflates the tests).
+    const double refine_p = g_refine_p;
+    const double lead_chi2 = 15.137;
+    // js: chosen columns; qs: orthonormal basis of their centred values; cov: centred, unit variance
+    auto select_leads = [&](int c, int t, std::vector<int>& js, std::vector<Eigen::VectorXd>& qs,
+                            std::vector<Eigen::VectorXd>& cov) {
+        js.clear(); qs.clear(); cov.clear();
+        std::vector< std::pair<double,int> > cand;
+        for (int a2 = 0; a2 < C; ++a2) {
+            if (a2 == c) continue;
+            for (int j = off[a2]; j < off[a2 + 1]; ++j) {
+                if (j < (int) cd.colmaf.size() && cd.colmaf[j] < 0.01f) continue;
+                if (!(cd.cj[j] > 0.0)) continue;
+                const double z2 = U(j, t) * U(j, t) / (cd.cj[j] * std::max(yty[t], 1e-300) / n);
+                if (!(z2 >= lead_chi2)) continue;
+                cand.push_back(std::make_pair(-std::abs(U(j, t)) / std::sqrt(cd.cj[j]), j));
+            }
+        }
+        std::sort(cand.begin(), cand.end());
+        for (size_t q = 0; q < cand.size() && q < 30 && (int) qs.size() < 10; ++q) {
+            Eigen::VectorXd x = cd.V.col(cand[q].second).cast<double>(); x.array() -= x.mean();
+            const double x2 = x.squaredNorm(); if (!(x2 > 0.0)) continue;
+            Eigen::VectorXd r = x;
+            for (int it2 = 0; it2 < 2; ++it2)
+                for (size_t u = 0; u < qs.size(); ++u) r -= qs[u] * qs[u].dot(r);
+            if (r.squaredNorm() < 0.1 * x2) continue;          // r^2 > 0.9 with the chosen
+            js.push_back(cand[q].second);
+            qs.push_back(r / r.norm()); cov.push_back(x / std::sqrt(x2 / n));
+        }
+    };
+    // lead variants of two traits (trait tb first), at most 20 distinct columns
+    auto lead_union = [&](int c, int ta, int tb) -> std::vector<int> {
+        std::vector<int> js, j2; std::vector<Eigen::VectorXd> qs, cv;
+        select_leads(c, tb, js, qs, cv);
+        if (ta >= 0 && ta != tb) {
+            select_leads(c, ta, j2, qs, cv);
+            for (size_t k = 0; k < j2.size(); ++k)
+                if (std::find(js.begin(), js.end(), j2[k]) == js.end()) js.push_back(j2[k]);
+        }
+        return js;
+    };
+    // CONDITIONAL TEST ON LEAD VARIANTS (quantitative traits, flagged tests). The lead columns js
+    // are projected out of the genotypes and the phenotypes -- equivalent to adding them to the
+    // model as fixed effects -- every variance component (and, for co-heritability, every
+    // cross-covariance) is re-estimated on the projected data, and component c is tested again
+    // by the same machinery (one level deep: no further refinement inside). Phenotype ta alone
+    // (univariate) or the pair (ta, tb) (co-heritability). Returns (p, spa_used of the inner test);
+    // p = NA if the conditional test is not possible.
+    auto lead_test = [&](int c, const std::vector<int>& js, int ta, int tb, bool coh) -> std::pair<double, int> {
+        const std::pair<double, int> fail((double) NA_REAL, 0);
+        if (tl_refine_depth > 0 || js.empty()) return fail;
+        const int nl0 = (int) js.size();
+        Eigen::MatrixXd XL(n, nl0);
+        for (int k = 0; k < nl0; ++k) XL.col(k) = cd.V.col(js[k]).cast<double>();
+        Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr(XL);
+        qr.setThreshold(1e-6);
+        const int nl = (int) qr.rank();
+        if (nl <= 0) return fail;
+        const Eigen::MatrixXd QL = qr.householderQ() * Eigen::MatrixXd::Identity(n, nl);
+        // the projected block: lead columns removed, the others residualised on them
+        std::vector<char> drop(K, 0);
+        for (int k = 0; k < nl0; ++k) drop[js[k]] = 1;
+        ChunkDataA cdp; cdp.chr = cd.chr; cdp.start = cd.start; cdp.end = cd.end;
+        std::vector<int> keep; int cnew = -1;
+        for (int a2 = 0; a2 < A; ++a2) {
+            int m2 = 0;
+            for (int j = off[a2]; j < off[a2 + 1]; ++j) if (!drop[j]) { keep.push_back(j); ++m2; }
+            if (m2 == 0) { if (a2 == c) return fail; continue; }
+            if (a2 == c) cnew = (int) cdp.cat_m.size();
+            cdp.cat_m.push_back(m2); cdp.cat_id.push_back(cd.cat_id[a2]);
+            cdp.cat_name.push_back(cd.cat_name[a2]); cdp.cat_w.push_back(cd.cat_w[a2]);
+        }
+        int mf = 0;
+        for (int a2 = A; a2 < C; ++a2)
+            for (int j = off[a2]; j < off[a2 + 1]; ++j) if (!drop[j]) { keep.push_back(j); ++mf; }
+        if (cnew < 0) return fail;
+        cdp.m_flank = mf; cdp.K = (int) keep.size();
+        const int Kp = cdp.K;
+        // projected genotypes, and their Gram from the stored one: G_kk - (V_k'Q)(Q'V_k)
+        Eigen::MatrixXd Vk(n, Kp);
+        for (int q = 0; q < Kp; ++q) Vk.col(q) = cd.V.col(keep[q]).cast<double>();
+        const Eigen::MatrixXd VQ = Vk.transpose() * QL;              // K' x nl
+        Vk -= QL * VQ.transpose();
+        cdp.V = Vk.cast<float>();
+        Eigen::MatrixXd Gp;
+        const bool haveG = (gm.G.rows() == K);
+        if (haveG) {
+            Gp.resize(Kp, Kp);
+            for (int q = 0; q < Kp; ++q) for (int r = 0; r < Kp; ++r) Gp(r, q) = gm.G(keep[r], keep[q]);
+            Gp.noalias() -= VQ * VQ.transpose();
+        }
+        cdp.cj.resize(Kp); cdp.colmaf.resize(Kp); cdp.colbim.resize(Kp);
+        for (int q = 0; q < Kp; ++q) {
+            cdp.cj[q] = haveG ? Gp(q, q) : Vk.col(q).squaredNorm();
+            cdp.colmaf[q] = keep[q] < (int) cd.colmaf.size() ? cd.colmaf[keep[q]] : 0.f;
+            cdp.colbim[q] = keep[q] < (int) cd.colbim.size() ? cd.colbim[keep[q]] : -1;
+        }
+        ChunkGeom gmp;
+        build_geom(cdp, gm.cov_df + nl, true, false, gmp, haveG ? &Gp : 0);
+        if (!gmp.ok || !gmp.have_L) return fail;
+        // the projected phenotype(s)
+        const int Pp = coh ? 2 : 1;
+        Eigen::MatrixXd Yp(n, Pp);
+        Yp.col(0) = Y.col(ta); if (coh) Yp.col(1) = Y.col(tb);
+        Yp -= QL * (QL.transpose() * Yp);
+        const GenoMat Yfp = Yp.cast<float>();
+        std::vector<double> Vpp(Pp), ytyp(Pp), ycp;
+        Vpp[0] = Vp[ta]; ytyp[0] = Yp.col(0).squaredNorm();
+        std::vector< std::pair<int,int> > pp;
+        if (coh) { Vpp[1] = Vp[tb]; ytyp[1] = Yp.col(1).squaredNorm(); pp.push_back(std::make_pair(0, 1)); ycp.push_back(Yp.col(0).dot(Yp.col(1))); }
+        ChunkResultA crp;
+        ++tl_refine_depth;
+        test_chunk_annot(cdp, gmp, Yp, Yfp, Vpp, ytyp, false, true, coh, pp, ycp, CoherBin(), BinExact(), one_sided, crp);
+        --tl_refine_depth;
+        if (cnew >= (int) crp.p_spa.size() || crp.p_spa[cnew].empty()) return fail;
+        return std::make_pair(crp.p_spa[cnew][0], crp.spa_used[cnew][0]);
+    };
+    // LOCAL GENETIC SCORE of a trait from the BACKGROUND components of the block (every
+    // component other than the tested one c: e.g. the common variants of the gene and the
+    // flank): the best linear predictor  g_bg = V D_bg V' Sigma^{-1} y,  with
+    // Sigma = V D V' + e I and D the (clamped) variance components (sgt, env last). In
+    // K-space, with G = V'V:  V' Sigma^{-1} y = (u - G w) / e,  (e I + D G) w = D u.
+    // Centred; empty if the block has no background component with a positive estimate.
+    Eigen::MatrixXd Gk; bool haveGk = false;
+    auto bg_score = [&](int c, const Eigen::VectorXd& sgt, const Eigen::VectorXd& u) -> Eigen::VectorXd {
+        Eigen::VectorXd out;
+        Eigen::VectorXd dv = Eigen::VectorXd::Zero(K), db = Eigen::VectorXd::Zero(K);
+        bool anybg = false;
+        for (int a2 = 0; a2 < C; ++a2) {
+            const double sv = std::max(sgt[a2], 0.0) * g[a2];
+            for (int j = off[a2]; j < off[a2 + 1]; ++j) { dv[j] = sv; if (a2 != c) db[j] = sv; }
+            if (a2 != c && sv > 0.0 && off[a2 + 1] > off[a2]) anybg = true;
+        }
+        const double e = sgt[env];
+        if (anybg && e > 0.0 && have_L) {
+            if (!haveGk) { Gk = L * L.transpose(); haveGk = true; }
+            Eigen::MatrixXd M = dv.asDiagonal() * Gk;
+            M.diagonal().array() += e;
+            const Eigen::VectorXd w = M.partialPivLu().solve(dv.cwiseProduct(u));
+            const Eigen::VectorXd beta = db.cwiseProduct((u - Gk * w) / e);
+            out = (cd.V * beta.cast<float>()).cast<double>();
+            out.array() -= out.mean();
+            if (!out.allFinite() || !(out.squaredNorm() > 0.0)) out.resize(0);
+        }
+        return out;
+    };
+    // covariates of the binary refit: the lead variants and the part of the background score
+    // that they do not explain (else the fit is collinear)
+    auto refit_covs = [&](int c, int t, const Eigen::VectorXd& gs) -> std::vector<Eigen::VectorXd> {
+        std::vector<int> js; std::vector<Eigen::VectorXd> qs, cov;
+        select_leads(c, t, js, qs, cov);
+        if (gs.size() == n) {
+            Eigen::VectorXd r = gs; const double g2 = gs.squaredNorm();
+            for (int it2 = 0; it2 < 2; ++it2)
+                for (size_t u = 0; u < qs.size(); ++u) r -= qs[u] * qs[u].dot(r);
+            if (g2 > 0.0 && r.squaredNorm() >= 0.1 * g2) cov.push_back(r / std::sqrt(r.squaredNorm() / n));
+        }
+        return cov;
+    };
+    // logistic refit of null case probabilities:  logit pi = logit p0 + a + sum_k d_k cov_k
+    auto logit_refit = [&](const float* p0, const Eigen::VectorXd& bb, const std::vector<Eigen::VectorXd>& cov,
+                           std::vector<float>& out) -> bool {
+        out.clear();
+        if (cov.empty()) return false;
+        const int pq = 1 + (int) cov.size();
+        Eigen::MatrixXd Dm(n, pq); Dm.col(0).setOnes();
+        for (int k = 0; k < (int) cov.size(); ++k) Dm.col(k + 1) = cov[k];
+        Eigen::VectorXd l0(n);
+        for (int i = 0; i < n; ++i) {
+            const double q = std::min(std::max((double) p0[i], 1e-8), 1.0 - 1e-8);
+            l0[i] = std::log(q / (1.0 - q));
+        }
+        Eigen::VectorXd th = Eigen::VectorXd::Zero(pq);
+        for (int it = 0; it < 30; ++it) {
+            const Eigen::VectorXd eta = l0 + Dm * th;
+            Eigen::VectorXd pv(n), wv2(n);
+            for (int i = 0; i < n; ++i) { pv[i] = 1.0 / (1.0 + std::exp(-eta[i])); wv2[i] = pv[i] * (1.0 - pv[i]); }
+            const Eigen::VectorXd gr = Dm.transpose() * (bb - pv);
+            const Eigen::MatrixXd H = Dm.transpose() * wv2.asDiagonal() * Dm;
+            Eigen::LDLT<Eigen::MatrixXd> ld(H);
+            if (ld.info() != Eigen::Success) return false;
+            const Eigen::VectorXd st = ld.solve(gr);
+            if (!st.allFinite()) return false;
+            th += st;
+            if (st.cwiseAbs().maxCoeff() < 1e-8) break;
+        }
+        if (!th.allFinite()) return false;
+        const Eigen::VectorXd eta = l0 + Dm * th;
+        out.resize(n);
+        for (int i = 0; i < n; ++i)
+            out[i] = (float) std::min(std::max(1.0 / (1.0 + std::exp(-eta[i])), 1e-8), 1.0 - 1e-8);
+        return true;
+    };
 
     // ---- CO-HERITABILITY BRANCH (annotation path) --------------------------
     // Same construction as the plain path, but every one of the A tested
@@ -2508,10 +2717,10 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         // TWO-STAGE p-values (speed). Blocks with more than KREML columns (large genes, or genes
         // with a flank) first get the fast conditional-normal test with plug-in nuisance
         // parameters; it is not reliable in the tail (it can return spuriously small p-values), so
-        // every p < refine_p is recomputed with the REML-GLS test. Likewise, binary tests are
-        // recomputed with the background-refitted case probabilities only when p < refine_p.
+        // every p < refine_p is recomputed with the REML-GLS test. Binary tests are recomputed with
+        // the background-refitted case probabilities when p < refine_p. Tests with a lead
+        // background variant (p < 1e-4) are always computed conditional on the lead variants.
         const int KREML = 512;
-        const double refine_p = g_refine_p;
         auto coher_reml_test = [&](int c, int t1, int t2, const Eigen::VectorXd& b, const Eigen::VectorXd& a1,
                                    double r1, double e1, double e2, double e12, const Eigen::VectorXd& w,
                                    const Eigen::MatrixXd& Psi12, const Eigen::MatrixXd& P0, const Eigen::MatrixXd& M,
@@ -2561,12 +2770,31 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             xc.push_back(b); xo.push_back(ec * sr1);
             xc.push_back(p1a); xo.push_back(sr1 / e1);
             for (size_t q = 0; q < xbg.size(); ++q) {
-                if ((int) xc.size() + 4 > K + 1) break;
                 xc.push_back(xbg[q]); xo.push_back(0.0);
             }
-            const int NX = (int) xc.size();
+            // Linearly dependent covariates are dropped (Gram-Schmidt in the whitened metric,
+            // h always kept): e.g. a background covariate B_a Psi1^{-1} a1 is a combination of
+            // the columns of component a, so it lies in the span of the lead variants when
+            // they cover the component; a singular GLS would give a meaningless variance.
+            std::vector<Eigen::VectorXd> xw; std::vector<double> xow;
+            {
+                std::vector<Eigen::VectorXd> bas;                    // orthonormal basis (K + 1 dims)
+                for (size_t q = 0; q < xc.size(); ++q) {
+                    if (q >= 2 && (int) bas.size() + 4 > K + 1) break;   // >= 4 dimensions left for the residual
+                    Eigen::VectorXd v(K + 1); v.head(K) = Vt * xc[q]; v[K] = xo[q] / std::sqrt(vperp);
+                    const double v2 = v.squaredNorm();
+                    if (!(v2 > 0.0) || !std::isfinite(v2)) { if (q == 0) return false; continue; }
+                    Eigen::VectorXd r = v;
+                    for (int it2 = 0; it2 < 2; ++it2)
+                        for (size_t u = 0; u < bas.size(); ++u) r -= bas[u] * bas[u].dot(r);
+                    if (q > 0 && r.squaredNorm() < 1e-8 * v2) continue;
+                    bas.push_back(r / r.norm());
+                    xw.push_back(v.head(K)); xow.push_back(xo[q]);
+                }
+            }
+            const int NX = (int) xw.size();
             Eigen::MatrixXd Xt(K, NX); Eigen::VectorXd Xo(NX);
-            for (int q = 0; q < NX; ++q) { Xt.col(q) = Vt * xc[q]; Xo[q] = xo[q]; }
+            for (int q = 0; q < NX; ++q) { Xt.col(q) = xw[q]; Xo[q] = xow[q]; }
             // UNCERTAINTY OF TRAIT 1's COMPONENTS. The conditional mean Psi12 Psi1^{-1} a1 uses the
             // components of trait 1 estimated from y1; their errors move the mean (for the tested
             // component almost exactly along the tested direction, when the phenotypes are
@@ -2705,38 +2933,12 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             }
             return it->second;
         };
-        // LOCAL GENETIC SCORE of trait t from the BACKGROUND components of the block (every
-        // component other than the tested one c: e.g. the common variants of the gene and the
-        // flank): the best linear predictor  g_bg = V D_bg V' Sigma_t^{-1} y_t,  with
-        // Sigma_t = V D V' + e_t I and D the (clamped) variance components of trait t. In
-        // K-space, with G = V'V:  V' Sigma^{-1} y = (u - G w) / e_t,  (e_t I + D G) w = D u.
-        // Centred; empty if the block has no background component with a positive estimate.
+        // local genetic score of trait t from the background components (see bg_score), cached
         std::vector< std::map<int, Eigen::VectorXd> > gbgcache(A);
-        Eigen::MatrixXd Gk; bool haveGk = false;
         auto get_gbg = [&](int c, int t) -> const Eigen::VectorXd& {
             std::map<int, Eigen::VectorXd>::iterator it = gbgcache[c].find(t);
             if (it != gbgcache[c].end()) return it->second;
-            Eigen::VectorXd out;
-            Eigen::VectorXd dv = Eigen::VectorXd::Zero(K), db = Eigen::VectorXd::Zero(K);
-            bool anybg = false;
-            for (int a2 = 0; a2 < C; ++a2) {
-                const double sv = std::max(sg[t][a2], 0.0) * g[a2];
-                for (int j = off[a2]; j < off[a2 + 1]; ++j) { dv[j] = sv; if (a2 != c) db[j] = sv; }
-                if (a2 != c && sv > 0.0 && off[a2 + 1] > off[a2]) anybg = true;
-            }
-            const double e = sg[t][env];
-            if (anybg && e > 0.0 && have_L) {
-                if (!haveGk) { Gk = L * L.transpose(); haveGk = true; }
-                const Eigen::VectorXd u = U.col(t);
-                Eigen::MatrixXd M = dv.asDiagonal() * Gk;
-                M.diagonal().array() += e;
-                const Eigen::VectorXd w = M.partialPivLu().solve(dv.cwiseProduct(u));
-                const Eigen::VectorXd beta = db.cwiseProduct((u - Gk * w) / e);
-                out = (cd.V * beta.cast<float>()).cast<double>();
-                out.array() -= out.mean();
-                if (!out.allFinite() || !(out.squaredNorm() > 0.0)) out.resize(0);
-            }
-            return gbgcache[c].insert(std::make_pair(t, out)).first->second;
+            return gbgcache[c].insert(std::make_pair(t, bg_score(c, sg[t], U.col(t)))).first->second;
         };
         for (int pi = 0; pi < (int) pairs.size(); ++pi) {
             const int t1 = pairs[pi].first, t2 = pairs[pi].second;
@@ -2859,13 +3061,20 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         return er;
                     };
                     ExactSpaResult er = bin_test(cb.cpi[pi]);
-                    // TWO-STAGE: only when p < refine_p. Genetic effects of the BACKGROUND (other components of the gene, flank) on
+                    // REFIT. Genetic effects of the BACKGROUND (other components of the gene, flank) on
                     // the random trait: its carriers of causal common alleles are more often cases,
                     // so case status is not exchangeable given the fixed trait alone. The null case
                     // probabilities are refitted by a logistic regression of b on the local genetic
                     // score of the random trait (as for the LOCO PRS), with the current
                     // probabilities as offset. No background signal -> score 0 -> unchanged.
-                    if (er.converged && 2.0 * std::min(er.p_up, er.p_lo) < refine_p) {
+                    // refitted when p < refine_p, and ALWAYS when the random trait has a lead variant
+                    // (p < 1e-4): a decision that does not depend on this test's p-value
+                    bool haslead = false;
+                    {
+                        std::vector<int> jl; std::vector<Eigen::VectorXd> q1, c1;
+                        select_leads(c, cb.rand_t[pi], jl, q1, c1); haslead = !jl.empty();
+                    }
+                    if (er.converged && (haslead || 2.0 * std::min(er.p_up, er.p_lo) < refine_p)) {
                         // Refit of the random trait's null case probabilities (flagged tests only):
                         //   logit pi = logit pi0 + a + c g_bg + sum_k d_k x_k
                         // g_bg = local genetic score of the background components (random effects),
@@ -2873,73 +3082,12 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         //        with the random trait, r^2 < 0.9 with those already chosen) as FIXED
                         //        effects: a few strong causal common variants are underfitted by g_bg.
                         std::vector<float> cploc;
-                        {
+                        if (dl != 0.0) {
                             const int trr = cb.rand_t[pi];
-                            const Eigen::VectorXd& gs = get_gbg(c, trr);
-                            std::vector<Eigen::VectorXd> cov;                    // centred, unit-variance covariates
-                            std::vector<Eigen::VectorXd> qs;                     // orthonormal basis of cov
-                            {
-                                std::vector< std::pair<double,int> > cand;
-                                for (int a2 = 0; a2 < C; ++a2) {
-                                    if (a2 == c) continue;
-                                    for (int j = off[a2]; j < off[a2 + 1]; ++j) {
-                                        if (j < (int) cd.colmaf.size() && cd.colmaf[j] < 0.01f) continue;
-                                        if (!(cd.cj[j] > 0.0)) continue;
-                                        cand.push_back(std::make_pair(-std::abs(U(j, trr)) / std::sqrt(cd.cj[j]), j));
-                                    }
-                                }
-                                std::sort(cand.begin(), cand.end());
-                                for (size_t q = 0; q < cand.size() && q < 30 && (int) qs.size() < 10; ++q) {
-                                    Eigen::VectorXd x = cd.V.col(cand[q].second).cast<double>(); x.array() -= x.mean();
-                                    const double x2 = x.squaredNorm(); if (!(x2 > 0.0)) continue;
-                                    Eigen::VectorXd r = x;
-                                    for (int it2 = 0; it2 < 2; ++it2)
-                                        for (size_t u = 0; u < qs.size(); ++u) r -= qs[u] * qs[u].dot(r);
-                                    if (r.squaredNorm() < 0.1 * x2) continue;          // r^2 > 0.9 with the chosen
-                                    qs.push_back(r / r.norm()); cov.push_back(x / std::sqrt(x2 / n));
-                                }
-                            }
-                            // the background score is a combination of the background columns: keep only
-                            // the part not explained by the lead variants (else the fit is collinear)
-                            if (gs.size() == n) {
-                                Eigen::VectorXd r = gs; const double g2 = gs.squaredNorm();
-                                for (int it2 = 0; it2 < 2; ++it2)
-                                    for (size_t u = 0; u < qs.size(); ++u) r -= qs[u] * qs[u].dot(r);
-                                if (g2 > 0.0 && r.squaredNorm() >= 0.1 * g2) cov.push_back(r / std::sqrt(r.squaredNorm() / n));
-                            }
-                            if (!cov.empty() && dl != 0.0) {
-                                const std::vector<float>& cp0 = cb.cpi[pi];
-                                const int pq = 1 + (int) cov.size();
-                                Eigen::MatrixXd Dm(n, pq); Dm.col(0).setOnes();
-                                for (int k = 0; k < (int) cov.size(); ++k) Dm.col(k + 1) = cov[k];
-                                Eigen::VectorXd l0(n), bb(n);
-                                for (int i = 0; i < n; ++i) {
-                                    const double q = std::min(std::max((double) cp0[i], 1e-8), 1.0 - 1e-8);
-                                    l0[i] = std::log(q / (1.0 - q));
-                                    bb[i] = std::round((Y(i, trr) - (double) cy[i]) / dl);
-                                }
-                                Eigen::VectorXd th = Eigen::VectorXd::Zero(pq);
-                                bool okf = true;
-                                for (int it = 0; it < 30; ++it) {
-                                    const Eigen::VectorXd eta = l0 + Dm * th;
-                                    Eigen::VectorXd pv(n), wv2(n);
-                                    for (int i = 0; i < n; ++i) { pv[i] = 1.0 / (1.0 + std::exp(-eta[i])); wv2[i] = pv[i] * (1.0 - pv[i]); }
-                                    const Eigen::VectorXd gr = Dm.transpose() * (bb - pv);
-                                    const Eigen::MatrixXd H = Dm.transpose() * wv2.asDiagonal() * Dm;
-                                    Eigen::LDLT<Eigen::MatrixXd> ld(H);
-                                    if (ld.info() != Eigen::Success) { okf = false; break; }
-                                    const Eigen::VectorXd st = ld.solve(gr);
-                                    if (!st.allFinite()) { okf = false; break; }
-                                    th += st;
-                                    if (st.cwiseAbs().maxCoeff() < 1e-8) break;
-                                }
-                                if (okf && th.allFinite()) {
-                                    const Eigen::VectorXd eta = l0 + Dm * th;
-                                    cploc.resize(n);
-                                    for (int i = 0; i < n; ++i)
-                                        cploc[i] = (float) std::min(std::max(1.0 / (1.0 + std::exp(-eta[i])), 1e-8), 1.0 - 1e-8);
-                                }
-                            }
+                            const std::vector<Eigen::VectorXd> cov = refit_covs(c, trr, get_gbg(c, trr));
+                            Eigen::VectorXd bb(n);
+                            for (int i = 0; i < n; ++i) bb[i] = std::round((Y(i, trr) - (double) cy[i]) / dl);
+                            logit_refit(cb.cpi[pi].data(), bb, cov, cploc);
                         }
                         if (!cploc.empty()) { ExactSpaResult e2 = bin_test(cploc); if (e2.converged) er = e2; }
                     }
@@ -2999,6 +3147,19 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 const double V0 = b.dot(t2p.P0 * b) - w.dot(pcache[t1].solve(w)) + ec * ec * r1 * (e2 - e12 * e12 / e1);
                 const double bm = b.dot(Mc[c] * b);
                 const bool v0ok = (V0 > 0.0) && std::isfinite(V0);
+                // CONDITIONAL ON LEAD VARIANTS: when a background variant is strongly associated with
+                // either trait (p < 1e-4, see select_leads), the test is ALWAYS computed conditional on
+                // the lead variants of both traits (lead_test: projected out of genotypes and
+                // phenotypes, all components re-estimated). The decision depends on the background
+                // associations only, not on the test's own p-value: replacing only the small p-values
+                // by conditional ones would deflate the tests whenever the two differ.
+                if (tl_refine_depth == 0) {
+                    const std::vector<int> js = lead_union(c, t1, t2);
+                    if (!js.empty()) {
+                        const std::pair<double, int> pl = lead_test(c, js, t1, t2, true);
+                        if (std::isfinite(pl.first)) { cr.p_spa[c][pi] = pl.first; cr.spa_used[c][pi] = 8; continue; }
+                    }
+                }
                 if (K > KREML && v0ok) {          // large blocks: fast test first (needs V0 > 0)
                     const double sd0 = std::sqrt(2.0 * t2p.tau0);
                     double V = V0, nu6 = 1e300;
@@ -3010,7 +3171,8 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     const double p6 = t_two_sided_p((Q - hm) / std::sqrt(V), nu6);
                     if (std::isfinite(p6) && p6 >= refine_p) { cr.p_spa[c][pi] = p6; cr.spa_used[c][pi] = 6; continue; }
                 }
-                {                                 // REML-GLS test (all small blocks; large blocks with p < refine_p)
+                // REML-GLS test (all small blocks; large blocks with p < refine_p)
+                auto reml_p = [&]() -> double {
                     double tst, nu;
                     // sensitivity of the conditional mean to trait 1's tested component, and the
                     // sampling variance of its estimate (same trace formula as for trait 2)
@@ -3030,12 +3192,13 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         Eigen::MatrixXd Bf; coher_block(L, W, use_wcache, off, C, K, du, 0.0, Bf);
                         xbg.push_back(Bf * p1a);
                     }
-                    if (coher_reml_test(c, t1, t2, b, a1, r1, e1, e2, e12, w, Psi12, t2p.P0, Mc[c], pcache[t1],
-                                        ec, yty, ycross[pi], msl, vth[t1], xbg, tst, nu)) {
-                        cr.p_spa[c][pi] = t_two_sided_p(tst, nu); cr.spa_used[c][pi] = 7;
-                    } else { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
-                    continue;
-                }
+                    if (!coher_reml_test(c, t1, t2, b, a1, r1, e1, e2, e12, w, Psi12, t2p.P0, Mc[c], pcache[t1],
+                                         ec, yty, ycross[pi], msl, vth[t1], xbg, tst, nu)) return NA_REAL;
+                    return t_two_sided_p(tst, nu);
+                };
+                const double pr = reml_p();
+                if (std::isfinite(pr)) { cr.p_spa[c][pi] = pr; cr.spa_used[c][pi] = 7; }
+                else { cr.p_spa[c][pi] = NA_REAL; cr.spa_used[c][pi] = -1; }
             }
         }
         finish_se();
@@ -3076,8 +3239,11 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         // (configurations with probability < 1e-14 are dropped). A group whose enumeration
         // exceeds 50,000 configurations falls back to independent columns.
         struct SpCol { std::vector<int> js; std::vector<double> U, lp, uobs; int obs; };   // U: npts x m
-        std::vector<SpCol> spc; std::vector<int> dns; std::vector<double> dns_mean;
-        if (use_exact) {
+        // the sparse columns' exact null distributions and the dense columns' null means, for
+        // null case probabilities pic (n) with V' pic = upi
+        auto build_exact = [&](const float* pic, const Eigen::VectorXd& upi, std::vector<SpCol>& spc,
+                               std::vector<int>& dns, std::vector<double>& dns_mean) {
+            spc.clear(); dns.clear(); dns_mean.clear();
             const double dl = bx.delta[t], Ncase = bx.ncase[t];
             const std::vector<unsigned char>& bb = *bx.b[t];
             struct ColP { int j; double mu, kap; };
@@ -3086,9 +3252,9 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 const std::vector<int>& ci = cd.car[j];
                 const std::vector<unsigned char>& di = cd.dos[j];
                 double ec = 0.0;
-                for (size_t r = 0; r < ci.size(); ++r) ec += (double) bx.PiF(ci[r], t) * di[r];
+                for (size_t r = 0; r < ci.size(); ++r) ec += (double) pic[ci[r]] * di[r];
                 if (ci.empty() || ec > bx.ec_max) {
-                    dns.push_back(j); dns_mean.push_back(Ulo(j, t) + dl * Upi(j, t)); continue;
+                    dns.push_back(j); dns_mean.push_back(Ulo(j, t) + dl * upi[j]); continue;
                 }
                 const int cn = (int) ci.size();
                 double scar = 0.0;
@@ -3105,7 +3271,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 const std::vector<unsigned char>& di = cd.dos[cp.j];
                 const int cn = (int) ci.size();
                 std::vector<double> pis(cn); int sobs = 0;
-                for (int r = 0; r < cn; ++r) { pis[r] = bx.PiF(ci[r], t); if (bb[ci[r]]) sobs += di[r]; }
+                for (int r = 0; r < cn; ++r) { pis[r] = pic[ci[r]]; if (bb[ci[r]]) sobs += di[r]; }
                 SpCol sc; sc.js.assign(1, cp.j);
                 pb_pmf(di, pis, sc.lp);
                 if ((int) sc.lp.size() < sobs + 1) sc.lp.resize(sobs + 1, -1e300);   // keep the observation
@@ -3178,7 +3344,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     int a;
                     if (pt == pat.end()) { a = (int) apat.size(); pat[it->second] = a; apat.push_back(it->second); api.push_back(std::vector<double>()); aobs.push_back(0); }
                     else a = pt->second;
-                    api[a].push_back(bx.PiF(it->first, t));
+                    api[a].push_back(pic[it->first]);
                     if (bb[it->first]) ++aobs[a];
                 }
                 const int na = (int) apat.size();
@@ -3237,7 +3403,9 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                 }
                 spc.push_back(sc);
             }
-        }
+        };
+        std::vector<SpCol> spc; std::vector<int> dns; std::vector<double> dns_mean;
+        if (use_exact) build_exact(bx.PiF.col(t).data(), Upi.col(t), spc, dns, dns_mean);
         for (int a = 0; a < C; ++a) if (s0base[a] < 0.0) s0base[a] = 0.0;
 
         // ---- SPA-test each category component c ----
@@ -3266,7 +3434,11 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                                       : std::erfc(std::abs(sigma[c] / std::sqrt(var0)) / std::sqrt(2.0));
 
             // ---- exact per-variant binary saddlepoint (spa_used = 5) -------------------
-            if (use_exact) {
+            // for given sparse distributions / dense means (null case probabilities) and
+            // Bernoulli variance vbar of the dense scores
+            auto run_exact = [&](const std::vector<SpCol>& spc, const std::vector<int>& dns,
+                                 const std::vector<double>& dns_mean, double vbar) -> ExactSpaResult {
+                ExactSpaResult er0; er0.p_up = er0.p_lo = NA_REAL; er0.converged = false;
                 const double Cc = Tinv(c, env) * yty[t];
                 double qobs = Cc;
                 std::vector<ExactTerm> terms; terms.reserve(spc.size());
@@ -3292,7 +3464,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     // approximated by vbar X_D' X_D (exact when pi is constant). NOT the Gaussian-null
                     // Smat: its residual variance is estimated from y (minus any LOCO score), which
                     // is not the Bernoulli variance when a polygenic score is subtracted.
-                    Eigen::MatrixXd Sig = bx.vbar[t] * (LD * LD.transpose());
+                    Eigen::MatrixXd Sig = vbar * (LD * LD.transpose());
                     Sig = (0.5 * (Sig + Sig.transpose())).eval();
                     Eigen::VectorXd ad(nd), md(nd);
                     for (int r = 0; r < nd; ++r) {
@@ -3338,11 +3510,47 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         ExactSpaResult eg = exact_grid_solve(qobs, terms, lamd, nc2d, Cc);
                         if (eg.converged) er = eg;
                     }
-                    if (er.converged) {
-                        cr.p_spa[c][t] = one_sided ? er.p_up : std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo));
-                        cr.spa_used[c][t] = 5;
-                        continue;
+                    return er;
+                }
+                return er0;
+            };
+            if (use_exact) {
+                ExactSpaResult er = run_exact(spc, dns, dns_mean, bx.vbar[t]);
+                if (er.converged) {
+                    double pe = one_sided ? er.p_up : std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo));
+                    int used = 5;
+                    // conditional test (conditional = TRUE): the null case probabilities are refitted
+                    // on the lead variants and the background score (as for binary co-heritability),
+                    // and the exact test is recomputed (spa_used = 9) -- always when the trait has a
+                    // lead variant (p < 1e-4), otherwise when p < refine_p
+                    bool haslead = false;
+                    if (g_cond_lead) {
+                        std::vector<int> jl; std::vector<Eigen::VectorXd> q1, c1;
+                        select_leads(c, t, jl, q1, c1); haslead = !jl.empty();
                     }
+                    if (g_cond_lead && tl_refine_depth == 0 && (haslead || pe < refine_p) && bx.delta[t] != 0.0) {
+                        const std::vector<unsigned char>& bb = *bx.b[t];
+                        Eigen::VectorXd bbv(n);
+                        for (int i = 0; i < n; ++i) bbv[i] = (double) bb[i];
+                        const std::vector<Eigen::VectorXd> cov = refit_covs(c, t, bg_score(c, sigma, U.col(t)));
+                        std::vector<float> pin;
+                        if (logit_refit(bx.PiF.col(t).data(), bbv, cov, pin)) {
+                            const Eigen::Map<const Eigen::VectorXf> pmap(pin.data(), n);
+                            const Eigen::VectorXd upi2 = (cd.V.transpose() * pmap).cast<double>();
+                            double vb = 0.0;
+                            for (int i = 0; i < n; ++i) vb += (double) pin[i] * (1.0 - (double) pin[i]);
+                            vb *= bx.delta[t] * bx.delta[t] / n;
+                            std::vector<SpCol> spc2; std::vector<int> dns2; std::vector<double> dm2;
+                            build_exact(pin.data(), upi2, spc2, dns2, dm2);
+                            const ExactSpaResult e2 = run_exact(spc2, dns2, dm2, vb);
+                            if (e2.converged) {
+                                pe = one_sided ? e2.p_up : std::min(1.0, 2.0 * std::min(e2.p_up, e2.p_lo));
+                                used = 9;
+                            }
+                        }
+                    }
+                    cr.p_spa[c][t] = pe; cr.spa_used[c][t] = used;
+                    continue;
                 }
             }
             // binary phenotypes use the exact computation only: if it is not possible, the
@@ -3364,6 +3572,16 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                                               0.0, 0.0, 0.0, 0.0, one_sided ? 1 : 0);
             if (qr.converged) { cr.p_spa[c][t] = qr.p; cr.spa_used[c][t] = 1; }
             else              { cr.p_spa[c][t] = p_wald; cr.spa_used[c][t] = 0; }
+            // conditional test (conditional = TRUE): whenever a background variant is strongly
+            // associated with the trait (p < 1e-4), the test is recomputed conditional on the lead
+            // variants (independently of its own p-value; see the co-heritability branch)
+            if (g_cond_lead && tl_refine_depth == 0) {
+                const std::vector<int> js = lead_union(c, -1, t);
+                if (!js.empty()) {
+                    const std::pair<double, int> pl = lead_test(c, js, t, -1, false);
+                    if (std::isfinite(pl.first)) { cr.p_spa[c][t] = pl.first; cr.spa_used[c][t] = 8; }
+                }
+            }
         }
     }
     finish_se();
@@ -4215,6 +4433,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          double gene_flank = 0,
                          double flank_maf = 0.01,
                          double refine_p = 0.05,
+                         bool conditional = false,
                          SEXP chr = R_NilValue,
                          std::string out_file = "",
                          int batch_size = 64,
@@ -4224,7 +4443,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit + lead variants for p < refine_p; capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < refine_p; conditional on lead variants (p<1e-4) whenever present [quant: projected + re-estimated, spa_used 8; binary refit]; univariate conditional=TRUE (spa_used 8/9); capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
     // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
@@ -4306,8 +4525,13 @@ Rcpp::List stratgwas_run(const std::string& filename,
     pr.gene_flank = (long) std::max(0.0, gene_flank); pr.gene_flank_maf = std::max(0.0, flank_maf);
     if (!(refine_p >= 0.0 && refine_p <= 1.0)) stop("refine_p must be in [0, 1]");
     g_refine_p = refine_p;
-    if (coher) Rcout << "Co-heritability: tests with p < " << refine_p << " are recomputed with the refined null "
-                     << "(REML-GLS for large blocks; binary: case probabilities refitted on lead background variants).\n";
+    g_cond_lead = conditional && !coher;
+    if (coher) Rcout << "Co-heritability: tests are computed conditional on the lead background variants (p < 1e-4) when there are any; "
+                     << "otherwise tests with p < " << refine_p << " are recomputed with the refined null "
+                     << "(REML-GLS for large blocks; binary: case probabilities refitted on the background score).\n";
+    if (g_cond_lead) Rcout << "Conditional tests: every test is computed conditional on the lead background variants "
+                           << "(MAF >= 1%, p < 1e-4, at most 10) when there are any (quantitative: projected out, components "
+                           << "re-estimated; binary: case probabilities refitted, also for p < " << refine_p << ").\n";
     if (pr.gene_flank > 0)
         Rcout << "Gene flanks: all variants with MAF >= " << pr.gene_flank_maf << " within " << pr.gene_flank
               << " bp of each gene form a background component (estimated, not tested).\n";
