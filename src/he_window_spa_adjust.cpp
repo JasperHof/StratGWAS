@@ -29,8 +29,8 @@
 using namespace Rcpp;
 
 // ===========================================================================
-// StratGWAS -- combined-panel chunk HE + saddlepoint, with KVIK LOCO offsets
-// and a large-window heritability calibration.
+// StratGWAS / SPARROW -- gene-based (and chunk-based) HE + saddlepoint, with
+// KVIK LOCO offsets.
 //
 // ONE genotype file holds every variant (WES/WGS rare AND array/imputed
 // common). An annotation matrix assigns each SNP to exactly one CATEGORY
@@ -38,28 +38,14 @@ using namespace Rcpp;
 // component; the moment system is solved jointly across the categories present
 // in each unit of analysis.
 //
-// TWO PASSES over the same file, same kernels, same solver:
-//
-//   PASS 1 -- ASSOCIATION.  Unit = a chunk of `chunk_size` consecutive SNPs.
-//     No flanks (as SAIGE-GENE: a gene is tested marginally). Phenotype for
-//     chromosome c is  y - LOCO_c , the LDAK-KVIK step-1 leave-one-chromosome-
-//     out PRS, so the polygenic background of every OTHER chromosome is removed
-//     while the tested chromosome's own signal is untouched. Output: vg, se_vg,
-//     h2 and an SPA p-value per chunk x category x trait.
-//
-//   PASS 2 -- HERITABILITY.  Unit = a window of ~window_bp built from N whole
-//     chunks, with the neighbouring windows as flanks. Phenotype = y - FULL PRS
-//     (the full PRS is recovered exactly from the LOCO file, see prs_load).
-//     Per category, the PRS actually subtracted is chosen by `prs_mask`, so a
-//     rare-variant category can be estimated CONDITIONAL on the common-SNP PRS
-//     while a common category is estimated on the raw phenotype. This is the
-//     configuration that gave unbiased estimates in simulation; the chunk
-//     estimates of pass 1 do not (LD leakage at 256-SNP resolution).
-//
-//   ADJUSTMENT.  Within each window, (window vg - sum of its chunks' vg) is
-//   distributed back over the chunks in proportion to each chunk's expected
-//   variance share under the alpha model, sum_j [2 f_j (1-f_j)]^(1+alpha).
-//   p-values are NOT touched; vg_adj / h2_adj are reported next to vg / h2.
+// UNITS. With `genes`, each gene (split into blocks of at most max_gene_snps
+// variants, optionally with a flanking background component) is a unit; without
+// genes, consecutive chunks of `chunk_size` SNPs are (an agnostic screen).
+// Phenotype for chromosome c is  y - LOCO_c , the LDAK-KVIK step-1 leave-one-
+// chromosome-out PRS, so the polygenic background of every OTHER chromosome is
+// removed while the tested chromosome's own signal is untouched (with
+// h2_without_prs, vg / h2 are estimated on y itself). Output: vg, se_vg, h2 and
+// a saddlepoint p-value per unit x category x trait (or trait pair).
 //
 // Everything numerical below the context/driver layer (bed reader, cumulant
 // algebra, quad_spa_solve, bern_spa_solve, the co-heritability machinery and
@@ -1553,14 +1539,13 @@ struct ChunkContext {
     // every SNP belongs to exactly one category; -1 = no category (background)
     int n_cat; std::vector<std::string> cat_names; std::vector<int> snp_cat;
     BedReader bed;
-    // PRS sources and the per-category mask used in pass 2
+    // LOCO PRS sources, trait-major: prs[t * G + g]
     std::vector<PrsSource> prs;
-    std::vector< std::vector<unsigned char> > prs_mask;   // [cat][source]
     // binary raw 0/1 per trait (only when binary && coher), analysis order
     std::vector< std::vector<unsigned char> > braw;
     std::vector<double> prev, bdelta;
     // alpha values. alphas[0] is the PRIMARY one: it weights the genotypes as
-    // read, and every vg / h2 / window estimate is at that value. Any further
+    // read, and every vg / h2 estimate is at that value. Any further
     // values are used ONLY for association p-values, which are ACAT-combined
     // across all alphas (see Worker). One value = the original behaviour.
     std::vector<double> alphas;
@@ -1799,8 +1784,7 @@ static void prs_load(const std::string& path, ChunkContext& ctx, PrsSource& S) {
 }
 
 // Phenotype variant + everything the tester needs that depends on it.
-// Built once per chromosome (pass 1: y - sum LOCO_c) and once per distinct
-// prs_mask row (pass 2: y - sum full).
+// Built once per chromosome (y - sum LOCO_c).
 // Per-phenotype-variant inputs of the exact binary saddlepoint (spa_used = 5).
 // y_i = lo_i + delta b_i: lo is variant specific (it carries the PRS offset), b, pi and
 // delta are those of the original phenotype.
@@ -2036,16 +2020,15 @@ static void build_pheno_stats(const ChunkContext& ctx, const Eigen::MatrixXd& of
 // ===========================================================================
 // One assembled unit: [ cat_0 | ... | cat_{A-1} | flank ]
 // ===========================================================================
-// Used for BOTH passes. `a..b` is the unit's own SNP range; the flanks are two
-// explicit index ranges (empty for pass 1; the neighbouring windows in pass 2).
+// `a..b` is the unit's own SNP range; the flanks are two explicit index ranges
+// (empty for chunks; the gene flanks with gene_flank > 0).
 struct ChunkDataA {
     std::string chr; long start, end;
     std::vector<int> cat_m;            // columns per ACTIVE category
     std::vector<int> cat_id;           // global category index of each active category
     std::vector<std::string> cat_name;
     std::vector<double> cat_w;         // sum_j [2f(1-f)]^(1+alpha) per active category:
-                                       // the alpha-model's expected variance share, used
-                                       // to distribute the window adjustment over chunks
+                                       // the alpha-model's expected variance share
     int m_flank, K;
     GenoMat V;
     std::vector<double> cj;
@@ -2214,11 +2197,9 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
 // on the phenotype -- the Gram, G^2, the moment matrix T and its decomposition,
 // and (when SPA is on) the Cholesky factor L and the block outer products W.
 //
-// This is ~97% of the cost of a window at K ~ 3000: the Gram alone is nK^2/2
-// flops against nKP for q = V'y. Building it once and sweeping the phenotype
-// variants (distinct prs_mask rows) over it is what makes pass 2 cost ONE
-// traversal of the window list instead of one per variant. Results are
-// unchanged: the same operations in the same order, just not repeated.
+// This dominates the cost of a unit: the Gram alone is nK^2/2 flops against
+// nKP for q = V'y. It is built once per unit and shared by the phenotype
+// variants (y - LOCO for p-values, y for heritability) and by the alphas.
 // ===========================================================================
 struct ChunkGeom {
     bool ok;
@@ -2252,7 +2233,7 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
     if (A <= 0 || K <= 0 || n <= 0) return;
     const bool has_f = (cd.m_flank > 0);
     // Components: the A tested categories, then the flank ONLY if present. With no
-    // flank (pass 1) the model is { cat_0, ..., cat_{A-1}, sigma_e I }.
+    // flank the model is { cat_0, ..., cat_{A-1}, sigma_e I }.
     const int C = A + (has_f ? 1 : 0), env = C;
     gm.K = K; gm.A = A; gm.C = C; gm.env = env; gm.has_f = has_f; gm.cov_df = cov_df;
 
@@ -2425,7 +2406,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
     // variants that tag them then carry their signal. Flagged tests are therefore recomputed
     // with up to 10 LEAD background variants as fixed effects: columns of the components other
     // than the tested one c (other categories of the gene, flank), MAF >= 1%, marginal
-    // association p < 1e-4 with trait t (chi2 >= 15.14), largest |correlation| first, r^2 < 0.9
+    // association p < 1e-4 with trait t (chi2 >= 15.14), largest |correlation| first, r^2 < 0.99
     // with those already chosen (out of the top 30). The p-value threshold keeps the
     // refinement from removing chance associations under the null (which deflates the tests).
     const double refine_p = g_refine_p;
@@ -2454,7 +2435,11 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
             Eigen::VectorXd r = x;
             for (int it2 = 0; it2 < 2; ++it2)
                 for (size_t u = 0; u < qs.size(); ++u) r -= qs[u] * qs[u].dot(r);
-            if (r.squaredNorm() < 0.1 * x2) continue;          // r^2 > 0.9 with the chosen
+            // r^2 > 0.99 with the chosen: skipped. NOT 0.9: two causal variants in strong LD with
+            // opposite effects carry their signal on the few discordant haplotypes (their
+            // difference), which rare variants on those haplotypes tag; dropping one of the pair
+            // left that direction unmodelled (TTC21B: r^2 = 0.92, binary co-heritability p ~ 1e-7)
+            if (r.squaredNorm() < 0.01 * x2) continue;
             js.push_back(cand[q].second);
             qs.push_back(r / r.norm()); cov.push_back(x / std::sqrt(x2 / n));
         }
@@ -3084,7 +3069,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         //   logit pi = logit pi0 + a + c g_bg + sum_k d_k x_k
                         // g_bg = local genetic score of the background components (random effects),
                         // x_k  = up to 10 LEAD background variants (MAF >= 1%, largest |correlation|
-                        //        with the random trait, r^2 < 0.9 with those already chosen) as FIXED
+                        //        with the random trait, r^2 < 0.99 with those already chosen) as FIXED
                         //        effects: a few strong causal common variants are underfitted by g_bg.
                         std::vector<float> cploc;
                         if (dl != 0.0) {
@@ -3597,7 +3582,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
 // Driver
 // ===========================================================================
 struct ChunkParams {
-    int chunk_size; long window_bp; bool do_windows; int max_window_chunks;
+    int chunk_size;
     int max_gene_snps, min_gene_snps;
     bool spa; bool binary;
     double acatv_mac;          // variants with MAC below this are collapsed into a burden
@@ -3615,7 +3600,7 @@ struct ChunkParams {
 };
 
 // One unit of work: its own range [a,b) plus two flank ranges. `win` is the
-// index of the window a pass-1 chunk belongs to (or of the window itself).
+// index of the gene a gene block belongs to (unused for chunks).
 struct Job { size_t ci; int a, b, fL0, fL1, fR0, fR1; int win; bool gene = false; };
 
 // ---------------------------------------------------------------------------
@@ -3669,9 +3654,9 @@ static double acatv_p(const ChunkDataA& cd, size_t qcat,
     return acat_combine(pv, pw);
 }
 
-// The worker takes a VECTOR of phenotype variants (distinct prs_mask rows).
-// Each job is read from disk and its geometry built ONCE; the variants are then
-// swept over that geometry. Pass 1 passes a single variant, so it is unaffected.
+// The worker takes a VECTOR of phenotype variants (y - LOCO, and y itself with
+// h2_without_prs). Each job is read from disk and its geometry built ONCE; the
+// variants are then swept over that geometry.
 struct Worker : public RcppParallel::Worker {
     const ChunkContext& ctx; const std::vector<Job>& jobs; size_t job0;
     const std::vector<PhenoStats>& S; const ChunkParams& pr; bool spa;
@@ -3693,8 +3678,7 @@ struct Worker : public RcppParallel::Worker {
             ChunkDataA cd;
             if (!make_chunk(ctx, j.ci, j.a, j.b, j.fL0, j.fL1, j.fR0, j.fR1, cd,
                             j.gene ? pr.gene_flank_maf : 0.0)) { ok[w] = 0; continue; }
-            // Multi-alpha applies to ASSOCIATION passes only (spa = true). The
-            // heritability pass runs with spa = false and stays single-alpha.
+            // Multi-alpha applies to p-values only (spa = true).
             const bool multi = spa && ctx.alphas.size() > 1;
             // With h2_raw, S = { y - LOCO (p-values), y (heritability) }. The extra
             // alphas and ACAT-V only concern p-values, so they run on variant 0 only;
@@ -3852,8 +3836,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         setenv("RCPP_PARALLEL_NUM_THREADS", nt.c_str(), 1);
 #endif
     }
-    // h2 denominators: the ORIGINAL phenotypic variance, so pass-1 and pass-2
-    // heritabilities (and the adjusted ones) are all fractions of the same thing.
+    // h2 denominators: the ORIGINAL phenotypic variance
     std::vector<double> Vp0(P);
     for (int t = 0; t < P; ++t) { double m = ctx.Y.col(t).mean();
         Vp0[t] = (ctx.Y.col(t).array() - m).square().sum() / (n - 1); }
@@ -3864,72 +3847,20 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         if (!pr.coher) return Vp0[t];
         return std::sqrt(Vp0[pr.pairs[t].first] * Vp0[pr.pairs[t].second]); };
 
-    // ---- enumerate chunks and windows ------------------------------------
-    std::vector<Job> cj, wj;                    // chunk jobs, window jobs
+    // ---- enumerate chunks (agnostic screen, without genes) -------------------
+    std::vector<Job> cj;                        // chunk jobs
     std::vector<size_t> chr_c0, chr_c1;          // chunk job range per chromosome
-    std::vector<int> win_ci;                     // chromosome of each window
     for (size_t ci = 0; ci < ctx.chr_order.size(); ++ci) {
         if (!pr.chr.empty() && strip_chr(ctx.chr_order[ci]) != strip_chr(pr.chr)) continue;
         const int lo = ctx.chr_lo[ci], hi = ctx.chr_hi[ci];
         chr_c0.push_back(cj.size());
-        // windows: consecutive whole chunks until the bp span reaches window_bp
-        std::vector< std::pair<int,int> > wr;    // [a, b) of each window
-        int wa = lo, wn = 0;                     // window start, chunks in it so far
         for (int a = lo; a <= hi; ) {
             const int b = std::min(hi + 1, a + pr.chunk_size);
-            Job j; j.ci = ci; j.a = a; j.b = b; j.fL0 = j.fL1 = j.fR0 = j.fR1 = 0;
-            j.win = (int) wj.size() + (int) wr.size();
-            cj.push_back(j); ++wn;
-            const bool last = (b > hi);
-            // Windows close on bp span OR on the chunk cap, whichever comes
-            // first. Without the cap a gene-dense megabase can reach tens of
-            // thousands of columns, and both the Gram (nK^2/2) and the memory
-            // (n*K floats for V, K^2 for the Gram) blow up with it.
-            if (last || wn >= pr.max_window_chunks ||
-                ctx.bim.bp[b - 1] - ctx.bim.bp[wa] + 1 >= pr.window_bp) {
-                wr.push_back(std::make_pair(wa, b)); wa = b; wn = 0;
-            }
+            Job j; j.ci = ci; j.a = a; j.b = b; j.fL0 = j.fL1 = j.fR0 = j.fR1 = 0; j.win = 0;
+            cj.push_back(j);
             a = b;
         }
-        // A trailing remainder shorter than half a window is absorbed into its
-        // predecessor (as the old build_cells did), so no window-level estimate
-        // rests on a sliver. The chunks it held are re-pointed accordingly.
-        // Skipped when the merge would push the predecessor past the cap.
-        if (wr.size() >= 2) {
-            const std::pair<int,int>& lastw = wr.back();
-            const int merged = ((lastw.second - wr[wr.size() - 2].first)
-                                + pr.chunk_size - 1) / pr.chunk_size;
-            if (ctx.bim.bp[lastw.second - 1] - ctx.bim.bp[lastw.first] + 1 < pr.window_bp / 2
-                && merged <= pr.max_window_chunks) {
-                const int wlast = (int) wj.size() + (int) wr.size() - 1;
-                wr[wr.size() - 2].second = lastw.second; wr.pop_back();
-                for (size_t k = chr_c0.back(); k < cj.size(); ++k) if (cj[k].win == wlast) cj[k].win = wlast - 1;
-            }
-        }
-        for (size_t w = 0; w < wr.size(); ++w) {
-            Job j; j.ci = ci; j.a = wr[w].first; j.b = wr[w].second;
-            j.fL0 = (w > 0) ? wr[w - 1].first : j.a;               j.fL1 = j.a;
-            j.fR0 = j.b; j.fR1 = (w + 1 < wr.size()) ? wr[w + 1].second : j.b;
-            j.win = (int) wj.size(); wj.push_back(j); win_ci.push_back((int) ci);
-        }
         chr_c1.push_back(cj.size());
-    }
-    Rcout << "Pass 1: " << cj.size() << " chunks of " << pr.chunk_size << " SNPs, no flanks, "
-          << ctx.n_cat << " categories, phenotype = y - LOCO PRS of the tested chromosome.\n";
-    report_plan(ctx, pr, pr.chunk_size, "pass 1");
-    if (pr.do_windows) {
-        int Kmax = 0; double Kmean = 0.0;
-        for (size_t w = 0; w < wj.size(); ++w) {
-            const int Kw = (wj[w].b - wj[w].a) + (wj[w].fL1 - wj[w].fL0) + (wj[w].fR1 - wj[w].fR0);
-            Kmax = std::max(Kmax, Kw); Kmean += Kw;
-        }
-        if (!wj.empty()) Kmean /= (double) wj.size();
-        Rcout << "Pass 2: " << wj.size() << " windows of ~" << pr.window_bp
-              << " bp (at most " << pr.max_window_chunks << " chunks) with neighbouring "
-              << "windows as flanks, phenotype = y - full PRS per prs_mask.\n";
-        Rcout << "  mean K ~ " << (int) Kmean << ", worst case " << Kmax
-              << "; cost per window scales as K^2.\n";
-        report_plan(ctx, pr, Kmax, "pass 2");
     }
 
     // ---- GENE JOBS ---------------------------------------------------------
@@ -4005,14 +3936,16 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         }
         if (grec.empty()) stop("No gene overlapped the genotype file -- check the chromosome labels above, and the genome build of the gene coordinates");
     }
-    // A genes-only run (genes supplied, do_windows = FALSE) skips the agnostic
-    // chunk pass entirely: the user wants gene p-values, not chunk p-values.
-    // With do_windows = TRUE the chunks are still needed, because the window
-    // correction is defined as (window - sum of its chunks).
-    const bool need_chunks = pr.do_windows || !has_genes;
+    // With genes, the agnostic chunk pass is skipped: the user wants gene results.
+    const bool need_chunks = !has_genes;
+    if (need_chunks) {
+        Rcout << "Chunks: " << cj.size() << " chunks of " << pr.chunk_size << " SNPs, no flanks, "
+              << ctx.n_cat << " categories, phenotype = y - LOCO PRS of the tested chromosome.\n";
+        report_plan(ctx, pr, pr.chunk_size, "chunks");
+    }
 
     // ---- the per-chromosome LOCO offset, shared by the chunk and gene passes -
-    const size_t G = ctx.prs_mask.empty() ? 0 : ctx.prs_mask[0].size();
+    const size_t G = (P > 0) ? ctx.prs.size() / (size_t) P : 0;
     auto loco_stats = [&](size_t ci, std::vector<PhenoStats>& S) {
         Eigen::MatrixXd off = Eigen::MatrixXd::Zero(n, P);
         // ctx.prs is stored trait-major: prs[t * G + g]
@@ -4050,7 +3983,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     };
     const size_t NV1 = pr.h2_raw ? 2 : 1;
 
-    // ---- PASS 1: association, one phenotype variant per chromosome ---------
+    // ---- CHUNKS: one phenotype variant per chromosome ------------------------
     std::vector< std::vector<ChunkResultA> > r1v(NV1, std::vector<ChunkResultA>(need_chunks ? cj.size() : 0));
     std::vector<ChunkResultA>& r1 = r1v[0];
     std::vector<char> ok1(need_chunks ? cj.size() : 0, 0);
@@ -4060,16 +3993,14 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         for (size_t k = 0; k < chr_c0.size(); ++k) {
             if (chr_c1[k] == chr_c0[k]) continue;
             std::vector<PhenoStats> S; loco_stats(cj[chr_c0[k]].ci, S);
-            run_jobs(ctx, pr, S, pr.spa, cj, chr_c0[k], chr_c1[k], r1v, ok1, "pass1",
+            run_jobs(ctx, pr, S, pr.spa, cj, chr_c0[k], chr_c1[k], r1v, ok1, "chunks",
                      done, (long) cj.size(), pr.batch_size, t1);
         }
         merge_raw(r1v, ok1);
         Rcout << "\n";
-    } else {
-        Rcout << "Skipping the agnostic chunk pass (genes supplied with do_windows = FALSE).\n";
     }
 
-    // ---- PASS 1G: the same, on genes ---------------------------------------
+    // ---- GENES: the same, on gene blocks -----------------------------------
     std::vector< std::vector<ChunkResultA> > rgv(NV1, std::vector<ChunkResultA>(gj.size()));
     std::vector<ChunkResultA>& rg = rgv[0];
     std::vector<char> okg(gj.size(), 0);
@@ -4084,118 +4015,6 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         }
         merge_raw(rgv, okg);
         Rcout << "\n";
-    }
-
-    // ---- PASS 2: windows, one phenotype variant per distinct prs_mask row ---
-    std::vector<int> cat_variant(ctx.n_cat, 0);
-    std::vector< std::vector<unsigned char> > variants;           // distinct mask rows
-    for (int c = 0; c < ctx.n_cat; ++c) {
-        const std::vector<unsigned char>& row = ctx.prs_mask[c];
-        int v = -1;
-        for (size_t q = 0; q < variants.size(); ++q) if (variants[q] == row) { v = (int) q; break; }
-        if (v < 0) { v = (int) variants.size(); variants.push_back(row); }
-        cat_variant[c] = v;
-    }
-    std::vector< std::vector<ChunkResultA> > r2(variants.size(), std::vector<ChunkResultA>(wj.size()));
-    std::vector< std::vector<char> > ok2(variants.size(), std::vector<char>(wj.size(), 0));
-    if (pr.do_windows && !wj.empty()) {
-        // All variants are built up front and swept inside the worker, so each
-        // window is read and its Gram formed once rather than once per variant.
-        std::vector<PhenoStats> S(variants.size());
-        for (size_t v = 0; v < variants.size(); ++v) {
-            Eigen::MatrixXd off = Eigen::MatrixXd::Zero(n, P);
-            for (int t = 0; t < P; ++t)
-                for (size_t g = 0; g < G; ++g)
-                    if (variants[v][g]) off.col(t) += ctx.prs[(size_t) t * G + g].full;
-            build_pheno_stats(ctx, off, false, pr.coher, pr.pairs, S[v]);
-        }
-        std::vector<char> okw(wj.size(), 0);
-        long done2 = 0; const long tot2 = (long) wj.size();
-        const std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
-        const int b2 = std::max(1, std::min(pr.batch_size, 4));   // windows are slow: report often
-        run_jobs(ctx, pr, S, false, wj, 0, wj.size(), r2, okw, "pass2", done2, tot2, b2, t2);
-        for (size_t v = 0; v < variants.size(); ++v) ok2[v] = okw;
-        Rcout << "\n";
-    }
-
-    // ---- ADJUSTMENT: distribute (window - sum of chunks) over the chunks -----
-    // adj[chunk][k][t] for active category k of that chunk; NA if no window value
-    // Under coher the two univariate components are adjusted by the SAME rule, so
-    // a local genetic correlation can be formed with a calibrated numerator AND
-    // calibrated denominators rather than mixing the two scales.
-    // Sized from ok1, NOT from cj: in a genes-only run (need_chunks == false)
-    // ok1 and r1 are deliberately empty, and indexing them by a chunk index
-    // dereferences a null data pointer -- a segfault at address 0x0 right after
-    // the gene pass finishes, which is exactly what that looks like.
-    const size_t NCHUNK = ok1.size();
-    std::vector< std::vector< std::vector<double> > > adj(NCHUNK), adj1(NCHUNK), adj2(NCHUNK);
-    for (size_t k = 0; k < NCHUNK; ++k)
-        if (ok1[k]) {
-            const size_t nq = r1[k].cat_m.size();
-            adj[k].assign(nq, std::vector<double>(NOUT, NA_REAL));
-            if (pr.coher) {
-                adj1[k].assign(nq, std::vector<double>(NOUT, NA_REAL));
-                adj2[k].assign(nq, std::vector<double>(NOUT, NA_REAL));
-            }
-        }
-    // per-unit-weight correction for each window x category x trait, reused by
-    // the gene writer; NA where the window produced no estimate
-    std::vector< std::vector< std::vector<double> > > delta(
-        wj.size(), std::vector< std::vector<double> >(ctx.n_cat, std::vector<double>(NOUT, NA_REAL)));
-    if (pr.do_windows) {
-        // chunks of each window
-        std::vector< std::vector<size_t> > members(wj.size());
-        for (size_t k = 0; k < cj.size(); ++k) if (ok1[k]) members[cj[k].win].push_back(k);
-        for (size_t w = 0; w < wj.size(); ++w) {
-            for (int c = 0; c < ctx.n_cat; ++c) {
-                const int v = cat_variant[c];
-                if (!ok2[v][w]) continue;
-                const ChunkResultA& W = r2[v][w];
-                int kw = -1; for (size_t q = 0; q < W.cat_id.size(); ++q) if (W.cat_id[q] == c) { kw = (int) q; break; }
-                if (kw < 0) continue;
-                // sum over member chunks where c is active
-                double wsum = 0.0;
-                std::vector<double> ssum(NOUT, 0.0), ssum1(NOUT, 0.0), ssum2(NOUT, 0.0);
-                std::vector< std::pair<size_t,int> > hits;
-                for (size_t m = 0; m < members[w].size(); ++m) {
-                    const size_t k = members[w][m]; const ChunkResultA& R = r1[k];
-                    for (size_t q = 0; q < R.cat_id.size(); ++q) if (R.cat_id[q] == c) {
-                        hits.push_back(std::make_pair(k, (int) q)); wsum += R.cat_w[q];
-                        for (int t = 0; t < NOUT; ++t) {
-                            if (!std::isnan(R.vg[q][t])) ssum[t] += R.vg[q][t];
-                            if (pr.coher) {
-                                if (!std::isnan(R.vg_t1[q][t])) ssum1[t] += R.vg_t1[q][t];
-                                if (!std::isnan(R.vg_t2[q][t])) ssum2[t] += R.vg_t2[q][t];
-                            }
-                        }
-                    }
-                }
-                if (hits.empty() || !(wsum > 0.0)) continue;
-                // delta_w: the correction PER UNIT of alpha-model weight. The
-                // chunks below get delta_w * cat_w; a gene inside this window
-                // gets the same rule applied to its own cat_w (see the gene
-                // writer), so both are calibrated by one definition.
-                for (int t = 0; t < NOUT; ++t) {
-                    const double Wv = W.vg[kw][t];
-                    if (!std::isnan(Wv)) delta[w][c][t] = (Wv - ssum[t]) / wsum;
-                }
-                for (size_t h = 0; h < hits.size(); ++h) {
-                    const size_t k = hits[h].first; const int q = hits[h].second;
-                    const double share = r1[k].cat_w[q] / wsum;
-                    for (int t = 0; t < NOUT; ++t) {
-                        const double Wv = W.vg[kw][t];
-                        if (!std::isnan(Wv) && !std::isnan(r1[k].vg[q][t]))
-                            adj[k][q][t] = r1[k].vg[q][t] + (Wv - ssum[t]) * share;
-                        if (!pr.coher) continue;
-                        const double W1 = W.vg_t1[kw][t], W2 = W.vg_t2[kw][t];
-                        if (!std::isnan(W1) && !std::isnan(r1[k].vg_t1[q][t]))
-                            adj1[k][q][t] = r1[k].vg_t1[q][t] + (W1 - ssum1[t]) * share;
-                        if (!std::isnan(W2) && !std::isnan(r1[k].vg_t2[q][t]))
-                            adj2[k][q][t] = r1[k].vg_t2[q][t] + (W2 - ssum2[t]) * share;
-                    }
-                }
-            }
-        }
     }
 
     // ---- WRITE ---------------------------------------------------------------
@@ -4235,24 +4054,20 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
             else f << "NA";
         }
     };
-    long n1 = 0, n2 = 0;
+    long n1 = 0;
     if (!pr.out_file.empty() && need_chunks) {
         std::ofstream f1(pr.out_file.c_str());
         if (!f1.is_open()) stop("Could not open out_file: " + pr.out_file);
-        f1 << "chr\tstart\tend\twindow\tcategory\tm_cat\tm_flank\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_env";
+        f1 << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_env";
         if (pr.spa)   f1 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr;
         if (pr.coher) f1 << "\tvg_t1\tvg_t2";
-        if (pr.do_windows) {
-            f1 << "\tvg_adj\th2_adj";
-            if (pr.coher) f1 << "\tvg_t1_adj\tvg_t2_adj";
-        }
         f1 << "\n";
         for (size_t k = 0; k < cj.size(); ++k) {
             if (!ok1[k]) continue; ++n1;
             const ChunkResultA& R = r1[k];
             for (size_t q = 0; q < R.cat_m.size(); ++q)
                 for (int t = 0; t < NOUT; ++t) {
-                    f1 << R.chr << '\t' << R.start << '\t' << R.end << '\t' << cj[k].win << '\t'
+                    f1 << R.chr << '\t' << R.start << '\t' << R.end << '\t'
                        << R.cat_name[q] << '\t' << R.cat_m[q] << '\t' << R.m_flank << '\t' << label(t) << '\t';
                     wr(f1, R.vg[q][t]); f1 << '\t'; wr(f1, R.se_vg[q][t]); f1 << '\t';
                     wr(f1, h2den(t) > 0 ? R.vg[q][t] / h2den(t) : NA_REAL);
@@ -4260,55 +4075,15 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     if (pr.spa) { f1 << '\t'; wr(f1, R.p_spa[q][t]); f1 << '\t' << R.spa_used[q][t];
                                   wr_alpha(f1, R, q, t); wr_acv(f1, R, q, t); }
                     if (pr.coher) { f1 << '\t'; wr(f1, R.vg_t1[q][t]); f1 << '\t'; wr(f1, R.vg_t2[q][t]); }
-                    if (pr.do_windows) {
-                        const double a = adj[k][q][t];
-                        f1 << '\t'; wr(f1, a); f1 << '\t'; wr(f1, (!std::isnan(a) && h2den(t) > 0) ? a / h2den(t) : NA_REAL);
-                        if (pr.coher) {
-                            f1 << '\t'; wr(f1, adj1[k][q][t]);
-                            f1 << '\t'; wr(f1, adj2[k][q][t]);
-                        }
-                    }
                     f1 << '\n';
                 }
         }
         f1.close();
-        if (pr.do_windows) {
-            std::ofstream f2((pr.out_file + ".windows").c_str());
-            if (!f2.is_open()) stop("Could not open " + pr.out_file + ".windows");
-            f2 << "chr\tstart\tend\twindow\tn_chunks\tcategory\tm_cat\tm_flank\tprs_variant\tphenotype\tvg\th2\tvg_flank\tvg_env";
-            if (pr.coher) f2 << "\tvg_t1\tvg_t2";
-            f2 << "\n";
-            std::vector<int> nchunks(wj.size(), 0);
-            for (size_t k = 0; k < cj.size(); ++k) if (ok1[k]) ++nchunks[cj[k].win];
-            for (size_t w = 0; w < wj.size(); ++w)
-                for (int c = 0; c < ctx.n_cat; ++c) {
-                    const int v = cat_variant[c]; if (!ok2[v][w]) continue;
-                    const ChunkResultA& W = r2[v][w];
-                    int kw = -1; for (size_t q = 0; q < W.cat_id.size(); ++q) if (W.cat_id[q] == c) { kw = (int) q; break; }
-                    if (kw < 0) continue;
-                    ++n2;
-                    std::string vs; for (size_t g = 0; g < G; ++g) vs += (variants[v][g] ? '1' : '0');
-                    if (vs.empty()) vs = "none";
-                    for (int t = 0; t < NOUT; ++t) {
-                        f2 << W.chr << '\t' << W.start << '\t' << W.end << '\t' << w << '\t' << nchunks[w] << '\t'
-                           << W.cat_name[kw] << '\t' << W.cat_m[kw] << '\t' << W.m_flank << '\t' << vs << '\t'
-                           << label(t) << '\t';
-                        wr(f2, W.vg[kw][t]); f2 << '\t';
-                        wr(f2, h2den(t) > 0 ? W.vg[kw][t] / h2den(t) : NA_REAL);
-                        f2 << '\t'; wr(f2, W.vg_flank[t]); f2 << '\t'; wr(f2, W.vg_env[t]);
-                        if (pr.coher) { f2 << '\t'; wr(f2, W.vg_t1[kw][t]); f2 << '\t'; wr(f2, W.vg_t2[kw][t]); }
-                        f2 << '\n';
-                    }
-                }
-            f2.close();
-        }
     }
 
     // ---- GENE WRITE ----------------------------------------------------------
     // Per gene: one row per (block, category), then one ACAT row combining every
-    // p-value of that gene. vg_adj applies the window's per-unit-weight offset
-    // delta_w to the gene's own cat_w -- the same rule the chunks get, so gene
-    // and chunk heritabilities are calibrated by one definition rather than two.
+    // p-value of that gene.
     long ng = 0;
     if (!pr.out_file.empty() && has_genes) {
         std::ofstream f3((pr.out_file + ".genes").c_str());
@@ -4316,21 +4091,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         f3 << "gene\tchr\tstart\tend\tblock\tn_blocks\tcategory\tm_cat\tphenotype\tvg\tse_vg\th2\tvg_env";
         if (pr.spa)        f3 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr;
         if (pr.coher)      f3 << "\tvg_t1\tvg_t2";          // univariate estimates of both traits (for rg)
-        if (pr.do_windows) f3 << "\tvg_adj\th2_adj";
         f3 << "\n";
-        // Window overlap per gene block, computed ONCE. Windows tile each
-        // chromosome, so a block's SNP range intersects a short contiguous run
-        // of them; doing this inside the trait loop would be O(windows) a row.
-        std::vector< std::vector< std::pair<size_t,int> > > blk_win(gj.size());
-        if (pr.do_windows)
-            for (size_t b = 0; b < gj.size(); ++b) {
-                if (!okg[b]) continue;
-                for (size_t w = 0; w < wj.size(); ++w) {
-                    if (wj[w].ci != gj[b].ci) continue;
-                    const int lo = std::max(wj[w].a, gj[b].a), hi = std::min(wj[w].b, gj[b].b);
-                    if (hi > lo) blk_win[b].push_back(std::make_pair(w, hi - lo));
-                }
-            }
         for (size_t gi = 0; gi < grec.size(); ++gi) {
             const GeneRec& R = grec[gi];
             const int nb = (int) (R.j1 - R.j0);
@@ -4344,16 +4105,6 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     if (!okg[b]) continue;
                     const ChunkResultA& B = rg[b];
                     for (size_t q = 0; q < B.cat_m.size(); ++q) {
-                        // window-weighted correction for this block x category
-                        double dnum = 0.0, dden = 0.0;
-                        for (size_t z = 0; z < blk_win[b].size(); ++z) {
-                            const double d = delta[blk_win[b][z].first][B.cat_id[q]][t];
-                            if (std::isnan(d)) continue;
-                            dnum += d * (double) blk_win[b][z].second;
-                            dden += (double) blk_win[b][z].second;
-                        }
-                        const double a = (dden > 0.0)
-                            ? B.vg[q][t] + (dnum / dden) * B.cat_w[q] : NA_REAL;
                         f3 << R.name << '\t' << R.chr << '\t' << R.start << '\t' << R.end << '\t'
                            << (int) (b - R.j0) + 1 << '\t' << nb << '\t'
                            << B.cat_name[q] << '\t' << B.cat_m[q] << '\t' << label(t) << '\t';
@@ -4367,10 +4118,6 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                             pv.push_back(B.p_spa[q][t]); pw.push_back((double) B.cat_m[q]);
                         }
                         if (pr.coher) { f3 << '\t'; wr(f3, B.vg_t1[q][t]); f3 << '\t'; wr(f3, B.vg_t2[q][t]); }
-                        if (pr.do_windows) {
-                            f3 << '\t'; wr(f3, a);
-                            f3 << '\t'; wr(f3, (!std::isnan(a) && h2den(t) > 0) ? a / h2den(t) : NA_REAL);
-                        }
                         f3 << '\n';
                     }
                 }
@@ -4383,7 +4130,6 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                 if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f3 << "\tNA";
                 if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
                 if (pr.coher) f3 << "\tNA\tNA";
-                if (pr.do_windows) f3 << "\tNA\tNA";
                 f3 << '\n';
             }
         }
@@ -4394,9 +4140,8 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         long skipped = 0; for (size_t k = 0; k < cj.size(); ++k) if (!ok1[k]) ++skipped;
         Rcout << "Chunks tested: " << n1 << (skipped ? "  (skipped " + std::to_string(skipped) + ")" : "") << "\n";
     }
-    if (pr.do_windows) Rcout << "Window x category estimates: " << n2 << "\n";
     if (has_genes)     Rcout << "Genes tested: " << ng << " of " << grec.size() << "\n";
-    return List::create(_["n_chunks"] = (double) n1, _["n_windows"] = (double) wj.size(),
+    return List::create(_["n_chunks"] = (double) n1,
                         _["n_genes"] = (double) ng,
                         _["trait_names"] = ctx.trait_names, _["categories"] = wrap(ctx.cat_names));
 }
@@ -4412,11 +4157,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          Rcpp::Nullable<Rcpp::IntegerMatrix> annotation = R_NilValue,
                          Rcpp::Nullable<Rcpp::CharacterVector> annot_names = R_NilValue,
                          Rcpp::Nullable<Rcpp::CharacterMatrix> loco_prs = R_NilValue,
-                         Rcpp::Nullable<Rcpp::IntegerMatrix> prs_mask = R_NilValue,
                          int chunk_size = 256,
-                         double window_bp = 1e6,
-                         bool do_windows = true,
-                         int max_window_chunks = 8,
                          Rcpp::Nullable<Rcpp::CharacterMatrix> genes = R_NilValue,
                          int max_gene_snps = 512,
                          int min_gene_snps = 2,
@@ -4444,13 +4185,11 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          int batch_size = 64,
                          int n_threads = 0) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
-    if (window_bp < chunk_size) stop("window_bp is smaller than one chunk");
-    if (max_window_chunks < 1) stop("max_window_chunks must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < refine_p; conditional on lead variants (p<1e-4) whenever present [quant: projected + re-estimated, spa_used 8; binary refit on top-10 background variants, no threshold]; univariate conditional=TRUE (spa_used 8/9); capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes)\n";
-    // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2, the
-    // window adjustment); with SPA and >1 value, p_spa is the ACAT over alphas.
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice; quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < refine_p; conditional on lead variants (p<1e-4) whenever present [quant: projected + re-estimated, spa_used 8; binary refit on top-10 background variants, no threshold]; univariate conditional=TRUE (spa_used 8/9); capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, lead r2 < 0.99, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes; no window pass)\n";
+    // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2); with
+    // SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
     for (int k = 0; k < (int) alpha.size(); ++k) {
         const double ak = alpha[k];
@@ -4512,8 +4251,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     }
 
     ChunkParams pr;
-    pr.chunk_size = chunk_size; pr.window_bp = (long) window_bp; pr.do_windows = do_windows;
-    pr.max_window_chunks = max_window_chunks;
+    pr.chunk_size = chunk_size;
     pr.max_gene_snps = max_gene_snps; pr.min_gene_snps = min_gene_snps;
     pr.spa = SPA; pr.binary = binary; pr.acatv_mac = acatv_mac; pr.h2_raw = false;
     pr.one_sided = one_sided;
@@ -4533,7 +4271,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     g_cond_lead = conditional && !coher;
     if (coher) Rcout << "Co-heritability: tests are computed conditional on the lead background variants (p < 1e-4) when there are any; "
                      << "otherwise tests with p < " << refine_p << " are recomputed with the refined null "
-                     << "(REML-GLS for large blocks; binary: case probabilities refitted on the background score).\n";
+                     << "(REML-GLS for large blocks; binary: case probabilities refitted on the background score and the top-10 background variants).\n";
     if (g_cond_lead) Rcout << "Conditional tests: every test is computed conditional on the lead background variants "
                            << "(MAF >= 1%, p < 1e-4, at most 10) when there are any (quantitative: projected out, components "
                            << "re-estimated; binary: case probabilities refitted, also for p < " << refine_p << ").\n";
@@ -4561,31 +4299,10 @@ Rcpp::List stratgwas_run(const std::string& filename,
                 prs_load(as<std::string>(pm(r, (int) g)), ctx, ctx.prs[(size_t) t * G + g]);
             }
     }
-    // prs_mask: categories x sources, 1 = subtract that source's FULL PRS when
-    // estimating that category in pass 2. Default: subtract everything from
-    // everything. Pass 1 always subtracts every source's LOCO PRS.
-    ctx.prs_mask.assign(ctx.n_cat, std::vector<unsigned char>(G, 1));
-    if (prs_mask.isNotNull()) {
-        Rcpp::IntegerMatrix mm(prs_mask.get());
-        if (mm.nrow() != ctx.n_cat || (size_t) mm.ncol() != G)
-            stop("prs_mask must be n_categories x n_prs_sources");
-        for (int c = 0; c < ctx.n_cat; ++c)
-            for (size_t g = 0; g < G; ++g) ctx.prs_mask[c][g] = mm(c, (int) g) ? 1 : 0;
-    }
     pr.h2_raw = (G > 0) && h2_without_prs;
     if (pr.h2_raw)
-        Rcout << "LOCO PRS used for p-values only: vg / se_vg / h2 of chunks and genes are estimated on y itself\n"
-              << "  (an in-sample PRS shrinks heritability estimates). Use prs_mask = 0 to estimate windows on y as well.\n";
-    if (G > 0) {
-        Rcout << "PRS mask (pass 2, category x source):\n";
-        for (int c = 0; c < ctx.n_cat; ++c) {
-            Rcout << "  " << ctx.cat_names[c] << ":";
-            for (size_t g = 0; g < G; ++g) Rcout << " " << (int) ctx.prs_mask[c][g];
-            Rcout << "\n";
-        }
-    } else if (do_windows) {
-        Rcout << "No loco_prs: pass 2 runs on the raw phenotype (no PRS offset).\n";
-    }
+        Rcout << "LOCO PRS used for p-values only: vg / se_vg / h2 are estimated on y itself\n"
+              << "  (an in-sample PRS shrinks heritability estimates).\n";
 
     // ---- co-heritability: all pairs --------------------------------------------
     pr.coher = coher;

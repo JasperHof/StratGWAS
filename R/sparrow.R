@@ -4,12 +4,12 @@
 #' and tests it using a saddlepoint approximation. Phenotypes are matched to the
 #' genotypes by IID, covariates are regressed out of the phenotypes here (and out
 #' of the genotypes inside the C++ code), and all bookkeeping that used to be
-#' manual (cov_df, binary_raw, the logistic null model, prs_mask) is done automatically.
+#' manual (cov_df, binary_raw, the logistic null model) is done automatically.
 #'
 #' @param filename PLINK prefix (.bed/.bim/.fam) holding rare variants and common SNPs.
 #' @param pheno Data frame or file: FID, IID, then one column per phenotype.
-#' @param out_file Output prefix. Writes <out_file> (regions), <out_file>.genes and
-#'   <out_file>.windows.
+#' @param out_file Output prefix. Writes <out_file>.genes (with `genes`), or <out_file>
+#'   (chunks of `chunk_size` SNPs, without `genes`).
 #' @param covariates Optional data frame or file: FID, IID, then numeric covariates
 #'   (an intercept is added automatically; do not include one).
 #' @param annotation Optional 0/1 matrix or file (with header), one column per variant
@@ -26,10 +26,7 @@
 #' @param coher TRUE to estimate co-heritability for all pairs of phenotypes.
 #' @param h2_without_prs With `loco_prs`: estimate h2 from y (TRUE) and use y - LOCO
 #'   only for p-values. Recommended; see the supplement.
-#' @param prs_mask Advanced. Categories x PRS sources; which full PRS is subtracted in
-#'   the window pass. Default: 0 if h2_without_prs, else 1.
-#' @param do_windows Estimate ~1 Mb windows and report window-calibrated h2 (h2_adj).
-#' @param chunk_size,window_bp,max_window_chunks Region and window sizes.
+#' @param chunk_size Without `genes`: the genome is tested in chunks of this many SNPs.
 #' @param max_gene_snps,min_gene_snps Genes are split into blocks of at most
 #'   `max_gene_snps` variants; genes with fewer than `min_gene_snps` are skipped.
 #' @param acatv_mac Variants with MAC below this are collapsed into a burden in ACAT-V.
@@ -87,9 +84,7 @@ sparrow <- function(filename, pheno, out_file,
                     alpha = c(-1, -0.5, 0),
                     loco_prs = NULL, kvik_summaries = NULL,
                     binary = FALSE, coher = FALSE,
-                    h2_without_prs = TRUE, prs_mask = NULL,
-                    do_windows = TRUE, chunk_size = 256, window_bp = 1e6,
-                    max_window_chunks = 8,
+                    h2_without_prs = TRUE, chunk_size = 256,
                     max_gene_snps = 512, min_gene_snps = 2,
                     acatv_mac = 10, collapse_mac = 0, spa = TRUE, chr = NULL,
                     gene_flank = 0, flank_maf = 0.01, refine_p = 0.05, conditional = FALSE,
@@ -217,7 +212,6 @@ sparrow <- function(filename, pheno, out_file,
     if (is.null(annot_names)) annot_names <- paste0("cat", seq_len(ncol(annotation)))
     if (length(annot_names) != ncol(annotation)) stop("annot_names must have one name per annotation column")
   }
-  n_cat <- if (is.null(annotation)) 1 else ncol(annotation)
 
   # ---- genes ------------------------------------------------------------------------
   if (!is.null(genes)) {
@@ -239,13 +233,6 @@ sparrow <- function(filename, pheno, out_file,
     if (nrow(loco_prs) != P) stop("loco_prs needs one file per phenotype")
     miss <- loco_prs[!file.exists(loco_prs)]
     if (length(miss)) stop("loco_prs file(s) not found: ", paste(miss, collapse = ", "))
-    if (is.null(prs_mask))
-      prs_mask <- matrix(if (h2_without_prs) 0L else 1L, n_cat, ncol(loco_prs))
-    prs_mask <- as.matrix(prs_mask); storage.mode(prs_mask) <- "integer"
-    if (nrow(prs_mask) != n_cat || ncol(prs_mask) != ncol(loco_prs))
-      stop("prs_mask must be n_categories x n_prs_sources (", n_cat, " x ", ncol(loco_prs), ")")
-  } else if (!is.null(prs_mask)) {
-    warning("prs_mask is ignored without loco_prs"); prs_mask <- NULL
   }
   if (!is.null(kvik_summaries)) {
     kvik_summaries <- as.character(kvik_summaries)
@@ -267,9 +254,8 @@ sparrow <- function(filename, pheno, out_file,
   res <- stratgwas_run(
     filename = filename, pheno_mat = Y,
     annotation = annotation, annot_names = annot_names,
-    loco_prs = loco_prs, prs_mask = prs_mask,
-    chunk_size = chunk_size, window_bp = window_bp, do_windows = do_windows,
-    max_window_chunks = max_window_chunks,
+    loco_prs = loco_prs,
+    chunk_size = chunk_size,
     genes = genes, max_gene_snps = max_gene_snps, min_gene_snps = min_gene_snps,
     alpha = alpha, kvik_summaries = kvik_summaries, acatv_mac = acatv_mac,
     collapse_mac = as.integer(collapse_mac),
@@ -280,9 +266,8 @@ sparrow <- function(filename, pheno, out_file,
     conditional = conditional,
     chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
 
-  files <- c(regions = out_file,
-             genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA,
-             windows = if (do_windows) paste0(out_file, ".windows") else NA)
+  files <- c(regions = if (is.null(genes)) out_file else NA,
+             genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA)
   invisible(list(files = files[!is.na(files)], traits = traits, n = n, info = res))
 }
 

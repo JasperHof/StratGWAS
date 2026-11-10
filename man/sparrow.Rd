@@ -18,11 +18,7 @@ sparrow(
   binary = FALSE,
   coher = FALSE,
   h2_without_prs = TRUE,
-  prs_mask = NULL,
-  do_windows = TRUE,
   chunk_size = 256,
-  window_bp = 1e+06,
-  max_window_chunks = 8,
   max_gene_snps = 512,
   min_gene_snps = 2,
   acatv_mac = 10,
@@ -42,8 +38,8 @@ sparrow(
 
 \item{pheno}{Data frame or file: FID, IID, then one column per phenotype.}
 
-\item{out_file}{Output prefix. Writes <out_file> (regions), <out_file>.genes and
-<out_file>.windows.}
+\item{out_file}{Output prefix. Writes <out_file>.genes (with \code{genes}), or <out_file>
+(chunks of \code{chunk_size} SNPs, without \code{genes}).}
 
 \item{covariates}{Optional data frame or file: FID, IID, then numeric covariates
 (an intercept is added automatically; do not include one).}
@@ -71,12 +67,7 @@ Must be on the same genome build as the .bim.}
 \item{h2_without_prs}{With \code{loco_prs}: estimate h2 from y (TRUE) and use y - LOCO
 only for p-values. Recommended; see the supplement.}
 
-\item{prs_mask}{Advanced. Categories x PRS sources; which full PRS is subtracted in
-the window pass. Default: 0 if h2_without_prs, else 1.}
-
-\item{do_windows}{Estimate ~1 Mb windows and report window-calibrated h2 (h2_adj).}
-
-\item{chunk_size, window_bp, max_window_chunks}{Region and window sizes.}
+\item{chunk_size}{Without \code{genes}: the genome is tested in chunks of this many SNPs.}
 
 \item{max_gene_snps, min_gene_snps}{Genes are split into blocks of at most
 \code{max_gene_snps} variants; genes with fewer than \code{min_gene_snps} are skipped.}
@@ -126,7 +117,7 @@ Estimates the heritability explained by genes / regions (per variant category)
 and tests it using a saddlepoint approximation. Phenotypes are matched to the
 genotypes by IID, covariates are regressed out of the phenotypes here (and out
 of the genotypes inside the C++ code), and all bookkeeping that used to be
-manual (cov_df, binary_raw, the logistic null model, prs_mask) is done automatically.
+manual (cov_df, binary_raw, the logistic null model) is done automatically.
 }
 \examples{
 \donttest{
