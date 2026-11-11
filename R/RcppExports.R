@@ -17,8 +17,8 @@ compute_maf_all <- function(filename) {
     .Call(`_StratGWAS_compute_maf_all`, filename)
 }
 
-stratgwas_run <- function(filename, pheno_mat, annotation = NULL, annot_names = NULL, loco_prs = NULL, chunk_size = 256L, genes = NULL, max_gene_snps = 512L, min_gene_snps = 2L, alpha = as.numeric( c(-1.0)), kvik_summaries = NULL, acatv_mac = 10, collapse_mac = 0L, h2_without_prs = TRUE, one_sided = TRUE, exact_ec = 10, covariates = NULL, cov_df = NA_real_, SPA = TRUE, spa_pval_threshold = NA_real_, binary = FALSE, binary_raw = NULL, binary_pi = NULL, coher = FALSE, gene_flank = 0, flank_maf = 0.01, refine_p = 0.05, conditional = FALSE, chr = NULL, out_file = "", batch_size = 64L, n_threads = 0L) {
-    .Call(`_StratGWAS_stratgwas_run`, filename, pheno_mat, annotation, annot_names, loco_prs, chunk_size, genes, max_gene_snps, min_gene_snps, alpha, kvik_summaries, acatv_mac, collapse_mac, h2_without_prs, one_sided, exact_ec, covariates, cov_df, SPA, spa_pval_threshold, binary, binary_raw, binary_pi, coher, gene_flank, flank_maf, refine_p, conditional, chr, out_file, batch_size, n_threads)
+stratgwas_run <- function(filename, pheno_mat, annotation = NULL, annot_names = NULL, loco_prs = NULL, chunk_size = 256L, genes = NULL, max_gene_snps = 512L, min_gene_snps = 2L, alpha = as.numeric( c(-1.0)), kvik_summaries = NULL, acatv_mac = 10, collapse_mac = 0L, h2_without_prs = TRUE, one_sided = TRUE, exact_ec = 10, covariates = NULL, cov_df = NA_real_, SPA = TRUE, binary = FALSE, binary_raw = NULL, binary_pi = NULL, coher = FALSE, gene_flank = 0, flank_maf = 0.01, refine_p = 0.05, conditional = FALSE, chr = NULL, out_file = "", batch_size = 64L, n_threads = 0L) {
+    .Call(`_StratGWAS_stratgwas_run`, filename, pheno_mat, annotation, annot_names, loco_prs, chunk_size, genes, max_gene_snps, min_gene_snps, alpha, kvik_summaries, acatv_mac, collapse_mac, h2_without_prs, one_sided, exact_ec, covariates, cov_df, SPA, binary, binary_raw, binary_pi, coher, gene_flank, flank_maf, refine_p, conditional, chr, out_file, batch_size, n_threads)
 }
 
 computeLDscoresFromBED <- function(file_prefix, geno_set) {
