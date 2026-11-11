@@ -1184,15 +1184,25 @@ static ExactSpaResult coher_grid_solve(double q, const std::vector<double>& v, c
         }
     } else {
         const std::vector<ExactTerm> none; const std::vector<double> nolam;
+        const bool gaus = br->gv > 0.0;
         auto pg = [&](double x, double& up, double& lw) {
             if (x > Gmax) { up = 0.0; lw = 1.0; return; }
             if (x < Gmin) { up = 1.0; lw = 0.0; return; }
+            if (gaus) {                              // > 40 SD from the mean: negligible
+                const double zz = (x - mG) / std::max(sdG, 1e-300);
+                if (zz > 40.0) { up = 0.0; lw = 1.0; return; }
+                if (zz < -40.0) { up = 1.0; lw = 0.0; return; }
+            }
             ExactSpaResult r = exact_spa_solve(x, none, nolam, nolam, 0.0, br);
             if (r.converged) { up = r.p_up; lw = r.p_lo; }
             else { const double z = (x - mG) / std::max(sdG, 1e-300);
                    up = 0.5 * std::erfc(z / std::sqrt(2.0)); lw = 1.0 - up; }
         };
-        const long stride = 8;
+        // the tail of G is evaluated every `stride` lattice points and interpolated on the log
+        // scale; with a Gaussian part (sd sqrt(gv)) it is smooth on that scale, so the stride can
+        // grow to 5% of sqrt(gv) (at most 256 points)
+        long stride = 8;
+        if (gaus) stride = std::max(8L, std::min(256L, (long) std::floor(0.05 * std::sqrt(br->gv) / h)));
         double lu0 = 0, ll0 = 0, lu1 = 0, ll1 = 0; long k0 = LONG_MIN;
         for (long k = lo; k <= hi; ++k) {
             const double pk = pm[k]; if (pk < 1e-300) continue;
@@ -3100,32 +3110,38 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                     };
                     // UNCERTAINTY OF s. With few variants s_hat is very noisy (and often 0 when s > 0); a
                     // plug-in s is then anti-conservative (x30 at p = 1e-3 for a 6-variant gene). Flagged
-                    // tests (p < refine_p) average the p-value over s = max(0, s_hat + SE z_k), z_k the 16
-                    // quantiles (k - 1/2) / 16 of t_{m_c - 1}, SE from the trace formula at max(s_hat, 0).
+                    // tests (p < refine_p) average the p-value over s = max(0, s_hat + SE z_k), z_k the 8
+                    // quantiles (k - 1/2) / 8 of t_{m_c - 1}, SE from the trace formula (skipped if negligible).
                     const double gplug = gvar;
-                    auto bin_test_re = [&](const std::vector<float>& cp) -> ExactSpaResult {
-                        gvar = gplug;
-                        ExactSpaResult r0 = bin_test(cp);
+                    auto bin_mix = [&](const std::vector<float>& cp, ExactSpaResult r0) -> ExactSpaResult {
                         if (!(r0.converged && bmn > 0.0 && 2.0 * std::min(r0.p_up, r0.p_lo) < refine_p)) return r0;
                         get_M(c);
                         const T2& t2s = get_t2(c, cb.rand_t[pi]);
                         const double sp = std::max(s2hat, 0.0);
                         const double se = std::sqrt(std::max(0.0, 2.0 * (t2s.tau0 + t2s.tau1 * sp + tau2c[c] * sp * sp)));
                         if (!(se > 0.0) || !std::isfinite(se)) return r0;
-                        // quantiles (k + 1/2) / 16 of a t distribution with nu = (variants in c) - 1 degrees of
+                        // quantiles (k + 1/2) / 8 of a t distribution with nu = (variants in c) - 1 degrees of
                         // freedom (normal for large components): with few variants s_hat is roughly a
                         // scaled chi-square with few df and the trace-formula SE alone is too small
                         const int mc = off[c + 1] - off[c];
                         const double nut = std::max(1.0, (double) mc - 1.0);
-                        double ZQ[16];
-                        for (int k = 8; k < 16; ++k) {
-                            const double pt = 2.0 * (1.0 - (k + 0.5) / 16.0);      // two-sided tail
+                        double ZQ[8];
+                        for (int k = 4; k < 8; ++k) {
+                            const double pt = 2.0 * (1.0 - (k + 0.5) / 8.0);       // two-sided tail
                             double lo = 0.0, hi = 1.0;
                             while (t_two_sided_p(hi, nut) > pt && hi < 1e6) hi *= 2.0;
                             for (int it = 0; it < 60; ++it) { const double md = 0.5 * (lo + hi); if (t_two_sided_p(md, nut) > pt) lo = md; else hi = md; }
-                            ZQ[k] = 0.5 * (lo + hi); ZQ[15 - k] = -ZQ[k];
+                            ZQ[k] = 0.5 * (lo + hi); ZQ[7 - k] = -ZQ[k];
                         }
-                        const int NZ = 16; double pu = 0.0, pl = 0.0; int ok = 0;
+                        const int NZ = 8; double pu = 0.0, pl = 0.0; int ok = 0;
+                        // (c) negligible uncertainty: the spread of the Gaussian variance over the
+                        // quantiles is < 1% of the total null variance -> plug-in p
+                        {
+                            double vB = 0.0;
+                            for (int i = 0; i < n; ++i) { const double ci = dl * wv[i]; vB += ci * ci * cp[i] * (1.0 - cp[i]); }
+                            const double ghi = std::max(0.0, s2hat + se * ZQ[NZ - 1]) * bmn, glo = std::max(0.0, s2hat + se * ZQ[0]) * bmn;
+                            if (ghi - glo < 0.01 * (vB + gplug)) return r0;
+                        }
                         for (int k = 0; k < NZ; ++k) {
                             const double z = ZQ[k];
                             gvar = std::max(0.0, s2hat + se * z) * bmn;
@@ -3138,7 +3154,12 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         r0.p_up = pu / NZ; r0.p_lo = pl / NZ; r0.exact = false;
                         return r0;
                     };
-                    ExactSpaResult er = bin_test_re(cb.cpi[pi]);
+                    auto bin_test_re = [&](const std::vector<float>& cp) -> ExactSpaResult {
+                        gvar = gplug;
+                        return bin_mix(cp, bin_test(cp));
+                    };
+                    ExactSpaResult er = bin_test(cb.cpi[pi]);           // plug-in s; averaged below on the final probabilities
+                    bool refitted = false;
                     // REFIT. Genetic effects of the BACKGROUND (other components of the gene, flank) on
                     // the random trait: its carriers of causal common alleles are more often cases,
                     // so case status is not exchangeable given the fixed trait alone. The null case
@@ -3167,8 +3188,9 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                             for (int i = 0; i < n; ++i) bb[i] = std::round((Y(i, trr) - (double) cy[i]) / dl);
                             logit_refit(cb.cpi[pi].data(), bb, cov, cploc);
                         }
-                        if (!cploc.empty()) { ExactSpaResult e2 = bin_test_re(cploc); if (e2.converged) er = e2; }
+                        if (!cploc.empty()) { ExactSpaResult e2 = bin_test_re(cploc); if (e2.converged) { er = e2; refitted = true; } }
                     }
+                    if (!refitted && er.converged) er = bin_mix(cb.cpi[pi], er);
                     if (er.converged) {
                         cr.p_spa[c][pi] = std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo));
                         cr.spa_used[c][pi] = 4;
@@ -4274,7 +4296,7 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
-    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice, RANDOM-EFFECTS null (trait-2 heritability in the tested component, s averaged over t_{m-1} quantiles for p < refine_p); quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < refine_p; conditional on lead variants (p<1e-4) whenever present [quant: projected + re-estimated, spa_used 8; binary refit on top-10 background variants, no threshold]; univariate conditional=TRUE (spa_used 8/9); capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, scores from delta (b - pi_LOCO) (not y - PRS), exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, lead r2 < 0.99, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes; no window pass)\n";
+    Rcout << "StratGWAS C++ build: " << __DATE__ << " " << __TIME__ << "   (p-values: one-sided VC / two-sided coher [conditional REML-GLS test; binary exact+lattice, exact Bernoulli rest, mode-centred lattice, RANDOM-EFFECTS null (trait-2 heritability in the tested component, s averaged over 8 t_{m-1} quantiles for p < refine_p); quantitative: joint nuisance covariates + delta method for trait-1 components], gene_flank (MAF-filtered flank component; two-stage: REML-GLS / background refit for p < refine_p; conditional on lead variants (p<1e-4) whenever present [quant: projected + re-estimated, spa_used 8; binary refit on top-10 background variants, no threshold]; univariate conditional=TRUE (spa_used 8/9); capped cross-covariances, fewer NA), binary LOCO: null P(case) refitted on the LOCO PRS, scores from delta (b - pi_LOCO) (not y - PRS), exact binary SPA + lattice, binary_pi, ACAT-V via KVIK, h2 without PRS, collapse_mac, lead r2 < 0.99, no cumulant fallback (binary: NA if exact fails), coher vg_t1/vg_t2 in .genes; no window pass)\n";
     // alpha may be a vector: alphas[0] is the primary alpha (vg, se, h2); with
     // SPA and >1 value, p_spa is the ACAT over alphas.
     std::vector<double> alphas;
