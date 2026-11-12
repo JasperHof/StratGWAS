@@ -86,7 +86,8 @@ sparrow <- function(filename, pheno, out_file,
                     binary = FALSE, coher = FALSE,
                     h2_without_prs = TRUE, chunk_size = 256,
                     max_gene_snps = 512, min_gene_snps = 2,
-                    acatv_mac = 10, collapse_mac = 0, spa = TRUE, chr = NULL,
+                    acatv_mac = 10, collapse_mac = 5, min_category_mac = 5,
+                    spa = TRUE, chr = NULL,
                     gene_flank = 0, flank_maf = 0.01, refine_p = 0.05, conditional = FALSE,
                     n_threads = 0, batch_size = 64) {
 
@@ -258,13 +259,14 @@ sparrow <- function(filename, pheno, out_file,
     chunk_size = chunk_size,
     genes = genes, max_gene_snps = max_gene_snps, min_gene_snps = min_gene_snps,
     alpha = alpha, kvik_summaries = kvik_summaries, acatv_mac = acatv_mac,
-    collapse_mac = as.integer(collapse_mac),
+    collapse_mac = as.integer(collapse_mac), min_category_mac = as.integer(min_category_mac),
     h2_without_prs = h2_without_prs,
     covariates = C, cov_df = cov_df,
     SPA = spa, binary = binary, binary_raw = binary_raw, binary_pi = binary_pi, coher = coher,
     gene_flank = gene_flank, flank_maf = flank_maf, refine_p = refine_p,
     conditional = conditional,
-    chr = chr, out_file = out_file, batch_size = batch_size, n_threads = n_threads)
+    chr = chr, out_file = out_file, batch_size = batch_size, 
+    n_threads = n_threads)
 
   files <- c(regions = if (is.null(genes)) out_file else NA,
              genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA)

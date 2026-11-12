@@ -313,7 +313,8 @@ static void standardize_capture_maf(GenoMat& X, std::vector<float>& maf) {
 static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
                           int i0, int i1, Cell& cell,
                           const std::vector<int>* cat_id = 0,
-                          int collapse_mac = 0, int collapse_n = 5, int car_max = 0) {
+                          int collapse_mac = 0, int collapse_n = 5, int car_max = 0,
+                          int min_category_mac = 0) {
     cell = Cell(); cell.i0 = -1;
     int m = i1 - i0;
     int n_keep = (int) keep.size();
@@ -345,6 +346,7 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
     std::vector< std::vector<float> > out_cols;   // each length n_keep (raw scale)
     std::vector<int>  out_cat, out_bim;           // per output column: category id, .bim index
     std::map<int, std::vector<float> > grp;       // category -> pseudo-marker being built
+    std::map<int, int> category_mac;              // category -> sum of individual variant MACs
     cell.omaf.assign(m, 0.f); cell.ocat.assign(m, -1);
 
     for (int j = 0; j < m; ++j) {
@@ -358,6 +360,7 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
         int cid = (i0 + j >= 0 && i0 + j < ncat_all) ? (*cat_id)[i0 + j] : -1;
         double f = (nv > 0) ? s / (2.0 * nv) : 0.0; if (f > 0.5) f = 1.0 - f;
         cell.omaf[j] = (float) f; cell.ocat[j] = cid;
+        category_mac[cid] += mac;
 
         if (mac > collapse_mac) {
             std::vector<float> col(n_keep);
@@ -372,8 +375,20 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
             }
         }
     }
+    // Remove all individual columns belonging to categories with insufficient aggregate MAC.
+    if (min_category_mac > 0) {
+        for (int k = (int) out_cols.size() - 1; k >= 0; --k) {
+            if (category_mac[out_cat[k]] < min_category_mac) {
+                out_cols.erase(out_cols.begin() + k);
+                out_cat.erase(out_cat.begin() + k);
+                out_bim.erase(out_bim.begin() + k);
+            }
+        }
+    }
+
     const int n_ind = (int) out_cols.size();
     for (std::map<int, std::vector<float> >::iterator it = grp.begin(); it != grp.end(); ++it) {
+        if (min_category_mac > 0 && category_mac[it->first] < min_category_mac) continue;
         out_cols.push_back(it->second); out_cat.push_back(it->first); out_bim.push_back(-1);
     }
 
@@ -1576,6 +1591,7 @@ struct ChunkContext {
     // collapsing (SAIGE-GENE+ style): variants with MAC <= collapse_mac are summed into one
     // pseudo-marker per category of a tested unit (0 = off). Flanks are never collapsed.
     int collapse_mac = 0;
+    int min_category_mac = 0;
     // exact per-variant binary saddlepoint (needs the raw 0/1 phenotypes in braw)
     bool bin_exact = false;
     int  car_max = 0;                            // carriers recorded for columns with <= car_max
@@ -2104,7 +2120,8 @@ static bool read_block(const ChunkContext& ctx, int lo, int hi, Cell& c, bool co
     const bool coll = collapse && ctx.collapse_mac > 0;
     if (!read_cell_idx(ctx.bed, ctx.geno_keep, lo, hi, c,
                        coll ? &ctx.snp_cat : 0, coll ? ctx.collapse_mac : 0, 5,
-                       ctx.bin_exact ? ctx.car_max : 0)) return false;
+                       ctx.bin_exact ? ctx.car_max : 0,
+                       coll ? ctx.min_category_mac : 0)) return false;
     if (ctx.covZ.cols() > 0) project_covariates(c.X, ctx.covZ, ctx.covM);
     apply_alpha(c.X, c.maf, ctx.alpha, 0, lo);
     return true;
@@ -4274,7 +4291,8 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          Rcpp::NumericVector alpha = Rcpp::NumericVector::create(-1.0),
                          Rcpp::Nullable<Rcpp::CharacterVector> kvik_summaries = R_NilValue,
                          double acatv_mac = 10,
-                         int collapse_mac = 0,
+                         int collapse_mac = 5,
+                         int min_category_mac = 5,
                          bool h2_without_prs = true,
                          bool one_sided = true,
                          double exact_ec = 10,
@@ -4311,7 +4329,9 @@ Rcpp::List stratgwas_run(const std::string& filename,
     ChunkContext ctx = setup_context(filename, pheno_mat, alphas[0], covariates, annotation, annot_names);
     ctx.alphas = alphas;
     if (collapse_mac < 0) stop("collapse_mac must be >= 0");
+    if (min_category_mac < 0) stop("min_category_mac must be >= 0");
     ctx.collapse_mac = collapse_mac;
+    ctx.min_category_mac = min_category_mac;
     if (collapse_mac > 0)
         Rcout << "Collapsing: per tested unit and category, variants with MAC <= " << collapse_mac
               << " are summed into one pseudo-marker (ACAT-V still uses them individually).\n";
