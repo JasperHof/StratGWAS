@@ -996,7 +996,7 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
     if (br && br->c.empty() && !(br->gv > 0.0)) br = 0;
     const bool dense = !lam.empty() || br;
     // per term: kept atoms, minimum, observed value
-    double sum_mn = 0.0, Dobs = 0.0, dropped = 0.0; bool have_obs = !dense;
+    double sum_mn = 0.0, Dobs = 0.0, dropped = 0.0; bool have_obs = !dense, obs_ok = true;
     std::vector<double> mn(T.size(), 0.0);
     for (size_t j = 0; j < T.size(); ++j) {
         double m = 1e300;
@@ -1004,7 +1004,7 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
             if (T[j].lp[s] >= LPMIN || (int) s == T[j].obs) m = std::min(m, T[j].v[s]);
         if (!(m < 1e300)) return res;
         mn[j] = m; sum_mn += m;
-        if (T[j].obs < 0 || T[j].obs >= (int) T[j].v.size()) have_obs = false;
+        if (T[j].obs < 0 || T[j].obs >= (int) T[j].v.size()) { have_obs = false; obs_ok = false; }
         else Dobs += T[j].v[T[j].obs] - m;
     }
     const double Dq = q - C - sum_mn;                    // threshold for D (+ G)
@@ -1035,13 +1035,41 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
     for (size_t j = 0; j < T.size(); ++j) for (size_t s = 0; s < T[j].v.size(); ++s)
         if (T[j].lp[s] >= LPMIN) scale = std::max(scale, T[j].v[s] - mn[j]);
     if (!(R > 0.0)) R = 1e-9 * std::max(scale, 1e-300);
-    const double h = R / M;
-    long Kobs = M;
+    // The lattice spacing must be small relative to the spread of the continuous part G:
+    // rounding the observed configuration by one bin shifts the threshold of G by h, and when
+    // h >> sd(G) (e.g. a dense part with tiny weights under one heritability model) the tail
+    // probability collapses (p ~ 1e-40 for a true p ~ 0.01). Refine the lattice to h <= sd(G) / 8,
+    // within a cost cap; if that is not possible, report failure so the caller keeps the
+    // saddlepoint result.
+    long Mfine = M;
+    if (dense && !bounded && sdG > 0.0) {
+        long natoms = 0;
+        for (size_t j = 0; j < T.size(); ++j) natoms += (long) T[j].v.size();
+        const double need = std::ceil(8.0 * R / sdG);
+        const double cap = std::min(4194304.0, 4e8 / std::max(1L, natoms));
+        if (need > (double) M) {
+            if (need > cap) return res;                  // too coarse: not converged
+            Mfine = (long) need;
+        }
+    }
+    const double h = R / Mfine;
+    long Kobs = Mfine;
     if (!dense && have_obs) {
         Kobs = 0;
         for (size_t j = 0; j < T.size(); ++j) Kobs += std::llround((T[j].v[T[j].obs] - mn[j]) / h);
     }
-    const long Mc = std::max<long>(M, Kobs) + 1;         // bins 0..Mc-1, then overflow
+    // With a dense part, anchor the threshold on the OBSERVED configuration: each atom is rounded
+    // to the lattice, so the observed configuration lands at Kr * h instead of its exact value
+    // Dobs. Shifting G's threshold by (Dobs - Kr h) makes the observed configuration exact, which
+    // matters when it lies within a bin of an edge of G's support (e.g. G <= 0: a rounding step
+    // across the edge sets its tail to exactly 0).
+    double xshift = 0.0;
+    if (dense && obs_ok) {
+        long Kr = 0;
+        for (size_t j = 0; j < T.size(); ++j) Kr += std::llround((T[j].v[T[j].obs] - mn[j]) / h);
+        xshift = Dobs - (double) Kr * h;
+    }
+    const long Mc = std::max<long>(Mfine, Kobs) + 1;     // bins 0..Mc-1, then overflow
     std::vector<double> pm(Mc, 0.0), nx(Mc, 0.0);
     pm[0] = 1.0; long top = 0; double ovf = 0.0;
     std::vector<long> ak; std::vector<double> ap;
@@ -1088,10 +1116,18 @@ static ExactSpaResult exact_grid_solve(double q, const std::vector<ExactTerm>& T
             const long kb = (k / stride) * stride;
             if (kb != k0) {
                 double u0, l0, u1, l1;
-                pg(Dq - kb * h, u0, l0); pg(Dq - (kb + stride) * h, u1, l1);
+                pg(Dq - xshift - kb * h, u0, l0); pg(Dq - xshift - (kb + stride) * h, u1, l1);
                 lu0 = std::log(std::max(u0, 1e-300)); ll0 = std::log(std::max(l0, 1e-300));
                 lu1 = std::log(std::max(u1, 1e-300)); ll1 = std::log(std::max(l1, 1e-300));
                 k0 = kb;
+            }
+            // log-linear interpolation only where G's tail is smooth over the stride; near the
+            // edge of G's support (e.g. G <= 0, tail exactly 0 for x >= 0) or where it changes
+            // steeply, interpolating towards 1e-300 wipes out real mass: evaluate directly.
+            if (std::abs(lu1 - lu0) > 0.7 || std::abs(ll1 - ll0) > 0.7) {
+                double u, l; pg(Dq - xshift - k * h, u, l);
+                pu += pk * u; pl += pk * l;
+                continue;
             }
             const double f = (double) (k - kb) / stride;
             pu += pk * std::exp(lu0 + f * (lu1 - lu0));
@@ -1228,6 +1264,14 @@ static ExactSpaResult coher_grid_solve(double q, const std::vector<double>& v, c
                 lu0 = std::log(std::max(u0, 1e-300)); ll0 = std::log(std::max(l0, 1e-300));
                 lu1 = std::log(std::max(u1, 1e-300)); ll1 = std::log(std::max(l1, 1e-300));
                 k0 = kb;
+            }
+            // log-linear interpolation only where G's tail is smooth over the stride; near the
+            // edge of G's support (e.g. G <= 0, tail exactly 0 for x >= 0) or where it changes
+            // steeply, interpolating towards 1e-300 wipes out real mass: evaluate directly.
+            if (std::abs(lu1 - lu0) > 0.7 || std::abs(ll1 - ll0) > 0.7) {
+                double u, l; pg(x0 - (k - L0) * h, u, l);
+                pu += pk * u; pl += pk * l;
+                continue;
             }
             const double f = (double) (k - kb) / stride;
             pu += pk * std::exp(lu0 + f * (lu1 - lu0));
