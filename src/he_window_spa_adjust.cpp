@@ -249,7 +249,7 @@ static void calibrate_bed_reader(BedReader& br, const std::string& prefix,
 // (needed to look up categories for the middle window).
 struct Cell {
     GenoMat X;                     // n_keep x m, standardized (unweighted)
-    std::vector<float> maf;        // per-column folded MAF (0 for collapsed pseudo-markers)
+    std::vector<float> maf;        // per-column folded MAF (collapsed pseudo-markers: the MAXIMUM MAF of their variants)
     int i0;                        // .bim index of column 0 (-1 if empty)
     std::vector<int> cat;          // per-column category id (only set when collapsing;
                                    // empty -> columns map 1:1 to .bim via i0)
@@ -337,15 +337,17 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
 
     // -------- collapsing (as SAIGE-GENE+): every variant with MAC <= collapse_mac --
     // is added (sum of MINOR-allele dosages) into ONE pseudo-marker per category of
-    // the range. Variants with MAC > collapse_mac stay individual. A pseudo-marker has
-    // MAF 0 here, so it is exempt from alpha weighting (its frequency is not defined),
-    // and .bim index -1. The original variants are kept in omaf / ocat.
+    // the range. Variants with MAC > collapse_mac stay individual. A pseudo-marker is
+    // given the MAXIMUM MAF of the variants it contains, so that alpha weights it like
+    // one variant of that frequency (as SAIGE-GENE+ weights its collapsed marker), and
+    // .bim index -1. The original variants are kept in omaf / ocat.
     // collapse_n is no longer used (kept in the signature for compatibility).
     (void) collapse_n;
     int ncat_all = (int) cat_id->size();
     std::vector< std::vector<float> > out_cols;   // each length n_keep (raw scale)
     std::vector<int>  out_cat, out_bim;           // per output column: category id, .bim index
     std::map<int, std::vector<float> > grp;       // category -> pseudo-marker being built
+    std::map<int, float> grp_maxf;                // category -> maximum MAF of its collapsed variants
     std::map<int, int> category_mac;              // category -> sum of individual variant MACs
     cell.omaf.assign(m, 0.f); cell.ocat.assign(m, -1);
 
@@ -369,6 +371,7 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
         } else if (mac > 0) {
             std::vector<float>& acc = grp[cid];
             if (acc.empty()) acc.assign(n_keep, 0.f);
+            float& mf = grp_maxf[cid]; if ((float) f > mf) mf = (float) f;
             for (int i = 0; i < n_keep; ++i) {
                 float g = block(i, j);
                 if (g >= 0.f) acc[i] += (flip ? (2.f - g) : g);   // additive minor dosage
@@ -402,7 +405,7 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
     for (int k = 0; k < nout; ++k)
         for (int i = 0; i < n_keep; ++i) X(i, k) = out_cols[k][i];
     standardize_capture_maf(X, cell.maf);
-    for (int k = n_ind; k < nout; ++k) cell.maf[k] = 0.f;   // pseudo-markers: exempt from alpha
+    for (int k = n_ind; k < nout; ++k) cell.maf[k] = grp_maxf[out_cat[k]];   // pseudo-markers: maximum MAF of their variants (alpha weight)
     cell.X = std::move(X);
     cell.cat = out_cat;
     cell.bim = out_bim;
@@ -2120,7 +2123,7 @@ struct ChunkDataA {
     int m_flank, K;
     GenoMat V;
     std::vector<double> cj;
-    std::vector<float> colmaf;         // MAF of every column of V (0 = pseudo-marker);
+    std::vector<float> colmaf;         // MAF of every column of V (pseudo-marker: max MAF);
                                        // lets V be re-weighted to another alpha by a
                                        // pure column rescaling, with no second read
     std::vector<int> colbim;           // .bim index of every CATEGORY column (-1 for
