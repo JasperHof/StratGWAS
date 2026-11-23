@@ -51,6 +51,13 @@
 #'   binary traits: the null case probabilities are refitted on the lead variants and the
 #'   background score. Tests rare-variant signal beyond the nearby strong common associations;
 #'   best combined with `gene_flank` and without `kvik_summaries` (ACAT-V is not conditional).
+#' @param burden_groups Optional named list of extra burden tests on groups of categories, e.g.
+#'   `list(deleterious = c("pLoF", "damaging_missense", "spliceai2_gt040"))`. Each group (at least
+#'   two category names from `annot_names`) gets one burden test per alpha over the union of its
+#'   variants; the p-value (ACAT over alpha) is reported as its own row (category = group name) and
+#'   enters the gene-level ACAT like a category. Every category also has its own burden test, which
+#'   is part of its omnibus p-value. Burden tests are univariate and marginal: not used with
+#'   `coher = TRUE` or `conditional = TRUE`. NULL = no groups (default).
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -89,6 +96,7 @@ sparrow <- function(filename, pheno, out_file,
                     acatv_mac = 10, collapse_mac = 5, min_category_mac = 5,
                     spa = TRUE, chr = NULL,
                     gene_flank = 0, flank_maf = 0.01, refine_p = 0.05, conditional = FALSE,
+                    burden_groups = NULL,
                     n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
@@ -214,6 +222,26 @@ sparrow <- function(filename, pheno, out_file,
     if (length(annot_names) != ncol(annotation)) stop("annot_names must have one name per annotation column")
   }
 
+  # ---- burden groups: category names -> 0-based annotation columns ---------------------
+  bg <- NULL
+  if (!is.null(burden_groups)) {
+    if (!is.list(burden_groups) || is.null(names(burden_groups)) || any(names(burden_groups) == ""))
+      stop("burden_groups must be a named list of category-name vectors")
+    if (is.null(annotation)) stop("burden_groups needs an annotation")
+    if (any(names(burden_groups) %in% c(annot_names, "ACAT")))
+      stop("burden_groups names must differ from the category names and from 'ACAT'")
+    bg <- lapply(names(burden_groups), function(g) {
+      cats <- unique(as.character(burden_groups[[g]]))
+      bad <- setdiff(cats, annot_names)
+      if (length(bad)) stop("burden_groups '", g, "': unknown categories: ", paste(bad, collapse = ", "))
+      if (length(cats) < 2) stop("burden_groups '", g, "' needs at least two categories")
+      as.integer(match(cats, annot_names) - 1L)
+    })
+    names(bg) <- names(burden_groups)
+    if (coher || conditional)
+      message("burden_groups are not used with coher = TRUE or conditional = TRUE (burden tests are marginal)")
+  }
+
   # ---- genes ------------------------------------------------------------------------
   if (!is.null(genes)) {
     if (is.character(genes) && length(genes) == 1) {
@@ -265,8 +293,8 @@ sparrow <- function(filename, pheno, out_file,
     SPA = spa, binary = binary, binary_raw = binary_raw, binary_pi = binary_pi, coher = coher,
     gene_flank = gene_flank, flank_maf = flank_maf, refine_p = refine_p,
     conditional = conditional,
-    chr = chr, out_file = out_file, batch_size = batch_size, 
-    n_threads = n_threads)
+    chr = chr, out_file = out_file, batch_size = batch_size,
+    n_threads = n_threads, burden_groups = bg)
 
   files <- c(regions = if (is.null(genes)) out_file else NA,
              genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA)
