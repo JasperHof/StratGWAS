@@ -2670,8 +2670,80 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
         return cov;
     };
     // logistic refit of null case probabilities:  logit pi = logit p0 + a + sum_k d_k cov_k
+    // The covariates are centred and orthonormalised first (near-collinear ones dropped): the
+    // fitted probabilities do not depend on this, but Newton's method does. Each Newton step is
+    // halved until the log-likelihood does not decrease, and the fit is accepted only if it
+    // converged (Newton decrement), the fitted probabilities sum to the number of cases (the
+    // score equation of the intercept) and the Bernoulli variance is at least half of that of p0.
+    // Without these safeguards, a diverging fit could put (nearly) all probabilities at 0 or 1;
+    // the variance of the exact test then collapsed and the conditional p values became ~1e-20.
     auto logit_refit = [&](const float* p0, const Eigen::VectorXd& bb, const std::vector<Eigen::VectorXd>& cov,
                            std::vector<float>& out) -> bool {
+        out.clear();
+        if (cov.empty()) return false;
+        Eigen::MatrixXd Dm(n, 1 + (int) cov.size()); Dm.col(0).setOnes(); int pq = 1;
+        for (size_t k = 0; k < cov.size(); ++k) {
+            if (cov[k].size() != n || !cov[k].allFinite()) continue;
+            Eigen::VectorXd r = cov[k].array() - cov[k].mean();
+            const double z2 = r.squaredNorm();
+            if (!(z2 > 0.0)) continue;
+            for (int it2 = 0; it2 < 2; ++it2)
+                for (int q2 = 1; q2 < pq; ++q2) r -= Dm.col(q2) * (Dm.col(q2).dot(r) / (double) n);
+            if (!(r.squaredNorm() > 1e-8 * z2)) continue;                 // (near-)collinear: drop
+            Dm.col(pq++) = r * std::sqrt((double) n / r.squaredNorm());     // unit mean square
+        }
+        if (pq == 1) return false;
+        Dm.conservativeResize(n, pq);
+        Eigen::VectorXd l0(n);
+        double v0 = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double q = std::min(std::max((double) p0[i], 1e-8), 1.0 - 1e-8);
+            l0[i] = std::log(q / (1.0 - q)); v0 += q * (1.0 - q);
+        }
+        auto loglik = [&](const Eigen::VectorXd& eta) -> double {
+            double s = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const double e = eta[i];
+                s += bb[i] * e - (e > 0.0 ? e + std::log1p(std::exp(-e)) : std::log1p(std::exp(e)));
+            }
+            return s;
+        };
+        Eigen::VectorXd th = Eigen::VectorXd::Zero(pq), eta = l0;
+        double ll = loglik(eta);
+        bool conv = false;
+        for (int it = 0; it < 50; ++it) {
+            Eigen::VectorXd pv(n), wv2(n);
+            for (int i = 0; i < n; ++i) { pv[i] = 1.0 / (1.0 + std::exp(-eta[i])); wv2[i] = pv[i] * (1.0 - pv[i]); }
+            const Eigen::VectorXd gr = Dm.transpose() * (bb - pv);
+            const Eigen::MatrixXd H = Dm.transpose() * wv2.asDiagonal() * Dm;
+            Eigen::LDLT<Eigen::MatrixXd> ld(H);
+            if (ld.info() != Eigen::Success) return false;
+            const Eigen::VectorXd st = ld.solve(gr);
+            if (!st.allFinite()) return false;
+            if (gr.dot(st) < 1e-9) { conv = true; break; }                 // Newton decrement
+            double sc = 1.0; bool acc = false;
+            Eigen::VectorXd thn, etan; double lln = ll;
+            for (int h = 0; h < 40; ++h) {                                  // step halving
+                thn = th + sc * st; etan = l0 + Dm * thn; lln = loglik(etan);
+                if (std::isfinite(lln) && lln >= ll - 1e-12 * std::abs(ll)) { acc = true; break; }
+                sc *= 0.5;
+            }
+            if (!acc) return false;
+            th = thn; eta = etan; ll = lln;
+        }
+        if (!conv || !th.allFinite()) return false;
+        out.resize(n);
+        double sp = 0.0, sb = 0.0, vv = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double pi = std::min(std::max(1.0 / (1.0 + std::exp(-eta[i])), 1e-8), 1.0 - 1e-8);
+            out[i] = (float) pi; sp += pi; sb += bb[i]; vv += pi * (1.0 - pi);
+        }
+        if (std::abs(sp - sb) > 1e-3 * sb + 1.0 || vv < 0.5 * v0) { out.clear(); return false; }
+        return true;
+    };
+    // DEBUG (SPARROW_DEBUG_REFIT): the previous refit (plain Newton, no safeguards), for comparison
+    auto logit_refit_old = [&](const float* p0, const Eigen::VectorXd& bb, const std::vector<Eigen::VectorXd>& cov,
+                               std::vector<float>& out) -> bool {
         out.clear();
         if (cov.empty()) return false;
         const int pq = 1 + (int) cov.size();
@@ -3698,7 +3770,19 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                         for (int i = 0; i < n; ++i) bbv[i] = (double) bb[i];
                         const std::vector<Eigen::VectorXd> cov = refit_covs(c, t, bg_score(c, sigma, U.col(t)));
                         std::vector<float> pin;
-                        if (logit_refit(bx.PiF.col(t).data(), bbv, cov, pin)) {
+                        const bool fit_ok = logit_refit(bx.PiF.col(t).data(), bbv, cov, pin);
+                        if (std::getenv("SPARROW_DEBUG_REFIT")) {                          // DEBUG
+                            auto summ = [&](const std::vector<float>& pp, double& sp, double& vv, int& ncl) {
+                                sp = 0.0; vv = 0.0; ncl = 0;
+                                for (size_t i = 0; i < pp.size(); ++i) { sp += pp[i]; vv += (double) pp[i] * (1.0 - (double) pp[i]); if (pp[i] <= 1e-7f || pp[i] >= 1.0f - 1e-7f) ++ncl; }
+                                vv *= bx.delta[t] * bx.delta[t] / n;
+                            };
+                            std::vector<float> pold; const bool old_ok = logit_refit_old(bx.PiF.col(t).data(), bbv, cov, pold);
+                            double s1, v1, s2, v2; int c1, c2; summ(pin, s1, v1, c1); summ(pold, s2, v2, c2);
+                            std::fprintf(stderr, "REFITDBG c=%d t=%d ncov=%d cases=%.0f vbar0=%.3g | new ok=%d sum_pi=%.1f vbar=%.3g n_clamped=%d | old ok=%d sum_pi=%.1f vbar=%.3g n_clamped=%d\n",
+                                         c, t, (int) cov.size(), bx.ncase[t], bx.vbar[t], (int) fit_ok, s1, v1, c1, (int) old_ok, s2, v2, c2);
+                        }
+                        if (fit_ok) {
                             const Eigen::Map<const Eigen::VectorXf> pmap(pin.data(), n);
                             const Eigen::VectorXd upi2 = (cd.V.transpose() * pmap).cast<double>();
                             double vb = 0.0;
@@ -3713,6 +3797,9 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                             }
                         }
                     }
+                    if (std::getenv("SPARROW_DEBUG_REFIT"))                                // DEBUG
+                        std::fprintf(stderr, "CALLERDBG c=%d t=%d p_first=%.3g haslead=%d p_final=%.3g spa_used=%d\n",
+                                     c, t, one_sided ? er.p_up : std::min(1.0, 2.0 * std::min(er.p_up, er.p_lo)), (int) haslead, pe, used);
                     cr.p_spa[c][t] = pe; cr.spa_used[c][t] = used;
                     continue;
                 }
