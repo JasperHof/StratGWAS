@@ -2158,6 +2158,10 @@ struct ChunkResultA {
     // ACAT-V p-values (p_acv). p_spa then holds the omnibus of all of them.
     std::vector< std::vector< std::vector<double> > > p_acatv;
     std::vector< std::vector<double> > p_vc, p_acv;
+    // burden test (univariate association passes): per alpha [cat][trait][alpha], and the
+    // ACAT over alphas [cat][trait]. p_spa then also includes the burden p-values.
+    std::vector< std::vector< std::vector<double> > > p_bur;
+    std::vector< std::vector<double> > p_burc;
 };
 
 // Read a SNP index range, project covariates, apply alpha; return false on error.
@@ -2399,6 +2403,9 @@ static void build_geom(const ChunkDataA& cd, int cov_df, bool spa, bool binary,
 static double g_refine_p = 0.05;
 // univariate tests: recompute flagged tests (p < refine_p) conditional on lead variants
 static bool g_cond_lead = false;
+// per-category burden test in the omnibus p-value (univariate, not with conditional = TRUE);
+// switched off with the environment variable SPARROW_NO_BURDEN
+static bool g_burden = true;
 static bool g_coher_bin_re = true;      // binary co-heritability: random-effects null (trait 2 heritable at the gene)
 // the conditional recomputation calls test_chunk_annot on the projected data: one level only
 static thread_local int tl_refine_depth = 0;
@@ -3915,6 +3922,143 @@ static double acatv_p(const ChunkDataA& cd, size_t qcat,
     return acat_combine(pv, pw);
 }
 
+// ---------------------------------------------------------------------------
+// Burden test for one category of one unit, at one alpha.
+//
+// The burden genotype is the sum of the category's columns of V at that alpha, each
+// oriented to the minor allele:  c = sum_j s_j V_j,  s_j = sign of the third moment of V_j
+// (a standardised count of the minor allele is right-skewed). V_j is the standardised
+// genotype times sqrt([2f(1-f)]^(1+alpha)), so the burden weights are the square roots
+// of the per-variant variances of the variance-component model: alpha = 0 gives the
+// plain count of minor alleles, alpha = -1 weights each variant by 1 / sd.
+//
+// Quantitative traits: score  T = c'y,  Var(T) = Vp ||c||^2  (Vp: variance of y), normal.
+// Binary traits: T = sum_i g~_i (b_i - pi_i), with g = c - min(c) (zero for individuals
+// without a minor allele), g~ = g minus its P(case)-weighted mean (intercept projected out,
+// as in SAIGE) and pi the null P(case) of the exact test. Two-sided p-value:
+//   |z| < 1: normal; <= 12 carriers: exact distribution of T (sum of independent two-point
+//   variables); otherwise: normal if |z| < 2, else saddlepoint (Lugannani-Rice) on each tail,
+//   with the cumulant generating function K(t) = sum_carriers [log(1 - pi_i + pi_i e^{t g~_i})
+//   - t g~_i pi_i] + t^2 v0 / 2, the non-carriers being approximately normal (variance v0).
+// ---------------------------------------------------------------------------
+static inline double softplus(double x) { return x > 0.0 ? x + std::log1p(std::exp(-x)) : std::log1p(std::exp(x)); }
+
+// P(T >= s) by saddlepoint, T = sum_i g_i (B_i - p_i) + N(0, v0), B_i ~ Bernoulli(p_i)
+static double burden_spa_upper(const std::vector<double>& g, const std::vector<double>& pp, double v0, double s) {
+    const size_t k = g.size();
+    double hi = 0.0, lo = 0.0, atom = 1.0;                      // support of the discrete part
+    for (size_t i = 0; i < k; ++i) {
+        if (g[i] >= 0.0) { hi += g[i] * (1.0 - pp[i]); lo -= g[i] * pp[i]; atom *= pp[i]; }
+        else             { hi -= g[i] * pp[i]; lo += g[i] * (1.0 - pp[i]); atom *= 1.0 - pp[i]; }
+    }
+    if (!(v0 > 0.0)) {
+        const double tol = 1e-12 * (hi - lo);
+        if (s > hi + tol) return 0.0;
+        if (s >= hi - tol) return atom;                         // the most extreme configuration
+        if (s <= lo) return 1.0;
+    }
+    std::vector<double> lg(k);
+    for (size_t i = 0; i < k; ++i) lg[i] = std::log(pp[i] / (1.0 - pp[i]));
+    auto K = [&](double t, double& k1, double& k2) -> double {
+        double k0 = 0.5 * v0 * t * t; k1 = v0 * t; k2 = v0;
+        for (size_t i = 0; i < k; ++i) {
+            const double x = lg[i] + t * g[i];
+            const double q = 1.0 / (1.0 + std::exp(-x));            // tilted P(case)
+            k0 += softplus(x) - softplus(lg[i]) - t * g[i] * pp[i];
+            k1 += g[i] * (q - pp[i]);
+            k2 += g[i] * g[i] * q * (1.0 - q);
+        }
+        return k0;
+    };
+    // solve K'(t) = s: K' is increasing; bracket, then safeguarded Newton
+    double a = 0.0, b = 0.0, k1, k2;
+    K(0.0, k1, k2);
+    const double sc = std::sqrt(std::max(k2, 1e-300));
+    double step = 1.0 / sc;
+    if (s > 0.0) { b = step; while (K(b, k1, k2), k1 < s) { a = b; b *= 2.0; if (b > 1e12 * step) return NA_REAL; } }
+    else         { a = -step; while (K(a, k1, k2), k1 > s) { b = a; a *= 2.0; if (a < -1e12 * step) return NA_REAL; } }
+    double t = 0.5 * (a + b);
+    for (int it = 0; it < 200; ++it) {
+        K(t, k1, k2);
+        const double f = k1 - s;
+        if (std::abs(f) <= 1e-12 * sc) break;
+        if (f > 0.0) b = t; else a = t;
+        double tn = (k2 > 0.0) ? t - f / k2 : 0.5 * (a + b);
+        if (!(tn > a && tn < b)) tn = 0.5 * (a + b);
+        if (std::abs(tn - t) <= 1e-14 * (1.0 + std::abs(t))) { t = tn; break; }
+        t = tn;
+    }
+    const double k0 = K(t, k1, k2);
+    const double r = t * s - k0;
+    if (!(r >= 0.0) || !(k2 > 0.0)) return NA_REAL;
+    const double w = (t >= 0.0 ? 1.0 : -1.0) * std::sqrt(2.0 * r), v = t * std::sqrt(k2);
+    if (std::abs(w) < 1e-6 || std::abs(v) < 1e-12) return NA_REAL;
+    const double phi = std::exp(-0.5 * w * w) / std::sqrt(2.0 * M_PI);
+    double pu = 0.5 * std::erfc(w / std::sqrt(2.0)) + phi * (1.0 / v - 1.0 / w);
+    return std::min(1.0, std::max(pu, 0.0));
+}
+
+// Two-sided p-value of a binary burden.  g: burden genotype of the carriers (>= 0, zero for
+// everybody else), pp: their null P(case), Tc = sum_carriers g (b - p), sumW = sum_i p_i(1-p_i)
+// and sumR = sum_i (b_i - p_i) over ALL individuals.
+// As in SAIGE, the intercept is projected out of the burden genotype: g~ = g - gbar with
+// gbar = sum W g / sum W, so the non-carriers contribute -gbar sum (b - p), approximately
+// N(0, gbar^2 sum_noncarriers W), and Var(T) = sum W g^2 - (sum W g)^2 / sum W. (Without the
+// projection the variance is overstated and the test is conservative when the category has
+// many carriers.)
+static double burden_binary_p(const std::vector<double>& g, const std::vector<double>& pp,
+                              double Tc, double sumW, double sumR) {
+    const size_t k = g.size();
+    if (k == 0) return NA_REAL;
+    double swg = 0.0, swc = 0.0, scale = 0.0;
+    for (size_t i = 0; i < k; ++i) { const double w = pp[i] * (1.0 - pp[i]); swg += w * g[i]; swc += w; scale += g[i]; }
+    const double gbar = (sumW > 0.0) ? swg / sumW : 0.0;
+    const double v0 = gbar * gbar * std::max(0.0, sumW - swc);
+    std::vector<double> gt(k);
+    double var = v0;
+    for (size_t i = 0; i < k; ++i) { gt[i] = g[i] - gbar; var += gt[i] * gt[i] * pp[i] * (1.0 - pp[i]); }
+    if (!(var > 0.0)) return NA_REAL;
+    const double T = Tc - gbar * sumR;
+    const double s = std::abs(T);
+    const double z = s / std::sqrt(var);
+    if (z < 1.0) return std::erfc(z / std::sqrt(2.0));          // p > 0.3: the normal approximation suffices
+    if (k <= 12) {                                              // exact: distribution of Tc over the carriers
+        // (the projection is negligible for so few carriers). d is kept sorted by value:
+        // both shifted copies are sorted, so one merge per carrier.
+        const double sc = std::abs(Tc), tol = 1e-9 * scale;
+        std::vector< std::pair<double, double> > d(1, std::make_pair(0.0, 1.0)), lo, hi, nd;
+        bool ok = true;
+        for (size_t i = 0; i < k && ok; ++i) {
+            lo.resize(d.size()); hi.resize(d.size());
+            for (size_t r = 0; r < d.size(); ++r) {
+                hi[r] = std::make_pair(d[r].first + g[i] * (1.0 - pp[i]), d[r].second * pp[i]);
+                lo[r] = std::make_pair(d[r].first - g[i] * pp[i], d[r].second * (1.0 - pp[i]));
+            }
+            nd.resize(2 * d.size());
+            std::merge(lo.begin(), lo.end(), hi.begin(), hi.end(), nd.begin());
+            d.clear();
+            for (size_t r = 0; r < nd.size(); ++r) {                 // merge equal values (lattice)
+                if (!d.empty() && nd[r].first - d.back().first <= tol) d.back().second += nd[r].second;
+                else d.push_back(nd[r]);
+            }
+            if (d.size() > 200000) ok = false;
+        }
+        if (ok) {
+            double p = 0.0;
+            for (size_t r = 0; r < d.size(); ++r)
+                if (d[r].first >= sc - tol || d[r].first <= -sc + tol) p += d[r].second;
+            return std::min(1.0, p);
+        }
+    }
+    if (z < 2.0) return std::erfc(z / std::sqrt(2.0));
+    const double pu = burden_spa_upper(gt, pp, v0, s);
+    std::vector<double> gm(k);
+    for (size_t i = 0; i < k; ++i) gm[i] = -gt[i];              // lower tail: P(T <= -s) = P(-T >= s)
+    const double pl = burden_spa_upper(gm, pp, v0, s);
+    if (std::isnan(pu) || std::isnan(pl)) return std::erfc(z / std::sqrt(2.0));
+    return std::min(1.0, pu + pl);
+}
+
 // The worker takes a VECTOR of phenotype variants (y - LOCO, and y itself with
 // h2_without_prs). Each job is read from disk and its geometry built ONCE; the
 // variants are then swept over that geometry.
@@ -4039,6 +4183,102 @@ struct Worker : public RcppParallel::Worker {
                             } else if (!std::isnan(R.p_spa[q][t])) { ov.push_back(R.p_spa[q][t]); ow.push_back(1.0); }
                             for (size_t k = 0; k < av.size(); ++k) { ov.push_back(av[k]); ow.push_back(1.0); }
                             R.p_spa[q][t] = ov.empty() ? NA_REAL : acat_combine(ov, ow);
+                        }
+                    }
+                }
+            }
+            // ---- burden test, one per category and alpha ---------------------
+            // Univariate association passes (not with conditional = TRUE: like ACAT-V,
+            // the burden is a marginal test). The omnibus becomes
+            //     p_spa = ACAT( VC p at each alpha [, ACAT-V p at each alpha], burden p at each alpha )
+            // with equal weights; p_burden keeps the ACAT over alphas of the burden p-values.
+            if (spa && g_burden && !pr.coher && gm.ok) {
+                const size_t NAL = std::max<size_t>(1, ctx.alphas.size());
+                const double a0 = ctx.alphas.empty() ? -1.0 : ctx.alphas[0];
+                const int n = (int) cd.V.rows();
+                const size_t A = cd.cat_m.size();
+                // orientation of every category column: sign of its third moment
+                std::vector<int> o(A + 1, 0);
+                for (size_t q = 0; q < A; ++q) o[q + 1] = o[q] + cd.cat_m[q];
+                std::vector<double> sg(o[A], 0.0);
+                for (int j = 0; j < o[A]; ++j)
+                    sg[j] = (cd.V.col(j).cast<double>().array().cube().sum() >= 0.0) ? 1.0 : -1.0;
+                for (size_t v = 0; v < NVP; ++v) {
+                    ChunkResultA& R = out[v][w];
+                    const size_t NT = R.p_spa.empty() ? 0 : R.p_spa[0].size();
+                    if (R.p_spa.size() != A) continue;
+                    const PhenoStats& SV = S[v];
+                    const bool bin = pr.binary && SV.bx.active;
+                    R.p_bur.assign(A, std::vector< std::vector<double> >(NT, std::vector<double>(NAL, NA_REAL)));
+                    R.p_burc.assign(A, std::vector<double>(NT, NA_REAL));
+                    std::vector<double> sumW(NT, -1.0), sumR(NT, 0.0);
+                    for (size_t q = 0; q < A; ++q) {
+                        const int m = cd.cat_m[q];
+                        if (m <= 0) continue;
+                        for (size_t k = 0; k < NAL; ++k) {
+                            const double ak = ctx.alphas.empty() ? a0 : ctx.alphas[k];
+                            Eigen::VectorXf wq(m);
+                            for (int j = 0; j < m; ++j)
+                                wq[j] = (float) (sg[o[q] + j] * alpha_w(cd.colmaf[o[q] + j], ak) / alpha_w(cd.colmaf[o[q] + j], a0));
+                            const Eigen::VectorXd c = (cd.V.middleCols(o[q], m) * wq).cast<double>();
+                            if (!bin) {
+                                const double c2 = c.squaredNorm();
+                                for (size_t t = 0; t < NT; ++t) {
+                                    const double vp = SV.Vp[t];
+                                    if (!(c2 > 0.0) || !(vp > 0.0)) continue;
+                                    const double z = c.dot(SV.Y.col(t)) / std::sqrt(vp * c2);
+                                    R.p_bur[q][t][k] = std::erfc(std::abs(z) / std::sqrt(2.0));
+                                }
+                            } else {
+                                const double cmin = c.minCoeff(), cmax = c.maxCoeff();
+                                const double ctol = 1e-6 * (cmax - cmin);
+                                if (!(cmax - cmin > 0.0)) continue;
+                                std::vector<int> ci;
+                                for (int i = 0; i < n; ++i) if (c[i] - cmin > ctol) ci.push_back(i);
+                                for (size_t t = 0; t < NT; ++t) {
+                                    if (t >= SV.bx.b.size() || !SV.bx.b[t]) continue;
+                                    const std::vector<unsigned char>& bb = *SV.bx.b[t];
+                                    if (sumW[t] < 0.0) {                     // once per trait and unit
+                                        double sw = 0.0, sr = 0.0;
+                                        for (int i = 0; i < n; ++i) {
+                                            const double pi = std::min(std::max((double) SV.bx.PiF(i, t), 1e-8), 1.0 - 1e-8);
+                                            sw += pi * (1.0 - pi); sr += (double) bb[i] - pi;
+                                        }
+                                        sumW[t] = sw; sumR[t] = sr;
+                                    }
+                                    std::vector<double> g, pp; g.reserve(ci.size()); pp.reserve(ci.size());
+                                    double T = 0.0;
+                                    for (size_t r = 0; r < ci.size(); ++r) {
+                                        const int i = ci[r];
+                                        const double pi = std::min(std::max((double) SV.bx.PiF(i, t), 1e-8), 1.0 - 1e-8);
+                                        const double gi = c[i] - cmin;
+                                        g.push_back(gi); pp.push_back(pi);
+                                        T += gi * ((double) bb[i] - pi);
+                                    }
+                                    R.p_bur[q][t][k] = burden_binary_p(g, pp, T, sumW[t], sumR[t]);
+                                }
+                            }
+                        }
+                        for (size_t t = 0; t < NT; ++t) {
+                            std::vector<double> bv, bw, ov, ow;
+                            for (size_t k = 0; k < NAL; ++k)
+                                if (!std::isnan(R.p_bur[q][t][k])) { bv.push_back(R.p_bur[q][t][k]); bw.push_back(1.0); }
+                            if (bv.empty()) continue;
+                            R.p_burc[q][t] = acat_combine(bv, bw);
+                            // the p-values already in the omnibus (VC at each alpha, ACAT-V at each alpha)
+                            const bool has_acv = q < R.p_acatv.size() && t < R.p_acatv[q].size();
+                            if (!R.p_alpha.empty() && q < R.p_alpha.size() && t < R.p_alpha[q].size()) {
+                                for (size_t k = 0; k < R.p_alpha[q][t].size(); ++k)
+                                    if (!std::isnan(R.p_alpha[q][t][k])) { ov.push_back(R.p_alpha[q][t][k]); ow.push_back(1.0); }
+                            } else {
+                                const double pvc = has_acv ? R.p_vc[q][t] : R.p_spa[q][t];
+                                if (!std::isnan(pvc)) { ov.push_back(pvc); ow.push_back(1.0); }
+                            }
+                            if (has_acv)
+                                for (size_t k = 0; k < R.p_acatv[q][t].size(); ++k)
+                                    if (!std::isnan(R.p_acatv[q][t][k])) { ov.push_back(R.p_acatv[q][t][k]); ow.push_back(1.0); }
+                            for (size_t k = 0; k < bv.size(); ++k) { ov.push_back(bv[k]); ow.push_back(1.0); }
+                            R.p_spa[q][t] = acat_combine(ov, ow);
                         }
                     }
                 }
@@ -4306,6 +4546,25 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
             if (has && k < R.p_acatv[q][t].size()) wr(f, R.p_acatv[q][t][k]); else f << "NA";
         }
     };
+    // burden columns: p_burden (ACAT over alphas) and p_burden_<alpha>
+    const bool bur = pr.spa && g_burden && !pr.coher;
+    const size_t NALB = std::max<size_t>(1, ctx.alphas.size());
+    std::string bur_hdr;
+    if (bur) {
+        bur_hdr = "\tp_burden";
+        for (size_t k = 0; k < NALB; ++k) {
+            std::ostringstream o; o << "\tp_burden_" << (ctx.alphas.empty() ? -1.0 : ctx.alphas[k]); bur_hdr += o.str();
+        }
+    }
+    auto wr_bur = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
+        if (!bur) return;
+        const bool has = q < R.p_burc.size() && (size_t) t < R.p_burc[q].size();
+        f << '\t'; if (has) wr(f, R.p_burc[q][t]); else f << "NA";
+        for (size_t k = 0; k < NALB; ++k) {
+            f << '\t';
+            if (has && k < R.p_bur[q][t].size()) wr(f, R.p_bur[q][t][k]); else f << "NA";
+        }
+    };
     auto wr_alpha = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
         if (!multi_a) return;
         for (size_t k = 0; k < ctx.alphas.size(); ++k) {
@@ -4320,7 +4579,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         std::ofstream f1(pr.out_file.c_str());
         if (!f1.is_open()) stop("Could not open out_file: " + pr.out_file);
         f1 << "chr\tstart\tend\tcategory\tm_cat\tm_flank\tphenotype\tvg\tse_vg\th2\tvg_flank\tvg_env";
-        if (pr.spa)   f1 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr;
+        if (pr.spa)   f1 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr << bur_hdr;
         if (pr.coher) f1 << "\tvg_t1\tvg_t2";
         f1 << "\n";
         for (size_t k = 0; k < cj.size(); ++k) {
@@ -4334,7 +4593,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     wr(f1, h2den(t) > 0 ? R.vg[q][t] / h2den(t) : NA_REAL);
                     f1 << '\t'; wr(f1, R.vg_flank[t]); f1 << '\t'; wr(f1, R.vg_env[t]);
                     if (pr.spa) { f1 << '\t'; wr(f1, R.p_spa[q][t]); f1 << '\t' << R.spa_used[q][t];
-                                  wr_alpha(f1, R, q, t); wr_acv(f1, R, q, t); }
+                                  wr_alpha(f1, R, q, t); wr_acv(f1, R, q, t); wr_bur(f1, R, q, t); }
                     if (pr.coher) { f1 << '\t'; wr(f1, R.vg_t1[q][t]); f1 << '\t'; wr(f1, R.vg_t2[q][t]); }
                     f1 << '\n';
                 }
@@ -4350,7 +4609,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         std::ofstream f3((pr.out_file + ".genes").c_str());
         if (!f3.is_open()) stop("Could not open " + pr.out_file + ".genes");
         f3 << "gene\tchr\tstart\tend\tblock\tn_blocks\tcategory\tm_cat\tphenotype\tvg\tse_vg\th2\tvg_env";
-        if (pr.spa)        f3 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr;
+        if (pr.spa)        f3 << "\tp_spa\tspa_used" << alpha_hdr << acv_hdr << bur_hdr;
         if (pr.coher)      f3 << "\tvg_t1\tvg_t2";          // univariate estimates of both traits (for rg)
         f3 << "\n";
         for (size_t gi = 0; gi < grec.size(); ++gi) {
@@ -4376,6 +4635,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                             f3 << '\t'; wr(f3, B.p_spa[q][t]); f3 << '\t' << B.spa_used[q][t];
                             wr_alpha(f3, B, q, t);
                             wr_acv(f3, B, q, t);
+                            wr_bur(f3, B, q, t);
                             pv.push_back(B.p_spa[q][t]); pw.push_back((double) B.cat_m[q]);
                         }
                         if (pr.coher) { f3 << '\t'; wr(f3, B.vg_t1[q][t]); f3 << '\t'; wr(f3, B.vg_t2[q][t]); }
@@ -4390,6 +4650,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                 wr(f3, acat_combine(pv, pw)); f3 << "\tNA";
                 if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f3 << "\tNA";
                 if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
+                if (bur) for (size_t k = 0; k < NALB + 1; ++k) f3 << "\tNA";
                 if (pr.coher) f3 << "\tNA\tNA";
                 f3 << '\n';
             }
@@ -4530,6 +4791,8 @@ Rcpp::List stratgwas_run(const std::string& filename,
     if (!(refine_p >= 0.0 && refine_p <= 1.0)) stop("refine_p must be in [0, 1]");
     g_refine_p = refine_p;
     g_cond_lead = conditional && !coher;
+    g_burden = !coher && !g_cond_lead && std::getenv("SPARROW_NO_BURDEN") == 0;
+    if (g_burden && SPA) Rcout << "Burden test: one per category and alpha, included in the omnibus p-value (p_burden).\n";
     if (coher) Rcout << "Co-heritability: tests are computed conditional on the lead background variants (p < 1e-4) when there are any; "
                      << "otherwise tests with p < " << refine_p << " are recomputed with the refined null "
                      << "(REML-GLS for large blocks; binary: case probabilities refitted on the background score and the top-10 background variants).\n";
