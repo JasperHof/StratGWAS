@@ -64,6 +64,24 @@
 #'   split into blocks (`max_gene_snps`) also get gene-wide burdens per category and group over all
 #'   blocks: rows with `block = 0`, included in the gene-level ACAT. Burden tests are univariate and
 #'   marginal: not used with `coher = TRUE` or `conditional = TRUE`. NULL = no groups (default).
+#' @param variant_scores Optional per-variant scores (e.g. SpliceAI DS_MAX, AlphaMissense, CADD):
+#'   a data frame or a file with a header, variant IDs (as in the .bim) in the first column and
+#'   one numeric column per score (NA = no score). Each score and each transform in
+#'   `score_transform` gives a WEIGHTED model: the heritability model of variant j becomes
+#'   [2f(1-f)]^(1+alpha) w_j, with w_j = score_floor + (1 - score_floor) g(s_j) and g the transformed
+#'   score in [0, 1]. Variance-component and burden tests are run under every weighted model and
+#'   alpha and enter the omnibus p-value next to the unweighted tests (which are always kept);
+#'   estimates (vg, h2) stay unweighted. Variants without a score get the median weight of the
+#'   scored variants of their category; a category whose variants all have the same weight is not
+#'   re-tested. Univariate analyses only (ignored with coher = TRUE).
+#' @param score_transform Transforms g of each score (scores are often very skewed):
+#'   "rank" (percentile rank over the scored variants: robust, gentle contrast), "log"
+#'   (log(1 + 99 z) / log(100) of the min-max scaled score z: concave, lifts small scores),
+#'   "sqrt" (sqrt(z)), "linear" (z), "square" (z^2: emphasises the top) and "step:<t>"
+#'   (1 if score >= t, else 0, e.g. "step:0.2" for SpliceAI). Each transform adds one weighted
+#'   model per score (and per alpha), so keep the number small.
+#' @param score_floor Weight of the lowest-scoring variants (0 < score_floor <= 1): variants are
+#'   down-weighted, never removed, so the test stays robust when a score is uninformative.
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -103,6 +121,7 @@ sparrow <- function(filename, pheno, out_file,
                     spa = TRUE, chr = NULL,
                     gene_flank = 0, flank_maf = 0.01, refine_p = 0.05, conditional = FALSE,
                     burden_groups = NULL,
+                    variant_scores = NULL, score_transform = c("rank", "log"), score_floor = 0.1,
                     n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
@@ -248,6 +267,32 @@ sparrow <- function(filename, pheno, out_file,
       message("burden_groups are not used with coher = TRUE or conditional = TRUE (burden tests are marginal)")
   }
 
+  # ---- variant scores -> weights (one column per score x transform) ------------------
+  vw <- NULL
+  if (!is.null(variant_scores)) {
+    if (coher) message("variant_scores are ignored with coher = TRUE")
+    else {
+      if (!(is.numeric(score_floor) && length(score_floor) == 1 && score_floor > 0 && score_floor <= 1))
+        stop("score_floor must be a single number in (0, 1]")
+      if (is.character(variant_scores) && length(variant_scores) == 1) {
+        if (!file.exists(variant_scores)) stop("variant_scores file not found: ", variant_scores)
+        variant_scores <- read.table(variant_scores, header = TRUE, check.names = FALSE,
+                                     na.strings = c("NA", "", "."), stringsAsFactors = FALSE)
+      }
+      variant_scores <- as.data.frame(variant_scores, stringsAsFactors = FALSE)
+      if (ncol(variant_scores) < 2) stop("variant_scores needs variant IDs and at least one score column")
+      bim_id <- scan(paste0(filename, ".bim"), what = list(NULL, "", NULL, NULL, NULL, NULL), quiet = TRUE)[[2]]
+      idx <- match(bim_id, as.character(variant_scores[[1]]))
+      S <- sapply(variant_scores[idx, -1, drop = FALSE], function(x) suppressWarnings(as.numeric(x)))
+      S <- matrix(S, nrow = length(bim_id), dimnames = list(NULL, names(variant_scores)[-1]))
+      cat_of <- if (!is.null(annotation)) ifelse(rowSums(annotation) > 0, max.col(annotation, "first"), 0L) else rep(0L, length(bim_id))
+      message("variant_scores: ", sum(!is.na(idx)), " of ", length(bim_id), " .bim variants matched; scored (non-missing): ",
+              paste(colnames(S), colSums(is.finite(S)), sep = " = ", collapse = ", "))
+      vw <- .sparrow_score_weights(S, cat_of, score_transform, score_floor)
+      if (!is.null(vw) && ncol(vw) == 0) vw <- NULL
+    }
+  }
+
   # ---- genes ------------------------------------------------------------------------
   if (!is.null(genes)) {
     if (is.character(genes) && length(genes) == 1) {
@@ -306,7 +351,7 @@ sparrow <- function(filename, pheno, out_file,
     gene_flank = gene_flank, flank_maf = flank_maf, refine_p = refine_p,
     conditional = conditional,
     chr = chr, out_file = out_file, batch_size = batch_size,
-    n_threads = n_threads, burden_groups = bg)
+    n_threads = n_threads, burden_groups = bg, variant_weights = vw)
 
   files <- c(regions = if (is.null(genes)) out_file else NA,
              genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA)
@@ -315,6 +360,39 @@ sparrow <- function(filename, pheno, out_file,
 
 
 # ---- internal helpers -------------------------------------------------------------------
+
+# Variant weights from scores: one column per score x transform, w = floor + (1 - floor) g(s),
+# g in [0, 1]; missing scores get the median weight of the scored variants of their category
+# (all scored variants if the category has none).
+.sparrow_score_weights <- function(S, cat_of, transform, floor) {
+  out <- list()
+  for (j in seq_len(ncol(S))) {
+    s <- S[, j]; ok <- is.finite(s)
+    if (sum(ok) < 2 || length(unique(s[ok])) < 2) { warning("score '", colnames(S)[j], "' has fewer than two distinct values: skipped"); next }
+    x <- s[ok]; z <- (x - min(x)) / (max(x) - min(x))
+    for (tf in transform) {
+      g <- if (tf == "rank") (rank(x, ties.method = "average") - 0.5) / length(x)
+           else if (tf == "linear") z
+           else if (tf == "sqrt") sqrt(z)
+           else if (tf == "log") log1p(99 * z) / log(100)
+           else if (tf == "square") z^2
+           else if (grepl("^step:", tf)) {
+             thr <- suppressWarnings(as.numeric(sub("^step:", "", tf)))
+             if (!is.finite(thr)) stop("score_transform '", tf, "': give a number after 'step:'")
+             as.numeric(x >= thr)
+           } else stop("unknown score_transform '", tf, "' (rank, log, sqrt, linear, square, step:<t>)")
+      w <- rep(NA_real_, length(s)); w[ok] <- floor + (1 - floor) * g
+      allmed <- stats::median(w[ok])
+      for (c in unique(cat_of[!ok])) {
+        m <- stats::median(w[ok & cat_of == c])
+        w[!ok & cat_of == c] <- if (is.finite(m)) m else allmed
+      }
+      out[[paste0(colnames(S)[j], "_", gsub("[^A-Za-z0-9.]", "", tf))]] <- w
+    }
+  }
+  if (!length(out)) return(NULL)
+  do.call(cbind, out)
+}
 
 # Does a whitespace-delimited file have a header? (third field of line 1 not a number)
 .sparrow_has_header <- function(path) {

@@ -254,6 +254,8 @@ struct Cell {
     std::vector<int> cat;          // per-column category id (only set when collapsing;
                                    // empty -> columns map 1:1 to .bim via i0)
     std::vector<int> bim;          // per-column .bim index, -1 for a pseudo-marker (collapsing only)
+    std::vector< std::vector<int> > mem;   // per-column .bim indices of its variants (collapsing only;
+                                           // one for an individual variant, several for a pseudo-marker)
     // the ORIGINAL variants of the range (collapsing only): MAF and category, so that
     // ACAT-V and the alpha-model weights can still see every variant individually
     std::vector<float> omaf;
@@ -346,7 +348,9 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
     int ncat_all = (int) cat_id->size();
     std::vector< std::vector<float> > out_cols;   // each length n_keep (raw scale)
     std::vector<int>  out_cat, out_bim;           // per output column: category id, .bim index
+    std::vector< std::vector<int> > out_mem;      // per output column: .bim indices of its variants
     std::map<int, std::vector<float> > grp;       // category -> pseudo-marker being built
+    std::map<int, std::vector<int> > grp_mem;     // category -> .bim indices of the collapsed variants
     std::map<int, float> grp_maxf;                // category -> maximum MAF of its collapsed variants
     std::map<int, int> category_mac;              // category -> sum of individual variant MACs
     cell.omaf.assign(m, 0.f); cell.ocat.assign(m, -1);
@@ -368,7 +372,9 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
             std::vector<float> col(n_keep);
             for (int i = 0; i < n_keep; ++i) { float g = block(i, j); col[i] = (g < 0.f) ? -1.f : g; }
             out_cols.push_back(std::move(col)); out_cat.push_back(cid); out_bim.push_back(i0 + j);
+            out_mem.push_back(std::vector<int>(1, i0 + j));
         } else if (mac > 0) {
+            grp_mem[cid].push_back(i0 + j);
             std::vector<float>& acc = grp[cid];
             if (acc.empty()) acc.assign(n_keep, 0.f);
             float& mf = grp_maxf[cid]; if ((float) f > mf) mf = (float) f;
@@ -385,6 +391,7 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
                 out_cols.erase(out_cols.begin() + k);
                 out_cat.erase(out_cat.begin() + k);
                 out_bim.erase(out_bim.begin() + k);
+                out_mem.erase(out_mem.begin() + k);
             }
         }
     }
@@ -393,6 +400,7 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
     for (std::map<int, std::vector<float> >::iterator it = grp.begin(); it != grp.end(); ++it) {
         if (min_category_mac > 0 && category_mac[it->first] < min_category_mac) continue;
         out_cols.push_back(it->second); out_cat.push_back(it->first); out_bim.push_back(-1);
+        out_mem.push_back(grp_mem[it->first]);
     }
 
     int nout = (int) out_cols.size();
@@ -409,6 +417,7 @@ static bool read_cell_idx(const BedReader& br, const std::vector<int>& keep,
     cell.X = std::move(X);
     cell.cat = out_cat;
     cell.bim = out_bim;
+    cell.mem = out_mem;
     cell.i0 = i0;
     return true;
 }
@@ -1627,6 +1636,17 @@ struct ChunkContext {
     // values are used ONLY for association p-values, which are ACAT-combined
     // across all alphas (see Worker). One value = the original behaviour.
     std::vector<double> alphas;
+    // variant weights (variant_weights): per weight model w, one weight per .bim variant (> 0;
+    // missing values filled in R). A weighted model multiplies the heritability model of every
+    // variant by its weight: h2_j ~ [2f(1-f)]^(1+alpha) w_j, i.e. column j of V is rescaled by sqrt(w_j).
+    std::vector< std::vector<float> > vw;
+    std::vector<std::string> vw_names;
+    // the tested models (p-values only): model k = (alpha mod_a[k], weight mod_w[k], -1 = unweighted).
+    // Models 0 .. n_alpha-1 are the unweighted alphas (model 0 = the primary alpha); then, for every
+    // weight, one model per alpha. mod_name: the column-name suffix ("-1", "<weight>_-1", ...).
+    std::vector<double> mod_a;
+    std::vector<int> mod_w;
+    std::vector<std::string> mod_name;
     // gene definitions (optional). Genes may overlap and nest freely -- they are
     // tested marginally, so the only cost of an overlap is re-reading its SNPs.
     std::vector<std::string> gene_name, gene_chr;
@@ -2138,6 +2158,9 @@ struct ChunkDataA {
     std::vector< std::vector<int> > car;
     std::vector< std::vector<unsigned char> > dos;
     std::vector<double> colsum;
+    // variant weights per weight model [w][column] (1 for background / flank columns; a
+    // pseudo-marker gets the mean weight of its variants)
+    std::vector< std::vector<float> > colw;
     ChunkDataA() : m_flank(0), K(0) {}
 };
 struct ChunkResultA {
@@ -2175,6 +2198,7 @@ struct ChunkResultA {
     std::vector<double> gw_sd;
     std::vector< std::vector<int> > gw_car;
     std::vector< std::vector<unsigned char> > gw_dos;
+    std::vector< std::vector<float> > gw_w;            // [weight model][column]
 };
 
 // Read a SNP index range, project covariates, apply alpha; return false on error.
@@ -2251,6 +2275,19 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     cd.colmaf.assign(cd.K, 0.f);
     cd.colbim.assign(cd.K, -1);
     const bool keep_car = ctx.car_max > 0;
+    const size_t NW = ctx.vw.size();
+    cd.colw.assign(NW, std::vector<float>(cd.K, 1.f));
+    // weight of source column j of the target cell under weight model w
+    auto col_weight = [&](int j, size_t w) -> float {
+        const std::vector<float>& v = ctx.vw[w];
+        if (!coll) return v[a + j];
+        if (j < (int) tgt.bim.size() && tgt.bim[j] >= 0) return v[tgt.bim[j]];
+        if (j < (int) tgt.mem.size() && !tgt.mem[j].empty()) {
+            double s = 0.0; for (size_t r = 0; r < tgt.mem[j].size(); ++r) s += v[tgt.mem[j][r]];
+            return (float) (s / tgt.mem[j].size());
+        }
+        return 1.f;
+    };
     if (keep_car) { cd.car.assign(cd.K, std::vector<int>()); cd.dos.assign(cd.K, std::vector<unsigned char>()); }
     // copy the carrier list of source column j of cell C into column k of V
     auto take_car = [&](const Cell& C, int j, int k) {
@@ -2266,6 +2303,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
             cd.colmaf[off + (int) q] = tgt.maf[cc[q]];
             cd.colbim[off + (int) q] = coll ? tgt.bim[cc[q]] : a + cc[q];
             take_car(tgt, cc[q], off + (int) q);
+            for (size_t w = 0; w < NW; ++w) cd.colw[w][off + (int) q] = col_weight(cc[q], w);
         }
         // expected heritability under the alpha model, over the ORIGINAL variants
         double w = 0.0;
@@ -4118,7 +4156,8 @@ struct Worker : public RcppParallel::Worker {
             if (!make_chunk(ctx, j.ci, j.a, j.b, j.fL0, j.fL1, j.fR0, j.fR1, cd,
                             j.gene ? pr.gene_flank_maf : 0.0)) { ok[w] = 0; continue; }
             // Multi-alpha applies to p-values only (spa = true).
-            const bool multi = spa && ctx.alphas.size() > 1;
+            const size_t NM = ctx.mod_a.size();                 // tested models (alphas x weights)
+            const bool multi = spa && NM > 1;
             // With h2_raw, S = { y - LOCO (p-values), y (heritability) }. The extra
             // alphas and ACAT-V only concern p-values, so they run on variant 0 only;
             // variant 1 is tested once, at the primary alpha, which is all its
@@ -4137,8 +4176,21 @@ struct Worker : public RcppParallel::Worker {
                 // so  G_a = D G_0 D  and  ||v_j||^2 scales by d_j^2. No second
                 // read, no second n K^2 Gram -- the extra cost per alpha is one
                 // copy of V for the n x K GEMM V'Y and the per-test SPA.
-                const size_t NAL = ctx.alphas.size();
+                // Weighted models (variant_weights) rescale the category columns further by
+                // sqrt(w_j): h2_j ~ [2f(1-f)]^(1+alpha) w_j. A category whose columns all have
+                // the same weight gives exactly the unweighted test, so it is NA there.
+                const size_t NAL = NM;
                 const double a0 = ctx.alphas[0];
+                std::vector<int> co(cd.cat_m.size() + 1, 0);
+                for (size_t q = 0; q < cd.cat_m.size(); ++q) co[q + 1] = co[q] + cd.cat_m[q];
+                // wvar[w][q]: weight model w varies within category q
+                std::vector< std::vector<char> > wvar(ctx.vw.size(), std::vector<char>(cd.cat_m.size(), 0));
+                for (size_t ww = 0; ww < ctx.vw.size(); ++ww)
+                    for (size_t q = 0; q < cd.cat_m.size(); ++q) {
+                        float lo = 1e30f, hi = -1e30f;
+                        for (int c = co[q]; c < co[q + 1]; ++c) { lo = std::min(lo, cd.colw[ww][c]); hi = std::max(hi, cd.colw[ww][c]); }
+                        wvar[ww][q] = (hi > lo * (1.f + 1e-6f)) ? 1 : 0;
+                    }
                 for (size_t v = 0; v < NVP; ++v) {
                     ChunkResultA& R = out[v][w];
                     R.p_alpha.assign(R.p_spa.size(), std::vector< std::vector<double> >());
@@ -4149,10 +4201,13 @@ struct Worker : public RcppParallel::Worker {
                 }
                 if (gm.ok) {
                     for (size_t k = 1; k < NAL; ++k) {
-                        const double ak = ctx.alphas[k];
+                        const double ak = ctx.mod_a[k];
+                        const int wk = ctx.mod_w[k];
+                        if (wk >= 0 && std::find(wvar[wk].begin(), wvar[wk].end(), (char) 1) == wvar[wk].end()) continue;
                         Eigen::VectorXd d(cd.K);
                         for (int c = 0; c < cd.K; ++c)
-                            d[c] = alpha_w(cd.colmaf[c], ak) / alpha_w(cd.colmaf[c], a0);
+                            d[c] = alpha_w(cd.colmaf[c], ak) / alpha_w(cd.colmaf[c], a0)
+                                   * (wk >= 0 ? std::sqrt((double) cd.colw[wk][c]) : 1.0);
                         ChunkDataA ck = cd;
                         for (int c = 0; c < cd.K; ++c) {
                             ck.V.col(c) *= (float) d[c];
@@ -4167,9 +4222,11 @@ struct Worker : public RcppParallel::Worker {
                                              pr.binary, spa, pr.coher, pr.pairs,
                                              S[v].ycross, S[v].cb, S[v].bx, pr.one_sided, tmp);
                             ChunkResultA& R = out[v][w];
-                            for (size_t q = 0; q < R.p_alpha.size() && q < tmp.p_spa.size(); ++q)
+                            for (size_t q = 0; q < R.p_alpha.size() && q < tmp.p_spa.size(); ++q) {
+                                if (wk >= 0 && !wvar[wk][q]) continue;      // constant weights: same as unweighted
                                 for (size_t t = 0; t < R.p_alpha[q].size() && t < tmp.p_spa[q].size(); ++t)
                                     R.p_alpha[q][t][k] = tmp.p_spa[q][t];
+                            }
                         }
                     }
                 }
@@ -4234,9 +4291,13 @@ struct Worker : public RcppParallel::Worker {
             // Burden groups (burden_groups): the same burdens on the union of the group's
             // categories, reported as its own row and entering the gene-level ACAT like a category
             // (weight: its number of columns).
-            const std::vector<double> bal = ctx.alphas.empty() ? std::vector<double>(1, ctx.alpha) : ctx.alphas;
-            const size_t NAL = bal.size();
+            // burden models: the same models as the VC test (every alpha, unweighted and weighted)
+            const size_t NAL = NM;
             const double a0 = ctx.alpha;                       // the alpha V was read at
+            auto mw = [&](size_t k, int j) -> double {         // sqrt weight of column j under model k
+                const int wk = ctx.mod_w[k];
+                return wk >= 0 ? std::sqrt((double) cd.colw[wk][j]) : 1.0;
+            };
             const int n = (int) cd.V.rows();
             const size_t A = cd.cat_m.size();
             std::vector<int> o(A + 1, 0);
@@ -4284,7 +4345,7 @@ struct Worker : public RcppParallel::Worker {
                             Eigen::VectorXf wq(m);
                             for (int j = 0; j < m; ++j) {
                                 const float f = cd.colmaf[o[q] + j];
-                                wq[j] = (float) (sg[o[q] + j] * alpha_w(f, bal[k]) / alpha_w(f, a0));
+                                wq[j] = (float) (sg[o[q] + j] * alpha_w(f, ctx.mod_a[k]) / alpha_w(f, a0) * mw(k, o[q] + j));
                                 cols.push_back(o[q] + j);
                             }
                             c += (cd.V.middleCols(o[q], m) * wq).cast<double>();
@@ -4302,7 +4363,7 @@ struct Worker : public RcppParallel::Worker {
                         for (size_t r = 0; r < cols.size(); ++r) {
                             const int j = cols[r];
                             if (cd.car[j].empty() || std::isnan(colsd[j])) return false;
-                            const double u = alpha_w(cd.colmaf[j], bal[k]) / colsd[j];
+                            const double u = alpha_w(cd.colmaf[j], ctx.mod_a[k]) / colsd[j] * mw(k, j);
                             for (size_t z = 0; z < cd.car[j].size(); ++z) pr2.push_back(std::make_pair(cd.car[j][z], u * (double) cd.dos[j][z]));
                         }
                         std::sort(pr2.begin(), pr2.end());
@@ -4366,6 +4427,13 @@ struct Worker : public RcppParallel::Worker {
                         std::vector<double> pt;
                         std::vector<int> cols, ci; std::vector<double> gi;
                         for (size_t k = 0; k < NAL; ++k) {
+                            const int wk = ctx.mod_w[k];
+                            if (wk >= 0) {                        // weighted model: only if the weights vary
+                                float lo = 1e30f, hi = -1e30f;
+                                for (size_t r = 0; r < qs.size(); ++r)
+                                    for (int c = o[qs[r]]; c < o[qs[r] + 1]; ++c) { lo = std::min(lo, cd.colw[wk][c]); hi = std::max(hi, cd.colw[wk][c]); }
+                                if (!(hi > lo * (1.f + 1e-6f))) continue;
+                            }
                             const Eigen::VectorXd c = bgeno(qs, k, cols);
                             if (cols.empty()) continue;
                             const bool sp = bin && bcar(cols, k, ci, gi);
@@ -4425,11 +4493,13 @@ struct Worker : public RcppParallel::Worker {
             if (spa && g_burden && g_bur_gene && !pr.coher && j.split && have_car && !out.empty()) {
                 ChunkResultA& R = out[0][w];
                 R.gw_cat.clear(); R.gw_maf.clear(); R.gw_sd.clear(); R.gw_car.clear(); R.gw_dos.clear();
+                R.gw_w.assign(ctx.vw.size(), std::vector<float>());
                 for (size_t q = 0; q < A; ++q)
                     for (int z = 0; z < cd.cat_m[q]; ++z) {
                         const int jj = o[q] + z;
                         R.gw_cat.push_back(cd.cat_id[q]); R.gw_maf.push_back(cd.colmaf[jj]); R.gw_sd.push_back(colsd[jj]);
                         R.gw_car.push_back(cd.car[jj]); R.gw_dos.push_back(cd.dos[jj]);
+                        for (size_t ww = 0; ww < ctx.vw.size(); ++ww) R.gw_w[ww].push_back(cd.colw[ww][jj]);
                     }
             }
             ok[w] = 1;
@@ -4490,8 +4560,7 @@ static void gw_prepare(const ChunkContext& ctx, const PhenoStats& SV, bool binar
 static void gene_burden(const ChunkContext& ctx, const PhenoStats& SV, const GwPre& G,
                         const std::vector<const ChunkResultA*>& bl, GeneBur& out) {
     out = GeneBur();
-    const std::vector<double> bal = ctx.alphas.empty() ? std::vector<double>(1, ctx.alpha) : ctx.alphas;
-    const size_t NAL = bal.size();
+    const size_t NAL = ctx.mod_a.size();                 // models: alphas x weights
     const int n = G.n, P = G.P;
     // sets: every category, then every burden group (at least two of its categories present)
     std::vector< std::vector<int> > sets; std::vector<std::string> names;
@@ -4517,10 +4586,19 @@ static void gene_burden(const ChunkContext& ctx, const PhenoStats& SV, const GwP
         std::vector< std::vector<double> > pa(P, std::vector<double>(NAL, NA_REAL));
         if (okc) {
             for (size_t k = 0; k < NAL; ++k) {
+                const int wk = ctx.mod_w[k];
+                if (wk >= 0) {                                    // weighted model: only if the weights vary
+                    float lo = 1e30f, hi = -1e30f;
+                    for (size_t r = 0; r < cols.size(); ++r) {
+                        const float x = bl[cols[r].first]->gw_w[wk][cols[r].second]; lo = std::min(lo, x); hi = std::max(hi, x);
+                    }
+                    if (!(hi > lo * (1.f + 1e-6f))) continue;
+                }
                 std::vector< std::pair<int, double> > pr2;
                 for (size_t r = 0; r < cols.size(); ++r) {
                     const ChunkResultA& B = *bl[cols[r].first]; const size_t j = cols[r].second;
-                    const double u = Worker::alpha_w(B.gw_maf[j], bal[k]) / B.gw_sd[j];
+                    const double u = Worker::alpha_w(B.gw_maf[j], ctx.mod_a[k]) / B.gw_sd[j]
+                                     * (wk >= 0 ? std::sqrt((double) B.gw_w[wk][j]) : 1.0);
                     for (size_t z = 0; z < B.gw_car[j].size(); ++z) pr2.push_back(std::make_pair(B.gw_car[j][z], u * (double) B.gw_dos[j][z]));
                 }
                 std::sort(pr2.begin(), pr2.end());
@@ -4836,6 +4914,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                         std::vector<double>().swap(B.gw_sd);
                         std::vector< std::vector<int> >().swap(B.gw_car);
                         std::vector< std::vector<unsigned char> >().swap(B.gw_dos);
+                        std::vector< std::vector<float> >().swap(B.gw_w);
                     }
                 }
             }
@@ -4847,12 +4926,12 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     // ---- WRITE ---------------------------------------------------------------
     auto wr = [](std::ofstream& f, double v) { if (std::isnan(v)) f << "NA"; else f << v; };
     // multi-alpha: one extra column per alpha, p_alpha_<value>; p_spa = their ACAT
-    const bool multi_a = pr.spa && ctx.alphas.size() > 1;
+    // (and, with variant_weights, one per weighted model: p_alpha_<weight>_<alpha>)
+    const size_t NMOD = ctx.mod_a.size();
+    const bool multi_a = pr.spa && NMOD > 1;
     std::string alpha_hdr;
     if (multi_a)
-        for (size_t k = 0; k < ctx.alphas.size(); ++k) {
-            std::ostringstream o; o << "\tp_alpha_" << ctx.alphas[k]; alpha_hdr += o.str();
-        }
+        for (size_t k = 0; k < NMOD; ++k) alpha_hdr += "\tp_alpha_" + ctx.mod_name[k];
     // ACAT-V columns (KVIK summaries supplied): p_vc, p_acatv, p_acatv_<alpha>
     const bool acv = pr.use_acatv && !ctx.kz.empty();
     std::string acv_hdr;
@@ -4874,12 +4953,11 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     };
     // burden columns: p_burden (ACAT over alphas) and p_burden_<alpha>
     const bool bur = pr.spa && g_burden && !pr.coher;
-    const std::vector<double> bal = ctx.alphas.empty() ? std::vector<double>(1, ctx.alpha) : ctx.alphas;
-    const size_t NALB = bal.size();
+    const size_t NALB = NMOD;                                   // burden models = VC models
     std::string bur_hdr;
     if (bur) {
         bur_hdr = "\tp_burden";
-        for (size_t k = 0; k < NALB; ++k) { std::ostringstream o; o << "\tp_burden_" << bal[k]; bur_hdr += o.str(); }
+        for (size_t k = 0; k < NALB; ++k) bur_hdr += "\tp_burden_" + ctx.mod_name[k];
     }
     auto wr_bur = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
         if (!bur) return;
@@ -4895,7 +4973,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         const bool has = gi < R.p_grp.size() && (size_t) t < R.p_grp[gi].size();
         if (has) wr(f, R.p_grp[gi][t]); else f << "NA";
         f << "\tNA";
-        if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f << "\tNA";
+        if (multi_a) for (size_t k = 0; k < NMOD; ++k) f << "\tNA";
         if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f << "\tNA";
         if (bur) {
             f << '\t'; if (has) wr(f, R.p_grp[gi][t]); else f << "NA";
@@ -4908,7 +4986,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     };
     auto wr_alpha = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
         if (!multi_a) return;
-        for (size_t k = 0; k < ctx.alphas.size(); ++k) {
+        for (size_t k = 0; k < NMOD; ++k) {
             f << '\t';
             if (q < R.p_alpha.size() && (size_t) t < R.p_alpha[q].size() && k < R.p_alpha[q][t].size())
                 wr(f, R.p_alpha[q][t][k]);
@@ -5011,7 +5089,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                        << 0 << '\t' << nb << '\t' << GB.name[si] << '\t' << GB.m[si] << '\t' << label(t)
                        << "\tNA\tNA\tNA\tNA\t";
                     wr(f3, GB.p[si][t]); f3 << "\tNA";
-                    if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f3 << "\tNA";
+                    if (multi_a) for (size_t k = 0; k < NMOD; ++k) f3 << "\tNA";
                     if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
                     if (bur) {
                         f3 << '\t'; wr(f3, GB.p[si][t]);
@@ -5027,7 +5105,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                    << "NA\t" << nb << "\tACAT\t" << mtot << '\t' << label(t)
                    << "\tNA\tNA\tNA\tNA\t";
                 wr(f3, acat_combine(pv, pw)); f3 << "\tNA";
-                if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f3 << "\tNA";
+                if (multi_a) for (size_t k = 0; k < NMOD; ++k) f3 << "\tNA";
                 if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
                 if (bur) for (size_t k = 0; k < NALB + 1; ++k) f3 << "\tNA";
                 if (pr.coher) f3 << "\tNA\tNA";
@@ -5086,7 +5164,8 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          std::string out_file = "",
                          int batch_size = 64,
                          int n_threads = 0,
-                         Rcpp::Nullable<Rcpp::List> burden_groups = R_NilValue) {
+                         Rcpp::Nullable<Rcpp::List> burden_groups = R_NilValue,
+                         Rcpp::Nullable<Rcpp::NumericMatrix> variant_weights = R_NilValue) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
@@ -5118,6 +5197,38 @@ Rcpp::List stratgwas_run(const std::string& filename,
             for (size_t k = 0; k < alphas.size(); ++k) Rcout << (k ? ", " : "") << alphas[k];
             Rcout << "}; vg / se / h2 use alpha = " << alphas[0] << ".\n";
         }
+    }
+    // ---- variant weights -> the tested models (alphas x {unweighted, every weight}) ----
+    if (variant_weights.isNotNull()) {
+        if (coher || !SPA) Rcout << "variant_weights ignored (" << (coher ? "coher = TRUE" : "SPA = FALSE") << ").\n";
+        else {
+            Rcpp::NumericMatrix W(variant_weights.get());
+            if (W.nrow() != ctx.n_snps) stop("variant_weights must have one row per .bim variant (%d), not %d", ctx.n_snps, W.nrow());
+            Rcpp::CharacterVector cn;
+            if (!Rf_isNull(Rcpp::colnames(W))) cn = Rcpp::colnames(W);
+            for (int w = 0; w < W.ncol(); ++w) {
+                std::vector<float> v(ctx.n_snps);
+                for (int i = 0; i < ctx.n_snps; ++i) {
+                    const double x = W(i, w);
+                    if (!std::isfinite(x) || x <= 0.0) stop("variant_weights must be finite and > 0 (column %d, row %d)", w + 1, i + 1);
+                    v[i] = (float) x;
+                }
+                ctx.vw.push_back(v);
+                ctx.vw_names.push_back(cn.size() == W.ncol() ? Rcpp::as<std::string>(cn[w]) : "w" + std::to_string(w + 1));
+            }
+        }
+    }
+    for (int w = -1; w < (int) ctx.vw.size(); ++w)
+        for (size_t k = 0; k < alphas.size(); ++k) {
+            std::ostringstream o; if (w >= 0) o << ctx.vw_names[w] << "_"; o << alphas[k];
+            ctx.mod_a.push_back(alphas[k]); ctx.mod_w.push_back(w); ctx.mod_name.push_back(o.str());
+        }
+    if (!ctx.vw.empty()) {
+        Rcout << "Variant weights: " << ctx.vw.size() << " weighted model(s) per alpha (";
+        for (size_t w = 0; w < ctx.vw.size(); ++w) Rcout << (w ? ", " : "") << ctx.vw_names[w];
+        Rcout << "): h2_j ~ [2f(1-f)]^(1+alpha) w_j; variance-component and burden tests (not ACAT-V) at every alpha, "
+              << "in the omnibus p-value (columns p_alpha_<weight>_<alpha>, p_burden_<weight>_<alpha>); "
+              << "a category whose variants all have the same weight is not re-tested.\n";
     }
     const int P = ctx.n_pheno;
 

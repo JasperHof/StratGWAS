@@ -31,6 +31,9 @@ sparrow(
   refine_p = 0.05,
   conditional = FALSE,
   burden_groups = NULL,
+  variant_scores = NULL,
+  score_transform = c("rank", "log"),
+  score_floor = 0.1,
   n_threads = 0,
   batch_size = 64
 )
@@ -119,6 +122,27 @@ category also has its own burden test per alpha, which is part of its omnibus p-
 split into blocks (\code{max_gene_snps}) also get gene-wide burdens per category and group over all
 blocks: rows with \code{block = 0}, included in the gene-level ACAT. Burden tests are univariate and
 marginal: not used with \code{coher = TRUE} or \code{conditional = TRUE}. NULL = no groups (default).}
+
+\item{variant_scores}{Optional per-variant scores (e.g. SpliceAI DS_MAX, AlphaMissense, CADD):
+a data frame or a file with a header, variant IDs (as in the .bim) in the first column and
+one numeric column per score (NA = no score). Each score and each transform in
+\code{score_transform} gives a WEIGHTED model: the heritability model of variant j becomes
+\link{2f(1-f)}^(1+alpha) w_j, with w_j = score_floor + (1 - score_floor) g(s_j) and g the transformed
+score in \link{0, 1}. Variance-component and burden tests are run under every weighted model and
+alpha and enter the omnibus p-value next to the unweighted tests (which are always kept);
+estimates (vg, h2) stay unweighted. Variants without a score get the median weight of the
+scored variants of their category; a category whose variants all have the same weight is not
+re-tested. Univariate analyses only (ignored with coher = TRUE).}
+
+\item{score_transform}{Transforms g of each score (scores are often very skewed):
+"rank" (percentile rank over the scored variants: robust, gentle contrast), "log"
+(log(1 + 99 z) / log(100) of the min-max scaled score z: concave, lifts small scores),
+"sqrt" (sqrt(z)), "linear" (z), "square" (z^2: emphasises the top) and "step:\if{html}{\out{<t>}}"
+(1 if score >= t, else 0, e.g. "step:0.2" for SpliceAI). Each transform adds one weighted
+model per score (and per alpha), so keep the number small.}
+
+\item{score_floor}{Weight of the lowest-scoring variants (0 < score_floor <= 1): variants are
+down-weighted, never removed, so the test stays robust when a score is uninformative.}
 
 \item{n_threads}{Number of threads (0 = RcppParallel default).}
 
