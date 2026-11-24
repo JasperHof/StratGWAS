@@ -2411,6 +2411,11 @@ static bool g_cond_lead = false;
 // per-category burden test in the omnibus p-value (univariate, not with conditional = TRUE);
 // switched off with the environment variable SPARROW_NO_BURDEN
 static bool g_burden = true;
+// burden MAF bins (nested): a burden over the variants with MAF < bin, plain minor-allele counts;
+// 1 = all variants. As the AAF bins of SAIGE-GENE+ / REGENIE.
+static const double g_bur_maf[3] = {1e-4, 1e-3, 1.0};
+static const char* g_bur_maf_name[3] = {"1e-04", "0.001", "all"};
+static const size_t g_nbur = 3;
 // burden groups: annotation-column indices (0-based) of each group, and the group names
 static std::vector< std::vector<int> > g_bgrp;
 static std::vector<std::string> g_bgrp_name;
@@ -3931,21 +3936,21 @@ static double acatv_p(const ChunkDataA& cd, size_t qcat,
 }
 
 // ---------------------------------------------------------------------------
-// Burden test for one category of one unit, at one alpha.
+// Burden test for one category (or group of categories) of one unit, in one MAF bin.
 //
-// The burden genotype is the sum of the category's columns of V at that alpha, each
-// oriented to the minor allele:  c = sum_j s_j V_j,  s_j = sign of the third moment of V_j
-// (a standardised count of the minor allele is right-skewed). V_j is the standardised
-// genotype times sqrt([2f(1-f)]^(1+alpha)), so the burden weights are the square roots
-// of the per-variant variances of the variance-component model: alpha = 0 gives the
-// plain count of minor alleles, alpha = -1 weights each variant by 1 / sd.
+// The burden genotype is the (centred) count of minor alleles over the category's variants
+// with MAF below the bin (nested bins < 1e-4, < 1e-3, all; collapsed pseudo-variants are
+// ultra-rare and in every bin), as the AAF bins of SAIGE-GENE+ / REGENIE. Each column is
+// oriented to the minor allele by the sign of its third moment (a standardised count of
+// the minor allele is right-skewed).
 //
 // Quantitative traits: score  T = c'y,  Var(T) = Vp ||c||^2  (Vp: variance of y), normal.
-// Binary traits: T = sum_i g~_i (b_i - pi_i), with g = c - min(c) (zero for individuals
-// without a minor allele), g~ = g minus its P(case)-weighted mean (intercept projected out,
-// as in SAIGE) and pi the null P(case) of the exact test. Two-sided p-value:
-//   |z| < 1: normal; <= 12 carriers: exact distribution of T (sum of independent two-point
-//   variables); otherwise: normal if |z| < 2, else saddlepoint (Lugannani-Rice) on each tail,
+// Binary traits: T = sum_i g~_i (b_i - pi_i), with g = minor-allele count of individual i over
+// the variants (from the raw genotypes: carriers only, zero for everybody else; c - min(c)
+// only for variants without a carrier list), g~ = g minus its P(case)-weighted mean (intercept
+// projected out, as in SAIGE) and pi the null P(case) of the exact test. Two-sided p-value:
+//   |z| < 1: normal; <= 200 carriers: exact distribution of T (lattice convolution, see
+//   burden_binary_p); otherwise: normal if |z| < 2, else saddlepoint (Lugannani-Rice) on each tail,
 //   with the cumulant generating function K(t) = sum_carriers [log(1 - pi_i + pi_i e^{t g~_i})
 //   - t g~_i pi_i] + t^2 v0 / 2, the non-carriers being approximately normal (variance v0).
 // ---------------------------------------------------------------------------
@@ -4007,19 +4012,27 @@ static double burden_spa_upper(const std::vector<double>& g, const std::vector<d
 }
 
 // Two-sided p-value of a binary burden.  g: burden genotype of the carriers (>= 0, zero for
-// everybody else), pp: their null P(case), Tc = sum_carriers g (b - p), sumW = sum_i p_i(1-p_i)
-// and sumR = sum_i (b_i - p_i) over ALL individuals.
+// everybody else), pp: their null P(case), cb: their case status (0/1), Tc = sum_carriers g (b - p),
+// sumW = sum_i p_i(1-p_i) and sumR = sum_i (b_i - p_i) over ALL individuals.
 // As in SAIGE, the intercept is projected out of the burden genotype: g~ = g - gbar with
 // gbar = sum W g / sum W, so the non-carriers contribute -gbar sum (b - p), approximately
 // N(0, gbar^2 sum_noncarriers W), and Var(T) = sum W g^2 - (sum W g)^2 / sum W. (Without the
 // projection the variance is overstated and the test is conservative when the category has
 // many carriers.)
+// Up to 200 carriers the p-value is exact (mid-p): T = sum g b - sum g p depends on the case status
+// only through S = sum g b, whose distribution (independent Bernoulli(p_i) cases, weights g_i)
+// is a convolution on a lattice of width u (g rounded to multiples of u, at most 20000 steps;
+// the rounding error is negligible next to the discreteness of S). With few expected case
+// carriers the saddlepoint approximation is anti-conservative; the exact test is not.
 static double burden_binary_p(const std::vector<double>& g, const std::vector<double>& pp,
+                              const std::vector<unsigned char>& cb,
                               double Tc, double sumW, double sumR) {
     const size_t k = g.size();
     if (k == 0) return NA_REAL;
-    double swg = 0.0, swc = 0.0, scale = 0.0;
-    for (size_t i = 0; i < k; ++i) { const double w = pp[i] * (1.0 - pp[i]); swg += w * g[i]; swc += w; scale += g[i]; }
+    double swg = 0.0, swc = 0.0, scale = 0.0, gmax = 0.0;
+    for (size_t i = 0; i < k; ++i) {
+        const double w = pp[i] * (1.0 - pp[i]); swg += w * g[i]; swc += w; scale += g[i]; gmax = std::max(gmax, g[i]);
+    }
     const double gbar = (sumW > 0.0) ? swg / sumW : 0.0;
     const double v0 = gbar * gbar * std::max(0.0, sumW - swc);
     std::vector<double> gt(k);
@@ -4030,33 +4043,39 @@ static double burden_binary_p(const std::vector<double>& g, const std::vector<do
     const double s = std::abs(T);
     const double z = s / std::sqrt(var);
     if (z < 1.0) return std::erfc(z / std::sqrt(2.0));          // p > 0.3: the normal approximation suffices
-    if (k <= 12) {                                              // exact: distribution of Tc over the carriers
-        // (the projection is negligible for so few carriers). d is kept sorted by value:
-        // both shifted copies are sorted, so one merge per carrier.
-        const double sc = std::abs(Tc), tol = 1e-9 * scale;
-        std::vector< std::pair<double, double> > d(1, std::make_pair(0.0, 1.0)), lo, hi, nd;
-        bool ok = true;
-        for (size_t i = 0; i < k && ok; ++i) {
-            lo.resize(d.size()); hi.resize(d.size());
-            for (size_t r = 0; r < d.size(); ++r) {
-                hi[r] = std::make_pair(d[r].first + g[i] * (1.0 - pp[i]), d[r].second * pp[i]);
-                lo[r] = std::make_pair(d[r].first - g[i] * pp[i], d[r].second * (1.0 - pp[i]));
-            }
-            nd.resize(2 * d.size());
-            std::merge(lo.begin(), lo.end(), hi.begin(), hi.end(), nd.begin());
-            d.clear();
-            for (size_t r = 0; r < nd.size(); ++r) {                 // merge equal values (lattice)
-                if (!d.empty() && nd[r].first - d.back().first <= tol) d.back().second += nd[r].second;
-                else d.push_back(nd[r]);
-            }
-            if (d.size() > 200000) ok = false;
+    if (k <= 200 && cb.size() == k) {                           // exact (the projection is negligible here)
+        const double u = std::max(scale / 20000.0, gmax / 10000.0);
+        std::vector<int> h(k);
+        long L = 0, sobs = 0;
+        double mu = 0.0;
+        for (size_t i = 0; i < k; ++i) {
+            h[i] = std::max(1, (int) std::lround(g[i] / u));
+            L += h[i]; sobs += cb[i] ? h[i] : 0; mu += h[i] * pp[i];
         }
-        if (ok) {
-            double p = 0.0;
-            for (size_t r = 0; r < d.size(); ++r)
-                if (d[r].first >= sc - tol || d[r].first <= -sc + tol) p += d[r].second;
-            return std::min(1.0, p);
+        std::vector<double> f(L + 1, 0.0);
+        f[0] = 1.0;
+        long top = 0;
+        for (size_t i = 0; i < k; ++i) {                          // f <- f (1 - p_i) + shift(f, h_i) p_i
+            const int hi = h[i]; const double pi = pp[i];
+            for (long r = top; r >= 0; --r) {
+                const double v = f[r];
+                if (v == 0.0) continue;
+                f[r + hi] += v * pi; f[r] = v * (1.0 - pi);
+            }
+            top += hi;
         }
+        // two-sided mid-p: outcomes further from the mean than the observed one count fully,
+        // outcomes exactly as far (the observed one, and its mirror if on the lattice) count half.
+        // The usual exact p (counting them fully) is conservative for so discrete a statistic.
+        const double dev = std::abs((double) sobs - mu), eps = 1e-9 * (1.0 + mu);
+        double p = 0.0;
+        for (long r = 0; r <= L; ++r) {
+            if (f[r] == 0.0) continue;
+            const double d = std::abs((double) r - mu);
+            if (d > dev + eps) p += f[r];
+            else if (d >= dev - eps) p += 0.5 * f[r];
+        }
+        return std::min(1.0, std::max(p, 0.0));
     }
     if (z < 2.0) return std::erfc(z / std::sqrt(2.0));
     const double pu = burden_spa_upper(gt, pp, v0, s);
@@ -4195,16 +4214,17 @@ struct Worker : public RcppParallel::Worker {
                     }
                 }
             }
-            // ---- burden test, one per category and alpha ---------------------
+            // ---- burden test, one per category and MAF bin -------------------
             // Univariate association passes (not with conditional = TRUE: like ACAT-V,
             // the burden is a marginal test). The omnibus becomes
-            //     p_spa = ACAT( VC p at each alpha [, ACAT-V p at each alpha], burden p at each alpha )
-            // with equal weights; p_burden keeps the ACAT over alphas of the burden p-values.
-            // Burden groups (burden_groups): one more burden test per group of categories
-            // (the union of their columns), ACAT over alphas, reported as its own row and
-            // entering the gene-level ACAT like a category (weight: its number of columns).
+            //     p_spa = ACAT( VC p at each alpha [, ACAT-V p at each alpha], burden p in each MAF bin )
+            // with equal weights; p_burden keeps the ACAT over the bins of the burden p-values.
+            // A bin with no variant, or with the same variants as the next larger bin, is skipped.
+            // Burden groups (burden_groups): the same burdens on the union of the group's
+            // categories, ACAT over the bins, reported as its own row and entering the
+            // gene-level ACAT like a category (weight: its number of columns).
             if (spa && g_burden && !pr.coher && gm.ok) {
-                const size_t NAL = std::max<size_t>(1, ctx.alphas.size());
+                const size_t NAL = g_nbur;                         // burden MAF bins
                 const double a0 = ctx.alphas.empty() ? -1.0 : ctx.alphas[0];
                 const int n = (int) cd.V.rows();
                 const size_t A = cd.cat_m.size();
@@ -4230,21 +4250,53 @@ struct Worker : public RcppParallel::Worker {
                     R.p_bur.assign(A, std::vector< std::vector<double> >(NT, std::vector<double>(NAL, NA_REAL)));
                     R.p_burc.assign(A, std::vector<double>(NT, NA_REAL));
                     std::vector<double> sumW(NT, -1.0), sumR(NT, 0.0);
-                    // burden genotype at alpha k of a set of categories: sum of their oriented columns
-                    auto bgeno = [&](const std::vector<int>& qs, size_t k) -> Eigen::VectorXd {
-                        const double ak = ctx.alphas.empty() ? a0 : ctx.alphas[k];
+                    // burden genotype of a set of categories in MAF bin k: sum of the minor-allele counts
+                    // (centred) of their columns with MAF < bin. V holds standardised genotypes times the
+                    // alpha-a0 weight, so the count is V_j * sign_j * w(f_j, alpha = 0) / w(f_j, a0).
+                    // nc returns the number of columns in the bin.
+                    auto bgeno = [&](const std::vector<int>& qs, size_t k, int& nc, std::vector<int>& cols) -> Eigen::VectorXd {
                         Eigen::VectorXd c = Eigen::VectorXd::Zero(n);
+                        nc = 0; cols.clear();
                         for (size_t r = 0; r < qs.size(); ++r) {
                             const int q = qs[r], m = cd.cat_m[q];
-                            Eigen::VectorXf wq(m);
-                            for (int j = 0; j < m; ++j)
-                                wq[j] = (float) (sg[o[q] + j] * alpha_w(cd.colmaf[o[q] + j], ak) / alpha_w(cd.colmaf[o[q] + j], a0));
+                            Eigen::VectorXf wq = Eigen::VectorXf::Zero(m);
+                            int nq = 0;
+                            for (int j = 0; j < m; ++j) {
+                                const float f = cd.colmaf[o[q] + j];
+                                if (!(f < g_bur_maf[k])) continue;
+                                wq[j] = (float) (sg[o[q] + j] * alpha_w(f, 0.0) / alpha_w(f, a0)); ++nq;
+                                cols.push_back(o[q] + j);
+                            }
+                            if (nq == 0) continue;
+                            nc += nq;
                             c += (cd.V.middleCols(o[q], m) * wq).cast<double>();
                         }
                         return c;
                     };
+                    // binary traits: the carriers of a set of columns and their minor-allele counts, from
+                    // the raw genotypes (the columns of V have the covariates projected out, so in V the
+                    // non-carriers are not one constant value). false if a column has no carrier list
+                    // (more carriers than car_max): then the covariate-adjusted burden c is used instead.
+                    const bool have_car = (int) cd.car.size() == cd.K;
+                    auto bcar = [&](const std::vector<int>& cols, std::vector<int>& ci, std::vector<double>& gi) -> bool {
+                        ci.clear(); gi.clear();
+                        if (!have_car) return false;
+                        std::vector< std::pair<int, double> > pr2;
+                        for (size_t r = 0; r < cols.size(); ++r) {
+                            const int j = cols[r];
+                            if (cd.car[j].empty()) return false;
+                            for (size_t z = 0; z < cd.car[j].size(); ++z) pr2.push_back(std::make_pair(cd.car[j][z], (double) cd.dos[j][z]));
+                        }
+                        std::sort(pr2.begin(), pr2.end());
+                        for (size_t r = 0; r < pr2.size(); ++r) {
+                            if (!ci.empty() && ci.back() == pr2[r].first) gi.back() += pr2[r].second;
+                            else { ci.push_back(pr2[r].first); gi.push_back(pr2[r].second); }
+                        }
+                        return !ci.empty();
+                    };
                     // two-sided burden p-value of burden genotype c for every trait (NA where not computable)
-                    auto bpvals = [&](const Eigen::VectorXd& c, std::vector<double>& pt) {
+                    auto bpvals = [&](const Eigen::VectorXd& c, const std::vector<int>* sci, const std::vector<double>* sgi,
+                                      std::vector<double>& pt) {
                         pt.assign(NT, NA_REAL);
                         if (!bin) {
                             const double c2 = c.squaredNorm();
@@ -4256,11 +4308,16 @@ struct Worker : public RcppParallel::Worker {
                             }
                             return;
                         }
-                        const double cmin = c.minCoeff(), cmax = c.maxCoeff();
-                        const double ctol = 1e-6 * (cmax - cmin);
-                        if (!(cmax - cmin > 0.0)) return;
-                        std::vector<int> ci;
-                        for (int i = 0; i < n; ++i) if (c[i] - cmin > ctol) ci.push_back(i);
+                        // carriers and burden genotype g (>= 0, zero for everybody else): from the raw
+                        // genotypes when available, else c - min(c)
+                        std::vector<int> ci; std::vector<double> gv;
+                        if (sci && sgi && !sci->empty()) { ci = *sci; gv = *sgi; }
+                        else {
+                            const double cmin = c.minCoeff(), cmax = c.maxCoeff();
+                            const double ctol = 1e-6 * (cmax - cmin);
+                            if (!(cmax - cmin > 0.0)) return;
+                            for (int i = 0; i < n; ++i) if (c[i] - cmin > ctol) { ci.push_back(i); gv.push_back(c[i] - cmin); }
+                        }
                         for (size_t t = 0; t < NT; ++t) {
                             if (t >= SV.bx.b.size() || !SV.bx.b[t]) continue;
                             const std::vector<unsigned char>& bb = *SV.bx.b[t];
@@ -4273,24 +4330,41 @@ struct Worker : public RcppParallel::Worker {
                                 sumW[t] = sw; sumR[t] = sr;
                             }
                             std::vector<double> g, pp; g.reserve(ci.size()); pp.reserve(ci.size());
+                            std::vector<unsigned char> cbv; cbv.reserve(ci.size());
                             double T = 0.0;
                             for (size_t r = 0; r < ci.size(); ++r) {
                                 const int i = ci[r];
                                 const double pi = std::min(std::max((double) SV.bx.PiF(i, t), 1e-8), 1.0 - 1e-8);
-                                const double gi = c[i] - cmin;
-                                g.push_back(gi); pp.push_back(pi);
+                                const double gi = gv[r];
+                                g.push_back(gi); pp.push_back(pi); cbv.push_back(bb[i]);
                                 T += gi * ((double) bb[i] - pi);
                             }
-                            pt[t] = burden_binary_p(g, pp, T, sumW[t], sumR[t]);
+                            pt[t] = burden_binary_p(g, pp, cbv, T, sumW[t], sumR[t]);
                         }
                     };
-                    std::vector<double> pt;
+                    // burden p-values of a set of categories in every MAF bin; a bin with no column,
+                    // or with exactly the columns of the next larger bin (nested: same count), is NA
+                    auto bbins = [&](const std::vector<int>& qs, std::vector< std::vector<double> >& pk) {
+                        pk.assign(NAL, std::vector<double>(NT, NA_REAL));
+                        std::vector<int> nc(NAL, 0);
+                        std::vector<Eigen::VectorXd> cs(NAL);
+                        std::vector< std::vector<int> > cols(NAL);
+                        for (size_t k = 0; k < NAL; ++k) cs[k] = bgeno(qs, k, nc[k], cols[k]);
+                        std::vector<double> pt;
+                        std::vector<int> ci; std::vector<double> gi;
+                        for (size_t k = 0; k < NAL; ++k) {
+                            if (nc[k] == 0 || (k + 1 < NAL && nc[k] == nc[k + 1])) continue;
+                            const bool sp = bin && bcar(cols[k], ci, gi);
+                            bpvals(cs[k], sp ? &ci : 0, sp ? &gi : 0, pt);
+                            pk[k] = pt;
+                        }
+                    };
+                    std::vector< std::vector<double> > pk;
                     for (size_t q = 0; q < A; ++q) {
                         if (cd.cat_m[q] <= 0) continue;
-                        for (size_t k = 0; k < NAL; ++k) {
-                            bpvals(bgeno(std::vector<int>(1, (int) q), k), pt);
-                            for (size_t t = 0; t < NT; ++t) R.p_bur[q][t][k] = pt[t];
-                        }
+                        bbins(std::vector<int>(1, (int) q), pk);
+                        for (size_t k = 0; k < NAL; ++k)
+                            for (size_t t = 0; t < NT; ++t) R.p_bur[q][t][k] = pk[k][t];
                         for (size_t t = 0; t < NT; ++t) {
                             std::vector<double> bv, bw, ov, ow;
                             for (size_t k = 0; k < NAL; ++k)
@@ -4320,10 +4394,9 @@ struct Worker : public RcppParallel::Worker {
                     for (size_t gi = 0; gi < NG; ++gi) {
                         if (gq[gi].size() < 2) continue;
                         for (size_t r = 0; r < gq[gi].size(); ++r) R.grp_m[gi] += cd.cat_m[gq[gi][r]];
-                        for (size_t k = 0; k < NAL; ++k) {
-                            bpvals(bgeno(gq[gi], k), pt);
-                            for (size_t t = 0; t < NT; ++t) R.p_grpa[gi][t][k] = pt[t];
-                        }
+                        bbins(gq[gi], pk);
+                        for (size_t k = 0; k < NAL; ++k)
+                            for (size_t t = 0; t < NT; ++t) R.p_grpa[gi][t][k] = pk[k][t];
                         for (size_t t = 0; t < NT; ++t) {
                             std::vector<double> bv, bw;
                             for (size_t k = 0; k < NAL; ++k)
@@ -4596,15 +4669,13 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
             if (has && k < R.p_acatv[q][t].size()) wr(f, R.p_acatv[q][t][k]); else f << "NA";
         }
     };
-    // burden columns: p_burden (ACAT over alphas) and p_burden_<alpha>
+    // burden columns: p_burden (ACAT over the MAF bins) and p_burden_maf<bin>
     const bool bur = pr.spa && g_burden && !pr.coher;
-    const size_t NALB = std::max<size_t>(1, ctx.alphas.size());
+    const size_t NALB = g_nbur;                                 // burden MAF bins
     std::string bur_hdr;
     if (bur) {
         bur_hdr = "\tp_burden";
-        for (size_t k = 0; k < NALB; ++k) {
-            std::ostringstream o; o << "\tp_burden_" << (ctx.alphas.empty() ? -1.0 : ctx.alphas[k]); bur_hdr += o.str();
-        }
+        for (size_t k = 0; k < NALB; ++k) bur_hdr += std::string("\tp_burden_maf") + g_bur_maf_name[k];
     }
     auto wr_bur = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
         if (!bur) return;
@@ -4879,7 +4950,8 @@ Rcpp::List stratgwas_run(const std::string& filename,
     g_refine_p = refine_p;
     g_cond_lead = conditional && !coher;
     g_burden = !coher && !g_cond_lead && std::getenv("SPARROW_NO_BURDEN") == 0;
-    if (g_burden && SPA) Rcout << "Burden test: one per category and alpha, included in the omnibus p-value (p_burden).\n";
+    if (g_burden && SPA) Rcout << "Burden test: per category, minor-allele counts in nested MAF bins (< 1e-4, < 1e-3, all), "
+                               << "included in the omnibus p-value (p_burden, p_burden_maf<bin>).\n";
     // burden groups: list of integer vectors (0-based annotation columns), names = group names
     g_bgrp.clear(); g_bgrp_name.clear();
     if (burden_groups.isNotNull()) {

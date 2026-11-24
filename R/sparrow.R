@@ -53,8 +53,8 @@
 #'   best combined with `gene_flank` and without `kvik_summaries` (ACAT-V is not conditional).
 #' @param burden_groups Optional named list of extra burden tests on groups of categories, e.g.
 #'   `list(deleterious = c("pLoF", "damaging_missense", "spliceai2_gt040"))`. Each group (at least
-#'   two category names from `annot_names`) gets one burden test per alpha over the union of its
-#'   variants; the p-value (ACAT over alpha) is reported as its own row (category = group name) and
+#'   two category names from `annot_names`) gets burden tests (nested MAF bins < 1e-4, < 1e-3, all) over the union of its
+#'   variants; the p-value (ACAT over the bins) is reported as its own row (category = group name) and
 #'   enters the gene-level ACAT like a category. Every category also has its own burden test, which
 #'   is part of its omnibus p-value. Burden tests are univariate and marginal: not used with
 #'   `coher = TRUE` or `conditional = TRUE`. NULL = no groups (default).
