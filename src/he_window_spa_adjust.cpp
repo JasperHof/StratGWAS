@@ -2167,6 +2167,14 @@ struct ChunkResultA {
     std::vector<int> grp_m;
     std::vector< std::vector<double> > p_grp;
     std::vector< std::vector< std::vector<double> > > p_grpa;
+    // blocks of a split gene only: the category columns' raw carriers, for the gene-wide burdens
+    // (global category id, MAF as used by the alpha weights, SD of the raw column, carriers and
+    // minor-allele dosages). Freed once the gene-wide burdens are computed.
+    std::vector<int> gw_cat;
+    std::vector<float> gw_maf;
+    std::vector<double> gw_sd;
+    std::vector< std::vector<int> > gw_car;
+    std::vector< std::vector<unsigned char> > gw_dos;
 };
 
 // Read a SNP index range, project covariates, apply alpha; return false on error.
@@ -2176,7 +2184,7 @@ static bool read_block(const ChunkContext& ctx, int lo, int hi, Cell& c, bool co
     const bool coll = collapse && ctx.collapse_mac > 0;
     if (!read_cell_idx(ctx.bed, ctx.geno_keep, lo, hi, c,
                        coll ? &ctx.snp_cat : 0, coll ? ctx.collapse_mac : 0, 5,
-                       ctx.bin_exact ? ctx.car_max : 0,
+                       ctx.car_max,
                        coll ? ctx.min_category_mac : 0)) return false;
     if (ctx.covZ.cols() > 0) project_covariates(c.X, ctx.covZ, ctx.covM);
     apply_alpha(c.X, c.maf, ctx.alpha, 0, lo);
@@ -2242,7 +2250,7 @@ static bool make_chunk(const ChunkContext& ctx, size_t ci, int a, int b,
     cd.V = GenoMat(ctx.n_inds, cd.K);
     cd.colmaf.assign(cd.K, 0.f);
     cd.colbim.assign(cd.K, -1);
-    const bool keep_car = ctx.bin_exact;
+    const bool keep_car = ctx.car_max > 0;
     if (keep_car) { cd.car.assign(cd.K, std::vector<int>()); cd.dos.assign(cd.K, std::vector<unsigned char>()); }
     // copy the carrier list of source column j of cell C into column k of V
     auto take_car = [&](const Cell& C, int j, int k) {
@@ -2411,11 +2419,11 @@ static bool g_cond_lead = false;
 // per-category burden test in the omnibus p-value (univariate, not with conditional = TRUE);
 // switched off with the environment variable SPARROW_NO_BURDEN
 static bool g_burden = true;
-// burden MAF bins (nested): a burden over the variants with MAF < bin, plain minor-allele counts;
-// 1 = all variants. As the AAF bins of SAIGE-GENE+ / REGENIE.
-static const double g_bur_maf[3] = {1e-4, 1e-3, 1.0};
-static const char* g_bur_maf_name[3] = {"1e-04", "0.001", "all"};
-static const size_t g_nbur = 3;
+// burdens per alpha: the burden genotype of a category is the sum of its columns with the
+// alpha-model weights [2f(1-f)]^((1+alpha)/2) of the standardised genotypes, one burden per alpha.
+// genes split into blocks also get a gene-wide burden per category and group (g_bur_gene), from
+// the raw carriers of every block.
+static bool g_bur_gene = true;
 // burden groups: annotation-column indices (0-based) of each group, and the group names
 static std::vector< std::vector<int> > g_bgrp;
 static std::vector<std::string> g_bgrp_name;
@@ -3882,7 +3890,7 @@ struct ChunkParams {
 
 // One unit of work: its own range [a,b) plus two flank ranges. `win` is the
 // index of the gene a gene block belongs to (unused for chunks).
-struct Job { size_t ci; int a, b, fL0, fL1, fR0, fR1; int win; bool gene = false; };
+struct Job { size_t ci; int a, b, fL0, fL1, fR0, fR1; int win; bool gene = false; bool split = false; };
 
 // ---------------------------------------------------------------------------
 // ACAT-V for one category of one unit (gene block / chunk), at one alpha.
@@ -3936,13 +3944,12 @@ static double acatv_p(const ChunkDataA& cd, size_t qcat,
 }
 
 // ---------------------------------------------------------------------------
-// Burden test for one category (or group of categories) of one unit, in one MAF bin.
+// Burden test for one category (or group of categories) of one unit, at one alpha.
 //
-// The burden genotype is the (centred) count of minor alleles over the category's variants
-// with MAF below the bin (nested bins < 1e-4, < 1e-3, all; collapsed pseudo-variants are
-// ultra-rare and in every bin), as the AAF bins of SAIGE-GENE+ / REGENIE. Each column is
-// oriented to the minor allele by the sign of its third moment (a standardised count of
-// the minor allele is right-skewed).
+// The burden genotype is the (centred) sum of the category's minor-allele counts,
+// weighted as the variance-component test weights them at each alpha (see the Worker). Each
+// column is oriented to the minor allele by the sign of its third moment (a standardised count
+// of the minor allele is right-skewed).
 //
 // Quantitative traits: score  T = c'y,  Var(T) = Vp ||c||^2  (Vp: variance of y), normal.
 // Binary traits: T = sum_i g~_i (b_i - pi_i), with g = minor-allele count of individual i over
@@ -4214,23 +4221,39 @@ struct Worker : public RcppParallel::Worker {
                     }
                 }
             }
-            // ---- burden test, one per category and MAF bin -------------------
+            // ---- burden test, one per category and alpha ----------------------
             // Univariate association passes (not with conditional = TRUE: like ACAT-V,
             // the burden is a marginal test). The omnibus becomes
-            //     p_spa = ACAT( VC p at each alpha [, ACAT-V p at each alpha], burden p in each MAF bin )
-            // with equal weights; p_burden keeps the ACAT over the bins of the burden p-values.
-            // A bin with no variant, or with the same variants as the next larger bin, is skipped.
+            //     p_spa = ACAT( VC p at each alpha [, ACAT-V p at each alpha], burden p at each alpha )
+            // with equal weights; p_burden keeps the ACAT over alphas of the burden p-values.
+            // The burden genotype at alpha is the sum of the category's columns as the variance-
+            // component test sees them at that alpha: standardised genotype x [2f(1-f)]^((1+alpha)/2),
+            // i.e. minor-allele counts weighted per allele by u_j = [2f(1-f)]^((1+alpha)/2) / sd_j
+            // (alpha = 0: plain counts; alpha = -1: every column standardised; collapsed
+            // pseudo-variants weighted as one variant of their maximum MAF, as in the VC test).
             // Burden groups (burden_groups): the same burdens on the union of the group's
-            // categories, ACAT over the bins, reported as its own row and entering the
-            // gene-level ACAT like a category (weight: its number of columns).
+            // categories, reported as its own row and entering the gene-level ACAT like a category
+            // (weight: its number of columns).
+            const std::vector<double> bal = ctx.alphas.empty() ? std::vector<double>(1, ctx.alpha) : ctx.alphas;
+            const size_t NAL = bal.size();
+            const double a0 = ctx.alpha;                       // the alpha V was read at
+            const int n = (int) cd.V.rows();
+            const size_t A = cd.cat_m.size();
+            std::vector<int> o(A + 1, 0);
+            for (size_t q = 0; q < A; ++q) o[q + 1] = o[q] + cd.cat_m[q];
+            // SD of every category column from its raw carriers (NaN without a carrier list)
+            const bool have_car = (int) cd.car.size() == cd.K;
+            std::vector<double> colsd(o[A], NA_REAL);
+            if (have_car)
+                for (int j = 0; j < o[A]; ++j) {
+                    if (cd.car[j].empty()) continue;
+                    double s1 = 0.0, s2 = 0.0;
+                    for (size_t z = 0; z < cd.dos[j].size(); ++z) { const double d = cd.dos[j][z]; s1 += d; s2 += d * d; }
+                    const double v = (s2 - s1 * s1 / n) / (n - 1);
+                    if (v > 0.0) colsd[j] = std::sqrt(v);
+                }
             if (spa && g_burden && !pr.coher && gm.ok) {
-                const size_t NAL = g_nbur;                         // burden MAF bins
-                const double a0 = ctx.alphas.empty() ? -1.0 : ctx.alphas[0];
-                const int n = (int) cd.V.rows();
-                const size_t A = cd.cat_m.size();
                 // orientation of every category column: sign of its third moment
-                std::vector<int> o(A + 1, 0);
-                for (size_t q = 0; q < A; ++q) o[q + 1] = o[q] + cd.cat_m[q];
                 std::vector<double> sg(o[A], 0.0);
                 for (int j = 0; j < o[A]; ++j)
                     sg[j] = (cd.V.col(j).cast<double>().array().cube().sum() >= 0.0) ? 1.0 : -1.0;
@@ -4250,42 +4273,37 @@ struct Worker : public RcppParallel::Worker {
                     R.p_bur.assign(A, std::vector< std::vector<double> >(NT, std::vector<double>(NAL, NA_REAL)));
                     R.p_burc.assign(A, std::vector<double>(NT, NA_REAL));
                     std::vector<double> sumW(NT, -1.0), sumR(NT, 0.0);
-                    // burden genotype of a set of categories in MAF bin k: sum of the minor-allele counts
-                    // (centred) of their columns with MAF < bin. V holds standardised genotypes times the
-                    // alpha-a0 weight, so the count is V_j * sign_j * w(f_j, alpha = 0) / w(f_j, a0).
-                    // nc returns the number of columns in the bin.
-                    auto bgeno = [&](const std::vector<int>& qs, size_t k, int& nc, std::vector<int>& cols) -> Eigen::VectorXd {
+                    // burden genotype of a set of categories at alpha k (covariate-adjusted, from V:
+                    // V holds standardised genotypes times the alpha-a0 weight); cols: its columns
+                    auto bgeno = [&](const std::vector<int>& qs, size_t k, std::vector<int>& cols) -> Eigen::VectorXd {
                         Eigen::VectorXd c = Eigen::VectorXd::Zero(n);
-                        nc = 0; cols.clear();
+                        cols.clear();
                         for (size_t r = 0; r < qs.size(); ++r) {
                             const int q = qs[r], m = cd.cat_m[q];
-                            Eigen::VectorXf wq = Eigen::VectorXf::Zero(m);
-                            int nq = 0;
+                            if (m <= 0) continue;
+                            Eigen::VectorXf wq(m);
                             for (int j = 0; j < m; ++j) {
                                 const float f = cd.colmaf[o[q] + j];
-                                if (!(f < g_bur_maf[k])) continue;
-                                wq[j] = (float) (sg[o[q] + j] * alpha_w(f, 0.0) / alpha_w(f, a0)); ++nq;
+                                wq[j] = (float) (sg[o[q] + j] * alpha_w(f, bal[k]) / alpha_w(f, a0));
                                 cols.push_back(o[q] + j);
                             }
-                            if (nq == 0) continue;
-                            nc += nq;
                             c += (cd.V.middleCols(o[q], m) * wq).cast<double>();
                         }
                         return c;
                     };
-                    // binary traits: the carriers of a set of columns and their minor-allele counts, from
-                    // the raw genotypes (the columns of V have the covariates projected out, so in V the
-                    // non-carriers are not one constant value). false if a column has no carrier list
-                    // (more carriers than car_max): then the covariate-adjusted burden c is used instead.
-                    const bool have_car = (int) cd.car.size() == cd.K;
-                    auto bcar = [&](const std::vector<int>& cols, std::vector<int>& ci, std::vector<double>& gi) -> bool {
+                    // binary traits: the carriers of a set of columns and their burden genotype at alpha k,
+                    // from the raw genotypes (the columns of V have the covariates projected out, so in V
+                    // the non-carriers are not one constant value). false if a column has no carrier
+                    // list (more carriers than car_max): then the covariate-adjusted burden is used.
+                    auto bcar = [&](const std::vector<int>& cols, size_t k, std::vector<int>& ci, std::vector<double>& gi) -> bool {
                         ci.clear(); gi.clear();
                         if (!have_car) return false;
                         std::vector< std::pair<int, double> > pr2;
                         for (size_t r = 0; r < cols.size(); ++r) {
                             const int j = cols[r];
-                            if (cd.car[j].empty()) return false;
-                            for (size_t z = 0; z < cd.car[j].size(); ++z) pr2.push_back(std::make_pair(cd.car[j][z], (double) cd.dos[j][z]));
+                            if (cd.car[j].empty() || std::isnan(colsd[j])) return false;
+                            const double u = alpha_w(cd.colmaf[j], bal[k]) / colsd[j];
+                            for (size_t z = 0; z < cd.car[j].size(); ++z) pr2.push_back(std::make_pair(cd.car[j][z], u * (double) cd.dos[j][z]));
                         }
                         std::sort(pr2.begin(), pr2.end());
                         for (size_t r = 0; r < pr2.size(); ++r) {
@@ -4342,27 +4360,23 @@ struct Worker : public RcppParallel::Worker {
                             pt[t] = burden_binary_p(g, pp, cbv, T, sumW[t], sumR[t]);
                         }
                     };
-                    // burden p-values of a set of categories in every MAF bin; a bin with no column,
-                    // or with exactly the columns of the next larger bin (nested: same count), is NA
-                    auto bbins = [&](const std::vector<int>& qs, std::vector< std::vector<double> >& pk) {
+                    // burden p-values of a set of categories at every alpha
+                    auto bset = [&](const std::vector<int>& qs, std::vector< std::vector<double> >& pk) {
                         pk.assign(NAL, std::vector<double>(NT, NA_REAL));
-                        std::vector<int> nc(NAL, 0);
-                        std::vector<Eigen::VectorXd> cs(NAL);
-                        std::vector< std::vector<int> > cols(NAL);
-                        for (size_t k = 0; k < NAL; ++k) cs[k] = bgeno(qs, k, nc[k], cols[k]);
                         std::vector<double> pt;
-                        std::vector<int> ci; std::vector<double> gi;
+                        std::vector<int> cols, ci; std::vector<double> gi;
                         for (size_t k = 0; k < NAL; ++k) {
-                            if (nc[k] == 0 || (k + 1 < NAL && nc[k] == nc[k + 1])) continue;
-                            const bool sp = bin && bcar(cols[k], ci, gi);
-                            bpvals(cs[k], sp ? &ci : 0, sp ? &gi : 0, pt);
+                            const Eigen::VectorXd c = bgeno(qs, k, cols);
+                            if (cols.empty()) continue;
+                            const bool sp = bin && bcar(cols, k, ci, gi);
+                            bpvals(c, sp ? &ci : 0, sp ? &gi : 0, pt);
                             pk[k] = pt;
                         }
                     };
                     std::vector< std::vector<double> > pk;
                     for (size_t q = 0; q < A; ++q) {
                         if (cd.cat_m[q] <= 0) continue;
-                        bbins(std::vector<int>(1, (int) q), pk);
+                        bset(std::vector<int>(1, (int) q), pk);
                         for (size_t k = 0; k < NAL; ++k)
                             for (size_t t = 0; t < NT; ++t) R.p_bur[q][t][k] = pk[k][t];
                         for (size_t t = 0; t < NT; ++t) {
@@ -4394,7 +4408,7 @@ struct Worker : public RcppParallel::Worker {
                     for (size_t gi = 0; gi < NG; ++gi) {
                         if (gq[gi].size() < 2) continue;
                         for (size_t r = 0; r < gq[gi].size(); ++r) R.grp_m[gi] += cd.cat_m[gq[gi][r]];
-                        bbins(gq[gi], pk);
+                        bset(gq[gi], pk);
                         for (size_t k = 0; k < NAL; ++k)
                             for (size_t t = 0; t < NT; ++t) R.p_grpa[gi][t][k] = pk[k][t];
                         for (size_t t = 0; t < NT; ++t) {
@@ -4406,10 +4420,171 @@ struct Worker : public RcppParallel::Worker {
                     }
                 }
             }
+            // blocks of a gene split into several: keep the raw carriers of the category columns
+            // for the gene-wide burdens (computed once all blocks of the chromosome are done)
+            if (spa && g_burden && g_bur_gene && !pr.coher && j.split && have_car && !out.empty()) {
+                ChunkResultA& R = out[0][w];
+                R.gw_cat.clear(); R.gw_maf.clear(); R.gw_sd.clear(); R.gw_car.clear(); R.gw_dos.clear();
+                for (size_t q = 0; q < A; ++q)
+                    for (int z = 0; z < cd.cat_m[q]; ++z) {
+                        const int jj = o[q] + z;
+                        R.gw_cat.push_back(cd.cat_id[q]); R.gw_maf.push_back(cd.colmaf[jj]); R.gw_sd.push_back(colsd[jj]);
+                        R.gw_car.push_back(cd.car[jj]); R.gw_dos.push_back(cd.dos[jj]);
+                    }
+            }
             ok[w] = 1;
         }
     }
 };
+
+// ---------------------------------------------------------------------------
+// GENE-WIDE BURDENS of a gene split into blocks (max_gene_snps). The blocks partition the
+// gene's variants, so one burden over all of them is the sum of the blocks' burden genotypes.
+// Per category and burden group, per alpha: the burden genotype is built from the raw carriers
+// of every block with the per-allele weights u_j = [2f(1-f)]^((1+alpha)/2) / sd_j of the
+// within-block burdens, and tested in the same way:
+//   binary: burden_binary_p (exact up to 200 carriers, else normal / saddlepoint);
+//   quantitative: z = c'y / sqrt(Vp c'c), c the centred burden with the covariates projected
+//   out (c = P h, h = g - mean(g), P = I - Z M as for the genotype columns), computed exactly
+//   from the sparse g:  c'y = h'y - a'Z'y,  c'c = h'h - 2 a'Z'h + a'Z'Z a,  a = M h.
+// Each gene-wide p-value is the ACAT over alphas; it is written as a row with block = 0 and
+// enters the gene-level ACAT with weight = the set's number of columns over all blocks.
+// ---------------------------------------------------------------------------
+struct GeneBur {
+    std::vector<std::string> name; std::vector<int> m;
+    std::vector< std::vector<double> > p;                   // [set][trait]
+    std::vector< std::vector< std::vector<double> > > pa;   // [set][trait][alpha]
+};
+struct GwPre {                                             // per chromosome (phenotype variant 0)
+    bool bin = false; int n = 0, P = 0, q = 0;
+    std::vector<double> sumW, sumR, sumY;
+    Eigen::MatrixXd ZtY, ZtZ; Eigen::VectorXd M1, Zt1;
+};
+static void gw_prepare(const ChunkContext& ctx, const PhenoStats& SV, bool binary, GwPre& G) {
+    G = GwPre();
+    G.n = ctx.n_inds; G.P = ctx.n_pheno; G.bin = binary && SV.bx.active;
+    const int n = G.n, P = G.P;
+    if (G.bin) {
+        G.sumW.assign(P, 0.0); G.sumR.assign(P, 0.0);
+        for (int t = 0; t < P; ++t) {
+            if (t >= (int) SV.bx.b.size() || !SV.bx.b[t]) continue;
+            const std::vector<unsigned char>& bb = *SV.bx.b[t];
+            for (int i = 0; i < n; ++i) {
+                const double pi = std::min(std::max((double) SV.bx.PiF(i, t), 1e-8), 1.0 - 1e-8);
+                G.sumW[t] += pi * (1.0 - pi); G.sumR[t] += (double) bb[i] - pi;
+            }
+        }
+        return;
+    }
+    G.sumY.assign(P, 0.0);
+    for (int t = 0; t < P; ++t) G.sumY[t] = SV.Y.col(t).sum();
+    G.q = (int) ctx.covZ.cols();
+    if (G.q > 0) {
+        const Eigen::MatrixXd Z = ctx.covZ.cast<double>();
+        G.ZtY = Z.transpose() * SV.Y;
+        G.ZtZ = Z.transpose() * Z;
+        G.Zt1 = Z.colwise().sum().transpose();
+        G.M1 = ctx.covM.cast<double>().rowwise().sum();
+    }
+}
+static void gene_burden(const ChunkContext& ctx, const PhenoStats& SV, const GwPre& G,
+                        const std::vector<const ChunkResultA*>& bl, GeneBur& out) {
+    out = GeneBur();
+    const std::vector<double> bal = ctx.alphas.empty() ? std::vector<double>(1, ctx.alpha) : ctx.alphas;
+    const size_t NAL = bal.size();
+    const int n = G.n, P = G.P;
+    // sets: every category, then every burden group (at least two of its categories present)
+    std::vector< std::vector<int> > sets; std::vector<std::string> names;
+    for (int c = 0; c < ctx.n_cat; ++c) { sets.push_back(std::vector<int>(1, c)); names.push_back(ctx.cat_names[c]); }
+    for (size_t g = 0; g < g_bgrp.size(); ++g) { sets.push_back(g_bgrp[g]); names.push_back(g_bgrp_name[g]); }
+    for (size_t si = 0; si < sets.size(); ++si) {
+        const std::vector<int>& mem = sets[si];
+        std::vector< std::pair<size_t, size_t> > cols;      // (block, column)
+        std::vector<int> present;
+        for (size_t b = 0; b < bl.size(); ++b)
+            for (size_t j = 0; j < bl[b]->gw_cat.size(); ++j)
+                if (std::find(mem.begin(), mem.end(), bl[b]->gw_cat[j]) != mem.end()) {
+                    cols.push_back(std::make_pair(b, j));
+                    if (std::find(present.begin(), present.end(), bl[b]->gw_cat[j]) == present.end()) present.push_back(bl[b]->gw_cat[j]);
+                }
+        if (cols.empty()) continue;
+        if (si >= (size_t) ctx.n_cat && present.size() < 2) continue;      // group: two categories at least
+        bool okc = true;
+        for (size_t r = 0; r < cols.size() && okc; ++r) {
+            const ChunkResultA& B = *bl[cols[r].first]; const size_t j = cols[r].second;
+            if (B.gw_car[j].empty() || std::isnan(B.gw_sd[j]) || !(B.gw_sd[j] > 0.0)) okc = false;
+        }
+        std::vector< std::vector<double> > pa(P, std::vector<double>(NAL, NA_REAL));
+        if (okc) {
+            for (size_t k = 0; k < NAL; ++k) {
+                std::vector< std::pair<int, double> > pr2;
+                for (size_t r = 0; r < cols.size(); ++r) {
+                    const ChunkResultA& B = *bl[cols[r].first]; const size_t j = cols[r].second;
+                    const double u = Worker::alpha_w(B.gw_maf[j], bal[k]) / B.gw_sd[j];
+                    for (size_t z = 0; z < B.gw_car[j].size(); ++z) pr2.push_back(std::make_pair(B.gw_car[j][z], u * (double) B.gw_dos[j][z]));
+                }
+                std::sort(pr2.begin(), pr2.end());
+                std::vector<int> ci; std::vector<double> gv;
+                for (size_t r = 0; r < pr2.size(); ++r) {
+                    if (!ci.empty() && ci.back() == pr2[r].first) gv.back() += pr2[r].second;
+                    else { ci.push_back(pr2[r].first); gv.push_back(pr2[r].second); }
+                }
+                if (ci.empty()) continue;
+                if (G.bin) {
+                    for (int t = 0; t < P; ++t) {
+                        if (t >= (int) SV.bx.b.size() || !SV.bx.b[t]) continue;
+                        const std::vector<unsigned char>& bb = *SV.bx.b[t];
+                        std::vector<double> g, pp; std::vector<unsigned char> cbv;
+                        double T = 0.0;
+                        for (size_t r = 0; r < ci.size(); ++r) {
+                            const int i = ci[r];
+                            const double pi = std::min(std::max((double) SV.bx.PiF(i, t), 1e-8), 1.0 - 1e-8);
+                            g.push_back(gv[r]); pp.push_back(pi); cbv.push_back(bb[i]);
+                            T += gv[r] * ((double) bb[i] - pi);
+                        }
+                        pa[t][k] = burden_binary_p(g, pp, cbv, T, G.sumW[t], G.sumR[t]);
+                    }
+                } else {
+                    double s1 = 0.0, s2 = 0.0;
+                    for (size_t r = 0; r < gv.size(); ++r) { s1 += gv[r]; s2 += gv[r] * gv[r]; }
+                    const double gbar = s1 / n;
+                    double hh = s2 - n * gbar * gbar;
+                    Eigen::VectorXd a, Zh;
+                    if (G.q > 0) {
+                        Eigen::VectorXd Mg = Eigen::VectorXd::Zero(G.q), Zg = Eigen::VectorXd::Zero(G.q);
+                        for (size_t r = 0; r < ci.size(); ++r) {
+                            const int i = ci[r];
+                            for (int c = 0; c < G.q; ++c) {
+                                Mg[c] += (double) ctx.covM(c, i) * gv[r];
+                                Zg[c] += (double) ctx.covZ(i, c) * gv[r];
+                            }
+                        }
+                        a = Mg - gbar * G.M1; Zh = Zg - gbar * G.Zt1;
+                        hh += -2.0 * Zh.dot(a) + a.dot(G.ZtZ * a);
+                    }
+                    if (!(hh > 0.0)) continue;
+                    for (int t = 0; t < P; ++t) {
+                        const double vp = SV.Vp[t];
+                        if (!(vp > 0.0)) continue;
+                        double cy = -gbar * G.sumY[t];
+                        for (size_t r = 0; r < ci.size(); ++r) cy += gv[r] * SV.Y(ci[r], t);
+                        if (G.q > 0) cy -= a.dot(G.ZtY.col(t));
+                        const double z = cy / std::sqrt(vp * hh);
+                        pa[t][k] = std::erfc(std::abs(z) / std::sqrt(2.0));
+                    }
+                }
+            }
+        }
+        std::vector<double> pc(P, NA_REAL);
+        for (int t = 0; t < P; ++t) {
+            std::vector<double> bv, bw;
+            for (size_t k = 0; k < NAL; ++k) if (!std::isnan(pa[t][k])) { bv.push_back(pa[t][k]); bw.push_back(1.0); }
+            if (!bv.empty()) pc[t] = acat_combine(bv, bw);
+        }
+        out.name.push_back(names[si]); out.m.push_back((int) cols.size());
+        out.p.push_back(pc); out.pa.push_back(pa);
+    }
+}
 
 static void run_jobs(const ChunkContext& ctx, const ChunkParams& pr,
                      const std::vector<PhenoStats>& S,
@@ -4532,14 +4707,16 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     j.win = (int) grec.size(); j.gene = true;
                     gj.push_back(j); s = e;
                 }
-                r.j1 = gj.size(); grec.push_back(r);
+                r.j1 = gj.size();
+                if (r.j1 - r.j0 > 1) for (size_t z = r.j0; z < r.j1; ++z) gj[z].split = true;
+                grec.push_back(r);
             }
             chr_g1.push_back(gj.size());
         }
         Rcout << "Genes: " << grec.size() << " with >= " << pr.min_gene_snps << " SNPs -> "
               << gj.size() << " blocks (split at " << pr.max_gene_snps << " SNPs), "
               << (pr.gene_flank > 0 ? "common-variant flanks, " : "no flanks, ")
-              << "phenotype = y - LOCO PRS.\n";
+              << (ctx.prs.empty() ? "phenotype = y (no LOCO PRS).\n" : "phenotype = y - LOCO PRS.\n");
         if (n_gene_drop_small) Rcout << "  " << n_gene_drop_small << " genes skipped: fewer than "
                                      << pr.min_gene_snps << " SNPs in the genotype file.\n";
         if (n_gene_drop_chr) {
@@ -4564,7 +4741,8 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     const bool need_chunks = !has_genes;
     if (need_chunks) {
         Rcout << "Chunks: " << cj.size() << " chunks of " << pr.chunk_size << " SNPs, no flanks, "
-              << ctx.n_cat << " categories, phenotype = y - LOCO PRS of the tested chromosome.\n";
+              << ctx.n_cat << " categories, "
+              << (ctx.prs.empty() ? "phenotype = y (no LOCO PRS).\n" : "phenotype = y - LOCO PRS of the tested chromosome.\n");
         report_plan(ctx, pr, pr.chunk_size, "chunks");
     }
 
@@ -4628,6 +4806,9 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     std::vector< std::vector<ChunkResultA> > rgv(NV1, std::vector<ChunkResultA>(gj.size()));
     std::vector<ChunkResultA>& rg = rgv[0];
     std::vector<char> okg(gj.size(), 0);
+    std::vector<GeneBur> gbur(grec.size());
+    const bool gw_on = pr.spa && g_burden && g_bur_gene && !pr.coher;
+    long n_gw = 0;
     if (has_genes && !gj.empty()) {
         long doneg = 0;
         const std::chrono::steady_clock::time_point tg = std::chrono::steady_clock::now();
@@ -4636,6 +4817,28 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
             std::vector<PhenoStats> S; loco_stats(gj[chr_g0[k]].ci, S);
             run_jobs(ctx, pr, S, pr.spa, gj, chr_g0[k], chr_g1[k], rgv, okg, "genes",
                      doneg, (long) gj.size(), pr.batch_size, tg);
+            // gene-wide burdens of the split genes of this chromosome (phenotype variant 0 = p-values)
+            if (gw_on && !S.empty()) {
+                GwPre gp; bool prepared = false;
+                for (size_t gi = 0; gi < grec.size(); ++gi) {
+                    const GeneRec& GR = grec[gi];
+                    if (GR.j1 - GR.j0 < 2 || GR.j0 < chr_g0[k] || GR.j0 >= chr_g1[k]) continue;
+                    std::vector<const ChunkResultA*> bl;
+                    for (size_t b = GR.j0; b < GR.j1; ++b) if (okg[b] && !rgv[0][b].gw_cat.empty()) bl.push_back(&rgv[0][b]);
+                    if (bl.size() >= 2) {
+                        if (!prepared) { gw_prepare(ctx, S[0], pr.binary, gp); prepared = true; }
+                        gene_burden(ctx, S[0], gp, bl, gbur[gi]);
+                        if (!gbur[gi].m.empty()) ++n_gw;
+                    }
+                    for (size_t b = GR.j0; b < GR.j1; ++b) {        // free the carrier copies
+                        ChunkResultA& B = rgv[0][b];
+                        std::vector<int>().swap(B.gw_cat); std::vector<float>().swap(B.gw_maf);
+                        std::vector<double>().swap(B.gw_sd);
+                        std::vector< std::vector<int> >().swap(B.gw_car);
+                        std::vector< std::vector<unsigned char> >().swap(B.gw_dos);
+                    }
+                }
+            }
         }
         merge_raw(rgv, okg);
         Rcout << "\n";
@@ -4669,13 +4872,14 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
             if (has && k < R.p_acatv[q][t].size()) wr(f, R.p_acatv[q][t][k]); else f << "NA";
         }
     };
-    // burden columns: p_burden (ACAT over the MAF bins) and p_burden_maf<bin>
+    // burden columns: p_burden (ACAT over alphas) and p_burden_<alpha>
     const bool bur = pr.spa && g_burden && !pr.coher;
-    const size_t NALB = g_nbur;                                 // burden MAF bins
+    const std::vector<double> bal = ctx.alphas.empty() ? std::vector<double>(1, ctx.alpha) : ctx.alphas;
+    const size_t NALB = bal.size();
     std::string bur_hdr;
     if (bur) {
         bur_hdr = "\tp_burden";
-        for (size_t k = 0; k < NALB; ++k) bur_hdr += std::string("\tp_burden_maf") + g_bur_maf_name[k];
+        for (size_t k = 0; k < NALB; ++k) { std::ostringstream o; o << "\tp_burden_" << bal[k]; bur_hdr += o.str(); }
     }
     auto wr_bur = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
         if (!bur) return;
@@ -4799,6 +5003,24 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                         pv.push_back(B.p_grp[gi][t]); pw.push_back((double) B.grp_m[gi]);
                     }
                 }
+                // gene-wide burdens of a split gene: block 0, one row per category / group
+                const GeneBur& GB = gbur[gi];
+                for (size_t si = 0; si < GB.m.size(); ++si) {
+                    if ((size_t) t >= GB.p[si].size()) continue;
+                    f3 << R.name << '\t' << R.chr << '\t' << R.start << '\t' << R.end << '\t'
+                       << 0 << '\t' << nb << '\t' << GB.name[si] << '\t' << GB.m[si] << '\t' << label(t)
+                       << "\tNA\tNA\tNA\tNA\t";
+                    wr(f3, GB.p[si][t]); f3 << "\tNA";
+                    if (multi_a) for (size_t k = 0; k < ctx.alphas.size(); ++k) f3 << "\tNA";
+                    if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
+                    if (bur) {
+                        f3 << '\t'; wr(f3, GB.p[si][t]);
+                        for (size_t k = 0; k < NALB; ++k) { f3 << '\t'; if (k < GB.pa[si][t].size()) wr(f3, GB.pa[si][t][k]); else f3 << "NA"; }
+                    }
+                    if (pr.coher) f3 << "\tNA\tNA";
+                    f3 << '\n';
+                    if (!std::isnan(GB.p[si][t])) { pv.push_back(GB.p[si][t]); pw.push_back((double) GB.m[si]); }
+                }
                 if (!pr.spa || pv.empty()) continue;
                 int mtot = 0; for (size_t z = 0; z < pw.size(); ++z) mtot += (int) pw[z];
                 f3 << R.name << '\t' << R.chr << '\t' << R.start << '\t' << R.end << '\t'
@@ -4820,6 +5042,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         Rcout << "Chunks tested: " << n1 << (skipped ? "  (skipped " + std::to_string(skipped) + ")" : "") << "\n";
     }
     if (has_genes)     Rcout << "Genes tested: " << ng << " of " << grec.size() << "\n";
+    if (has_genes && gw_on) Rcout << "Gene-wide burdens (block 0 rows) for " << n_gw << " genes split into blocks.\n";
     return List::create(_["n_chunks"] = (double) n1,
                         _["n_genes"] = (double) ng,
                         _["trait_names"] = ctx.trait_names, _["categories"] = wrap(ctx.cat_names));
@@ -4950,8 +5173,13 @@ Rcpp::List stratgwas_run(const std::string& filename,
     g_refine_p = refine_p;
     g_cond_lead = conditional && !coher;
     g_burden = !coher && !g_cond_lead && std::getenv("SPARROW_NO_BURDEN") == 0;
-    if (g_burden && SPA) Rcout << "Burden test: per category, minor-allele counts in nested MAF bins (< 1e-4, < 1e-3, all), "
-                               << "included in the omnibus p-value (p_burden, p_burden_maf<bin>).\n";
+    g_bur_gene = g_burden && std::getenv("SPARROW_NO_GENE_BURDEN") == 0;
+    if (g_burden && SPA) Rcout << "Burden test: per category and alpha (the VC test's columns and alpha weights), "
+                               << "included in the omnibus p-value (p_burden, p_burden_<alpha>)"
+                               << (g_bur_gene && genes.isNotNull() ? "; genes split into blocks also get gene-wide burdens per category and group (rows with block = 0)" : "")
+                               << ".\n";
+    // quantitative traits: the gene-wide burdens need the raw carriers of every column
+    if (g_burden && g_bur_gene && SPA && !binary && genes.isNotNull()) ctx.car_max = 5000;
     // burden groups: list of integer vectors (0-based annotation columns), names = group names
     g_bgrp.clear(); g_bgrp_name.clear();
     if (burden_groups.isNotNull()) {

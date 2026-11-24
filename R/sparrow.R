@@ -21,6 +21,10 @@
 #' @param alpha Heritability models tested; alpha[1] is used for the estimates.
 #' @param loco_prs Optional LDAK-KVIK Step 1 `.loco.prs` files: one per phenotype
 #'   (character vector), or a matrix with one row per phenotype and one column per source.
+#'   Quantitative traits only: with `binary = TRUE` (univariate) it is ignored with a warning.
+#'   The Step 1 scores are in-sample predictions; for binary traits they are not valid case
+#'   probabilities (they nearly separate cases from controls), so the binary null model uses
+#'   the covariates only.
 #' @param kvik_summaries Optional LDAK-KVIK Step 2 `.summaries` files, one per phenotype.
 #' @param binary TRUE if the phenotypes are 0/1 (1/2 coding is converted).
 #' @param coher TRUE to estimate co-heritability for all pairs of phenotypes.
@@ -53,11 +57,13 @@
 #'   best combined with `gene_flank` and without `kvik_summaries` (ACAT-V is not conditional).
 #' @param burden_groups Optional named list of extra burden tests on groups of categories, e.g.
 #'   `list(deleterious = c("pLoF", "damaging_missense", "spliceai2_gt040"))`. Each group (at least
-#'   two category names from `annot_names`) gets burden tests (nested MAF bins < 1e-4, < 1e-3, all) over the union of its
-#'   variants; the p-value (ACAT over the bins) is reported as its own row (category = group name) and
-#'   enters the gene-level ACAT like a category. Every category also has its own burden test, which
-#'   is part of its omnibus p-value. Burden tests are univariate and marginal: not used with
-#'   `coher = TRUE` or `conditional = TRUE`. NULL = no groups (default).
+#'   two category names from `annot_names`) gets burden tests (one per alpha, with the alpha-model
+#'   variant weights) over the union of its variants; the p-value (ACAT over alphas) is reported as
+#'   its own row (category = group name) and enters the gene-level ACAT like a category. Every
+#'   category also has its own burden test per alpha, which is part of its omnibus p-value. Genes
+#'   split into blocks (`max_gene_snps`) also get gene-wide burdens per category and group over all
+#'   blocks: rows with `block = 0`, included in the gene-level ACAT. Burden tests are univariate and
+#'   marginal: not used with `coher = TRUE` or `conditional = TRUE`. NULL = no groups (default).
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -256,6 +262,12 @@ sparrow <- function(filename, pheno, out_file,
   }
 
   # ---- LDAK-KVIK inputs -------------------------------------------------------------
+  if (binary && !coher && !is.null(loco_prs)) {
+    warning("loco_prs is ignored for binary traits: the LDAK-KVIK Step 1 scores are in-sample ",
+            "predictions and not valid case probabilities; the null model uses the covariates only ",
+            "(kvik_summaries are still used)")
+    loco_prs <- NULL
+  }
   if (!is.null(loco_prs)) {
     loco_prs <- as.matrix(loco_prs)
     if (ncol(loco_prs) == P && nrow(loco_prs) == 1 && P > 1) loco_prs <- t(loco_prs)   # vector given

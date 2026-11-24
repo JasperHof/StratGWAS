@@ -58,7 +58,11 @@ Must be on the same genome build as the .bim.}
 \item{alpha}{Heritability models tested; alpha\link{1} is used for the estimates.}
 
 \item{loco_prs}{Optional LDAK-KVIK Step 1 \code{.loco.prs} files: one per phenotype
-(character vector), or a matrix with one row per phenotype and one column per source.}
+(character vector), or a matrix with one row per phenotype and one column per source.
+Quantitative traits only: with \code{binary = TRUE} (univariate) it is ignored with a warning.
+The Step 1 scores are in-sample predictions; for binary traits they are not valid case
+probabilities (they nearly separate cases from controls), so the binary null model uses
+the covariates only.}
 
 \item{kvik_summaries}{Optional LDAK-KVIK Step 2 \code{.summaries} files, one per phenotype.}
 
@@ -108,11 +112,13 @@ best combined with \code{gene_flank} and without \code{kvik_summaries} (ACAT-V i
 
 \item{burden_groups}{Optional named list of extra burden tests on groups of categories, e.g.
 \code{list(deleterious = c("pLoF", "damaging_missense", "spliceai2_gt040"))}. Each group (at least
-two category names from \code{annot_names}) gets burden tests (nested MAF bins < 1e-4, < 1e-3, all) over the union of its
-variants; the p-value (ACAT over the bins) is reported as its own row (category = group name) and
-enters the gene-level ACAT like a category. Every category also has its own burden test, which
-is part of its omnibus p-value. Burden tests are univariate and marginal: not used with
-\code{coher = TRUE} or \code{conditional = TRUE}. NULL = no groups (default).}
+two category names from \code{annot_names}) gets burden tests (one per alpha, with the alpha-model
+variant weights) over the union of its variants; the p-value (ACAT over alphas) is reported as
+its own row (category = group name) and enters the gene-level ACAT like a category. Every
+category also has its own burden test per alpha, which is part of its omnibus p-value. Genes
+split into blocks (\code{max_gene_snps}) also get gene-wide burdens per category and group over all
+blocks: rows with \code{block = 0}, included in the gene-level ACAT. Burden tests are univariate and
+marginal: not used with \code{coher = TRUE} or \code{conditional = TRUE}. NULL = no groups (default).}
 
 \item{n_threads}{Number of threads (0 = RcppParallel default).}
 
