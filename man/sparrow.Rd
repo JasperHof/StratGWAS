@@ -32,8 +32,9 @@ sparrow(
   conditional = FALSE,
   burden_groups = NULL,
   variant_scores = NULL,
-  score_transform = c("rank", "log"),
-  score_floor = 0.1,
+  score_transform = c("cubic:0.5", "cubic:0.7", "cubic:0.9", "beta:5", "beta:20"),
+  score_floor = 0.001,
+  score_targets = c("groups", "all"),
   n_threads = 0,
   batch_size = 64
 )
@@ -139,10 +140,25 @@ re-tested. Univariate analyses only (ignored with coher = TRUE).}
 (log(1 + 99 z) / log(100) of the min-max scaled score z: concave, lifts small scores),
 "sqrt" (sqrt(z)), "linear" (z), "square" (z^2: emphasises the top) and "step:\if{html}{\out{<t>}}"
 (1 if score >= t, else 0, e.g. "step:0.2" for SpliceAI). Each transform adds one weighted
-model per score (and per alpha), so keep the number small.}
+model per score (and per alpha), so keep the number small.
+FlexRV-type transforms (Schwartzentruber et al. 2025) for scores on \link{0, 1} such as within-gene
+percentiles: "cubic:\if{html}{\out{<t>}}" (cubic-root step at transition t: (sign(s-t)|s-t|^(1/3) + t^(1/3)) /
+((1-t)^(1/3) + t^(1/3))) and "beta:\if{html}{\out{<b>}}" (dbeta(1-s, 1, b) / dbeta(0, 1, b) = s^(b-1)); these
+use the score as given (not min-max scaled) and act as soft masks at high scores.
+Default: the five FlexRV-type transforms used in the paper (cubic 0.5 / 0.7 / 0.9, beta 5 / 20),
+meant for a combined score on \link{0, 1} (pLoF = 1, missense = within-gene percentile of a
+pathogenicity predictor, splice = SpliceAI). For other score scales, set the transforms explicitly.}
 
 \item{score_floor}{Weight of the lowest-scoring variants (0 < score_floor <= 1): variants are
-down-weighted, never removed, so the test stays robust when a score is uninformative.}
+down-weighted, never removed. Default 0.001 (for the FlexRV-type transforms); use e.g. 0.1 with
+"rank" / "log".}
+
+\item{score_targets}{"groups" (default): the weighted models are applied to the burden groups
+only (e.g. a pooled LoF + missense group with a combined score), so the category tests are
+unchanged and the weighting adds one row per group; "all": also to every category (variance
+component and burden). A pooled group of all coding categories (e.g. coding = pLoF + damaging
+missense + splice + other missense) only helps when it is weighted: without \code{variant_scores}
+it mostly dilutes the gene-level p-value, so leave it out of \code{burden_groups} in unweighted runs.}
 
 \item{n_threads}{Number of threads (0 = RcppParallel default).}
 

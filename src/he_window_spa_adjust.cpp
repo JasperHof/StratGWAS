@@ -2462,6 +2462,11 @@ static bool g_burden = true;
 // genes split into blocks also get a gene-wide burden per category and group (g_bur_gene), from
 // the raw carriers of every block.
 static bool g_bur_gene = true;
+// variant weights only for burden groups (categories keep their unweighted tests)
+static bool g_w_groups_only = false;
+// binary ACAT-V: a KVIK variant enters only when its expected minority-class count
+// MAC x min(prev, 1 - prev) is at least this (KVIK's single-variant saddlepoint is unreliable below)
+static double g_acatv_min_ec = 5.0;
 // burden groups: annotation-column indices (0-based) of each group, and the group names
 static std::vector< std::vector<int> > g_bgrp;
 static std::vector<std::string> g_bgrp_name;
@@ -3950,7 +3955,7 @@ struct Job { size_t ci; int a, b, fL0, fL1, fR0, fR1; int win; bool gene = false
 // ---------------------------------------------------------------------------
 static double acatv_p(const ChunkDataA& cd, size_t qcat,
                       const std::vector<float>& kz, const std::vector<float>& kmac,
-                      double alpha, double macthr) {
+                      double alpha, double macthr, double macmin = 0.0) {
     std::vector<double> pv, pw;
     double bz = 0.0, bs2 = 0.0; int bn = 0;
     if (qcat >= cd.cat_obim.size()) return NA_REAL;
@@ -3961,6 +3966,7 @@ static double acatv_p(const ChunkDataA& cd, size_t qcat,
         if (b < 0) continue;
         const double z = kz[b];
         if (std::isnan(z)) continue;
+        if (macmin > 0.0 && !(kmac[b] >= macmin)) continue;     // binary: too few expected cases / controls
         const double f = vf[j];
         if (!(f > 0.0 && f < 1.0)) continue;
         const double s2 = (alpha == -1.0) ? 1.0 : std::pow(2.0 * f * (1.0 - f), 1.0 + alpha);
@@ -4203,7 +4209,7 @@ struct Worker : public RcppParallel::Worker {
                     for (size_t k = 1; k < NAL; ++k) {
                         const double ak = ctx.mod_a[k];
                         const int wk = ctx.mod_w[k];
-                        if (wk >= 0 && std::find(wvar[wk].begin(), wvar[wk].end(), (char) 1) == wvar[wk].end()) continue;
+                        if (wk >= 0 && (g_w_groups_only || std::find(wvar[wk].begin(), wvar[wk].end(), (char) 1) == wvar[wk].end())) continue;
                         Eigen::VectorXd d(cd.K);
                         for (int c = 0; c < cd.K; ++c)
                             d[c] = alpha_w(cd.colmaf[c], ak) / alpha_w(cd.colmaf[c], a0)
@@ -4260,9 +4266,14 @@ struct Worker : public RcppParallel::Worker {
                     for (size_t q = 0; q < A; ++q) {
                         for (size_t t = 0; t < NT && t < ctx.kz.size(); ++t) {
                             std::vector<double> av, aw, ov, ow;
+                            double macmin = 0.0;
+                            if (pr.binary && t < ctx.prev.size()) {
+                                const double ph = std::min(ctx.prev[t], 1.0 - ctx.prev[t]);
+                                if (ph > 0.0) macmin = g_acatv_min_ec / ph;
+                            }
                             for (size_t k = 0; k < NAL; ++k) {
                                 const double pa = acatv_p(cd, q, ctx.kz[t], ctx.kmac[t],
-                                                          ctx.alphas[k], pr.acatv_mac);
+                                                          ctx.alphas[k], pr.acatv_mac, macmin);
                                 R.p_acatv[q][t][k] = pa;
                                 if (!std::isnan(pa)) { av.push_back(pa); aw.push_back(1.0); }
                             }
@@ -4422,12 +4433,13 @@ struct Worker : public RcppParallel::Worker {
                         }
                     };
                     // burden p-values of a set of categories at every alpha
-                    auto bset = [&](const std::vector<int>& qs, std::vector< std::vector<double> >& pk) {
+                    auto bset = [&](const std::vector<int>& qs, std::vector< std::vector<double> >& pk, bool is_group) {
                         pk.assign(NAL, std::vector<double>(NT, NA_REAL));
                         std::vector<double> pt;
                         std::vector<int> cols, ci; std::vector<double> gi;
                         for (size_t k = 0; k < NAL; ++k) {
                             const int wk = ctx.mod_w[k];
+                            if (wk >= 0 && g_w_groups_only && !is_group) continue;
                             if (wk >= 0) {                        // weighted model: only if the weights vary
                                 float lo = 1e30f, hi = -1e30f;
                                 for (size_t r = 0; r < qs.size(); ++r)
@@ -4444,7 +4456,7 @@ struct Worker : public RcppParallel::Worker {
                     std::vector< std::vector<double> > pk;
                     for (size_t q = 0; q < A; ++q) {
                         if (cd.cat_m[q] <= 0) continue;
-                        bset(std::vector<int>(1, (int) q), pk);
+                        bset(std::vector<int>(1, (int) q), pk, false);
                         for (size_t k = 0; k < NAL; ++k)
                             for (size_t t = 0; t < NT; ++t) R.p_bur[q][t][k] = pk[k][t];
                         for (size_t t = 0; t < NT; ++t) {
@@ -4476,7 +4488,7 @@ struct Worker : public RcppParallel::Worker {
                     for (size_t gi = 0; gi < NG; ++gi) {
                         if (gq[gi].size() < 2) continue;
                         for (size_t r = 0; r < gq[gi].size(); ++r) R.grp_m[gi] += cd.cat_m[gq[gi][r]];
-                        bset(gq[gi], pk);
+                        bset(gq[gi], pk, true);
                         for (size_t k = 0; k < NAL; ++k)
                             for (size_t t = 0; t < NT; ++t) R.p_grpa[gi][t][k] = pk[k][t];
                         for (size_t t = 0; t < NT; ++t) {
@@ -4587,6 +4599,7 @@ static void gene_burden(const ChunkContext& ctx, const PhenoStats& SV, const GwP
         if (okc) {
             for (size_t k = 0; k < NAL; ++k) {
                 const int wk = ctx.mod_w[k];
+                if (wk >= 0 && g_w_groups_only && si < (size_t) ctx.n_cat) continue;
                 if (wk >= 0) {                                    // weighted model: only if the weights vary
                     float lo = 1e30f, hi = -1e30f;
                     for (size_t r = 0; r < cols.size(); ++r) {
@@ -4929,9 +4942,12 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     // (and, with variant_weights, one per weighted model: p_alpha_<weight>_<alpha>)
     const size_t NMOD = ctx.mod_a.size();
     const bool multi_a = pr.spa && NMOD > 1;
+    // weights on the burden groups only: the weighted VC models are never computed, so their
+    // p_alpha_<weight>_<alpha> columns (always NA) are not written. Models are ordered unweighted first.
+    const size_t NVC = g_w_groups_only ? ctx.alphas.size() : NMOD;
     std::string alpha_hdr;
     if (multi_a)
-        for (size_t k = 0; k < NMOD; ++k) alpha_hdr += "\tp_alpha_" + ctx.mod_name[k];
+        for (size_t k = 0; k < NVC; ++k) alpha_hdr += "\tp_alpha_" + ctx.mod_name[k];
     // ACAT-V columns (KVIK summaries supplied): p_vc, p_acatv, p_acatv_<alpha>
     const bool acv = pr.use_acatv && !ctx.kz.empty();
     std::string acv_hdr;
@@ -4973,7 +4989,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         const bool has = gi < R.p_grp.size() && (size_t) t < R.p_grp[gi].size();
         if (has) wr(f, R.p_grp[gi][t]); else f << "NA";
         f << "\tNA";
-        if (multi_a) for (size_t k = 0; k < NMOD; ++k) f << "\tNA";
+        if (multi_a) for (size_t k = 0; k < NVC; ++k) f << "\tNA";
         if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f << "\tNA";
         if (bur) {
             f << '\t'; if (has) wr(f, R.p_grp[gi][t]); else f << "NA";
@@ -4986,7 +5002,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
     };
     auto wr_alpha = [&](std::ofstream& f, const ChunkResultA& R, size_t q, int t) {
         if (!multi_a) return;
-        for (size_t k = 0; k < NMOD; ++k) {
+        for (size_t k = 0; k < NVC; ++k) {
             f << '\t';
             if (q < R.p_alpha.size() && (size_t) t < R.p_alpha[q].size() && k < R.p_alpha[q][t].size())
                 wr(f, R.p_alpha[q][t][k]);
@@ -5089,7 +5105,7 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                        << 0 << '\t' << nb << '\t' << GB.name[si] << '\t' << GB.m[si] << '\t' << label(t)
                        << "\tNA\tNA\tNA\tNA\t";
                     wr(f3, GB.p[si][t]); f3 << "\tNA";
-                    if (multi_a) for (size_t k = 0; k < NMOD; ++k) f3 << "\tNA";
+                    if (multi_a) for (size_t k = 0; k < NVC; ++k) f3 << "\tNA";
                     if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
                     if (bur) {
                         f3 << '\t'; wr(f3, GB.p[si][t]);
@@ -5097,15 +5113,16 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
                     }
                     if (pr.coher) f3 << "\tNA\tNA";
                     f3 << '\n';
-                    if (!std::isnan(GB.p[si][t])) { pv.push_back(GB.p[si][t]); pw.push_back((double) GB.m[si]); }
+                    // weight m / n_blocks: together the gene-wide rows count as one more block
+                    if (!std::isnan(GB.p[si][t])) { pv.push_back(GB.p[si][t]); pw.push_back((double) GB.m[si] / nb); }
                 }
                 if (!pr.spa || pv.empty()) continue;
-                int mtot = 0; for (size_t z = 0; z < pw.size(); ++z) mtot += (int) pw[z];
+                long mtot = 0; for (size_t z = 0; z < pw.size(); ++z) mtot += std::lround(pw[z]);
                 f3 << R.name << '\t' << R.chr << '\t' << R.start << '\t' << R.end << '\t'
                    << "NA\t" << nb << "\tACAT\t" << mtot << '\t' << label(t)
                    << "\tNA\tNA\tNA\tNA\t";
                 wr(f3, acat_combine(pv, pw)); f3 << "\tNA";
-                if (multi_a) for (size_t k = 0; k < NMOD; ++k) f3 << "\tNA";
+                if (multi_a) for (size_t k = 0; k < NVC; ++k) f3 << "\tNA";
                 if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f3 << "\tNA";
                 if (bur) for (size_t k = 0; k < NALB + 1; ++k) f3 << "\tNA";
                 if (pr.coher) f3 << "\tNA\tNA";
@@ -5165,7 +5182,8 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          int batch_size = 64,
                          int n_threads = 0,
                          Rcpp::Nullable<Rcpp::List> burden_groups = R_NilValue,
-                         Rcpp::Nullable<Rcpp::NumericMatrix> variant_weights = R_NilValue) {
+                         Rcpp::Nullable<Rcpp::NumericMatrix> variant_weights = R_NilValue,
+                         bool weights_groups_only = false) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
@@ -5223,12 +5241,18 @@ Rcpp::List stratgwas_run(const std::string& filename,
             std::ostringstream o; if (w >= 0) o << ctx.vw_names[w] << "_"; o << alphas[k];
             ctx.mod_a.push_back(alphas[k]); ctx.mod_w.push_back(w); ctx.mod_name.push_back(o.str());
         }
+    g_w_groups_only = weights_groups_only && !ctx.vw.empty();
     if (!ctx.vw.empty()) {
+        if (g_w_groups_only) Rcout << "Variant weights apply to the burden groups only (category tests unweighted).\n";
         Rcout << "Variant weights: " << ctx.vw.size() << " weighted model(s) per alpha (";
         for (size_t w = 0; w < ctx.vw.size(); ++w) Rcout << (w ? ", " : "") << ctx.vw_names[w];
-        Rcout << "): h2_j ~ [2f(1-f)]^(1+alpha) w_j; variance-component and burden tests (not ACAT-V) at every alpha, "
-              << "in the omnibus p-value (columns p_alpha_<weight>_<alpha>, p_burden_<weight>_<alpha>); "
-              << "a category whose variants all have the same weight is not re-tested.\n";
+        if (g_w_groups_only)
+            Rcout << "): h2_j ~ [2f(1-f)]^(1+alpha) w_j; weighted burden tests of the burden groups at every alpha, "
+                  << "in the group p-values (columns p_burden_<weight>_<alpha> on the group rows).\n";
+        else
+            Rcout << "): h2_j ~ [2f(1-f)]^(1+alpha) w_j; variance-component and burden tests (not ACAT-V) at every alpha, "
+                  << "in the omnibus p-value (columns p_alpha_<weight>_<alpha>, p_burden_<weight>_<alpha>); "
+                  << "a category whose variants all have the same weight is not re-tested.\n";
     }
     const int P = ctx.n_pheno;
 
@@ -5453,10 +5477,12 @@ Rcpp::List stratgwas_run(const std::string& filename,
             if (dup) Rcout << "NOTE: " << dup << " duplicated SNP names in the .bim; KVIK results are matched to the first.\n";
             ctx.kz.resize(P); ctx.kmac.resize(P);
             for (int t = 0; t < P; ++t) kvik_load(as<std::string>(kv[t]), ctx, t, idx);
+            if (const char* e = std::getenv("SPARROW_ACATV_MIN_EC")) g_acatv_min_ec = std::atof(e);
             Rcout << "ACAT-V: KVIK single-variant tests, weights [2f(1-f)]^(1+alpha) for each alpha, "
-                  << "variants with MAC < " << acatv_mac << " collapsed into a burden.\n"
-                  << "  p_spa = ACAT over " << 2 * ctx.alphas.size() << " p-values ("
-                  << ctx.alphas.size() << " variance-component + " << ctx.alphas.size() << " ACAT-V).\n";
+                  << "variants with MAC < " << acatv_mac << " collapsed into a burden"
+                  << (binary ? "; binary traits: variants with an expected minority-class count MAC x min(prev, 1 - prev) < "
+                               + std::to_string(g_acatv_min_ec).substr(0, 4) + " are left out" : std::string())
+                  << ".\n  p_spa per category = ACAT over the variance-component, ACAT-V and burden p-values (equal weights).\n";
         }
     }
     return run_all(ctx, pr);

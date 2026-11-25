@@ -80,8 +80,22 @@
 #'   "sqrt" (sqrt(z)), "linear" (z), "square" (z^2: emphasises the top) and "step:<t>"
 #'   (1 if score >= t, else 0, e.g. "step:0.2" for SpliceAI). Each transform adds one weighted
 #'   model per score (and per alpha), so keep the number small.
+#'   FlexRV-type transforms (Schwartzentruber et al. 2025) for scores on [0, 1] such as within-gene
+#'   percentiles: "cubic:<t>" (cubic-root step at transition t: (sign(s-t)|s-t|^(1/3) + t^(1/3)) /
+#'   ((1-t)^(1/3) + t^(1/3))) and "beta:<b>" (dbeta(1-s, 1, b) / dbeta(0, 1, b) = s^(b-1)); these
+#'   use the score as given (not min-max scaled) and act as soft masks at high scores.
+#'   Default: the five FlexRV-type transforms used in the paper (cubic 0.5 / 0.7 / 0.9, beta 5 / 20),
+#'   meant for a combined score on [0, 1] (pLoF = 1, missense = within-gene percentile of a
+#'   pathogenicity predictor, splice = SpliceAI). For other score scales, set the transforms explicitly.
 #' @param score_floor Weight of the lowest-scoring variants (0 < score_floor <= 1): variants are
-#'   down-weighted, never removed, so the test stays robust when a score is uninformative.
+#'   down-weighted, never removed. Default 0.001 (for the FlexRV-type transforms); use e.g. 0.1 with
+#'   "rank" / "log".
+#' @param score_targets "groups" (default): the weighted models are applied to the burden groups
+#'   only (e.g. a pooled LoF + missense group with a combined score), so the category tests are
+#'   unchanged and the weighting adds one row per group; "all": also to every category (variance
+#'   component and burden). A pooled group of all coding categories (e.g. coding = pLoF + damaging
+#'   missense + splice + other missense) only helps when it is weighted: without `variant_scores`
+#'   it mostly dilutes the gene-level p-value, so leave it out of `burden_groups` in unweighted runs.
 #' @param spa Compute saddlepoint p-values (FALSE = estimates only, much faster).
 #' @param chr Optional single chromosome to analyse.
 #' @param n_threads Number of threads (0 = RcppParallel default).
@@ -121,7 +135,10 @@ sparrow <- function(filename, pheno, out_file,
                     spa = TRUE, chr = NULL,
                     gene_flank = 0, flank_maf = 0.01, refine_p = 0.05, conditional = FALSE,
                     burden_groups = NULL,
-                    variant_scores = NULL, score_transform = c("rank", "log"), score_floor = 0.1,
+                    variant_scores = NULL,
+                    score_transform = c("cubic:0.5", "cubic:0.7", "cubic:0.9", "beta:5", "beta:20"),
+                    score_floor = 0.001,
+                    score_targets = c("groups", "all"),
                     n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
@@ -290,6 +307,9 @@ sparrow <- function(filename, pheno, out_file,
               paste(colnames(S), colSums(is.finite(S)), sep = " = ", collapse = ", "))
       vw <- .sparrow_score_weights(S, cat_of, score_transform, score_floor)
       if (!is.null(vw) && ncol(vw) == 0) vw <- NULL
+      score_targets <- match.arg(score_targets)
+      if (!is.null(vw) && score_targets == "groups" && is.null(bg))
+        stop("score_targets = \"groups\" needs burden_groups (e.g. a pooled group of pLoF and missense categories)")
     }
   }
 
@@ -351,7 +371,8 @@ sparrow <- function(filename, pheno, out_file,
     gene_flank = gene_flank, flank_maf = flank_maf, refine_p = refine_p,
     conditional = conditional,
     chr = chr, out_file = out_file, batch_size = batch_size,
-    n_threads = n_threads, burden_groups = bg, variant_weights = vw)
+    n_threads = n_threads, burden_groups = bg, variant_weights = vw,
+    weights_groups_only = !is.null(vw) && identical(match.arg(score_targets), "groups"))
 
   files <- c(regions = if (is.null(genes)) out_file else NA,
              genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA)
@@ -371,7 +392,13 @@ sparrow <- function(filename, pheno, out_file,
     if (sum(ok) < 2 || length(unique(s[ok])) < 2) { warning("score '", colnames(S)[j], "' has fewer than two distinct values: skipped"); next }
     x <- s[ok]; z <- (x - min(x)) / (max(x) - min(x))
     for (tf in transform) {
+      num <- function(p) { v <- suppressWarnings(as.numeric(sub(p, "", tf)))
+        if (!is.finite(v)) stop("score_transform '", tf, "': give a number after the ':'"); v }
+      if (grepl("^(cubic|beta):", tf) && (min(x) < 0 || max(x) > 1))
+        stop("score_transform '", tf, "' needs scores on [0, 1] (e.g. within-gene percentiles)")
       g <- if (tf == "rank") (rank(x, ties.method = "average") - 0.5) / length(x)
+           else if (grepl("^cubic:", tf)) { t <- num("^cubic:"); (sign(x - t) * abs(x - t)^(1/3) + t^(1/3)) / ((1 - t)^(1/3) + t^(1/3)) }
+           else if (grepl("^beta:", tf)) x^(num("^beta:") - 1)
            else if (tf == "linear") z
            else if (tf == "sqrt") sqrt(z)
            else if (tf == "log") log1p(99 * z) / log(100)
@@ -380,7 +407,7 @@ sparrow <- function(filename, pheno, out_file,
              thr <- suppressWarnings(as.numeric(sub("^step:", "", tf)))
              if (!is.finite(thr)) stop("score_transform '", tf, "': give a number after 'step:'")
              as.numeric(x >= thr)
-           } else stop("unknown score_transform '", tf, "' (rank, log, sqrt, linear, square, step:<t>)")
+           } else stop("unknown score_transform '", tf, "' (rank, log, sqrt, linear, square, step:<t>, cubic:<t>, beta:<b>)")
       w <- rep(NA_real_, length(s)); w[ok] <- floor + (1 - floor) * g
       allmed <- stats::median(w[ok])
       for (c in unique(cat_of[!ok])) {
