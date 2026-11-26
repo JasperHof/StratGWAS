@@ -35,6 +35,7 @@ sparrow(
   score_transform = c("cubic:0.5", "cubic:0.7", "cubic:0.9", "beta:5", "beta:20"),
   score_floor = 0.001,
   score_targets = c("groups", "all"),
+  group_vc = NULL,
   n_threads = 0,
   batch_size = 64
 )
@@ -159,6 +160,15 @@ unchanged and the weighting adds one row per group; "all": also to every categor
 component and burden). A pooled group of all coding categories (e.g. coding = pLoF + damaging
 missense + splice + other missense) only helps when it is weighted: without \code{variant_scores}
 it mostly dilutes the gene-level p-value, so leave it out of \code{burden_groups} in unweighted runs.}
+
+\item{group_vc}{Names of the \code{burden_groups} that also get a variance-component test (or TRUE for
+all groups; NULL = none, the default). The group's categories are merged into one component and
+tested jointly with the unit's other categories, like a single category, at every alpha
+(unweighted); the group p-value is then the ACAT of its burden and variance-component p-values,
+and the VC p-values appear in the p_alpha_\if{html}{\out{<alpha>}} columns of the group rows. A pooled variance
+component adds up evidence spread over the group's categories. Each group adds one joint fit per
+alpha (about 1.3x runtime for one group); the paper uses \code{group_vc = "coding"}, with
+coding = pLoF + damaging missense + splice + other missense. Univariate analyses only.}
 
 \item{n_threads}{Number of threads (0 = RcppParallel default).}
 

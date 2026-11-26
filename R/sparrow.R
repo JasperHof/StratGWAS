@@ -64,6 +64,14 @@
 #'   split into blocks (`max_gene_snps`) also get gene-wide burdens per category and group over all
 #'   blocks: rows with `block = 0`, included in the gene-level ACAT. Burden tests are univariate and
 #'   marginal: not used with `coher = TRUE` or `conditional = TRUE`. NULL = no groups (default).
+#' @param group_vc Names of the `burden_groups` that also get a variance-component test (or TRUE for
+#'   all groups; NULL = none, the default). The group's categories are merged into one component and
+#'   tested jointly with the unit's other categories, like a single category, at every alpha
+#'   (unweighted); the group p-value is then the ACAT of its burden and variance-component p-values,
+#'   and the VC p-values appear in the p_alpha_<alpha> columns of the group rows. A pooled variance
+#'   component adds up evidence spread over the group's categories. Each group adds one joint fit per
+#'   alpha (about 1.3x runtime for one group); the paper uses `group_vc = "coding"`, with
+#'   coding = pLoF + damaging missense + splice + other missense. Univariate analyses only.
 #' @param variant_scores Optional per-variant scores (e.g. SpliceAI DS_MAX, AlphaMissense, CADD):
 #'   a data frame or a file with a header, variant IDs (as in the .bim) in the first column and
 #'   one numeric column per score (NA = no score). Each score and each transform in
@@ -139,6 +147,7 @@ sparrow <- function(filename, pheno, out_file,
                     score_transform = c("cubic:0.5", "cubic:0.7", "cubic:0.9", "beta:5", "beta:20"),
                     score_floor = 0.001,
                     score_targets = c("groups", "all"),
+                    group_vc = NULL,
                     n_threads = 0, batch_size = 64) {
 
   # ---- basic checks -----------------------------------------------------------
@@ -284,6 +293,14 @@ sparrow <- function(filename, pheno, out_file,
       message("burden_groups are not used with coher = TRUE or conditional = TRUE (burden tests are marginal)")
   }
 
+  # ---- burden groups that also get a variance-component test --------------------------
+  gvc <- NULL
+  if (!is.null(group_vc) && !is.null(burden_groups) && !coher && !conditional) {
+    gvc <- if (isTRUE(group_vc)) names(burden_groups) else as.character(group_vc)
+    bad <- setdiff(gvc, names(burden_groups))
+    if (length(bad)) stop("group_vc: not in burden_groups: ", paste(bad, collapse = ", "))
+  }
+
   # ---- variant scores -> weights (one column per score x transform) ------------------
   vw <- NULL
   if (!is.null(variant_scores)) {
@@ -372,7 +389,8 @@ sparrow <- function(filename, pheno, out_file,
     conditional = conditional,
     chr = chr, out_file = out_file, batch_size = batch_size,
     n_threads = n_threads, burden_groups = bg, variant_weights = vw,
-    weights_groups_only = !is.null(vw) && identical(match.arg(score_targets), "groups"))
+    weights_groups_only = !is.null(vw) && identical(match.arg(score_targets), "groups"),
+    group_vc = gvc)
 
   files <- c(regions = if (is.null(genes)) out_file else NA,
              genes = if (!is.null(genes)) paste0(out_file, ".genes") else NA)

@@ -2190,6 +2190,8 @@ struct ChunkResultA {
     std::vector<int> grp_m;
     std::vector< std::vector<double> > p_grp;
     std::vector< std::vector< std::vector<double> > > p_grpa;
+    // variance-component p-values of the burden groups per (unweighted) alpha [group][trait][alpha]
+    std::vector< std::vector< std::vector<double> > > p_grpv;
     // blocks of a split gene only: the category columns' raw carriers, for the gene-wide burdens
     // (global category id, MAF as used by the alpha weights, SD of the raw column, carriers and
     // minor-allele dosages). Freed once the gene-wide burdens are computed.
@@ -2366,6 +2368,59 @@ struct ChunkGeom {
                   have_L(false), use_wcache(false) {}
 };
 
+// A copy of cd in which the active categories qs (>= 2, indices into cd's active categories) are
+// merged into ONE category, placed first; the other active categories follow in their order, then
+// the flank columns. The variance-component test of a burden group is the test of this merged
+// component, jointly with the unit's other categories (and flank), exactly as a single category is
+// tested. perm[c] = the column of cd that becomes column c.
+template <class T> static void perm_vec(const std::vector<T>& src, const std::vector<int>& perm, std::vector<T>& dst) {
+    dst.clear();
+    if (src.size() != perm.size()) return;
+    dst.resize(perm.size());
+    for (size_t c = 0; c < perm.size(); ++c) dst[c] = src[perm[c]];
+}
+static void merge_categories(const ChunkDataA& cd, const std::vector<int>& qs, ChunkDataA& ck, std::vector<int>& perm) {
+    const size_t A = cd.cat_m.size();
+    std::vector<int> o(A + 1, 0);
+    for (size_t q = 0; q < A; ++q) o[q + 1] = o[q] + cd.cat_m[q];
+    std::vector<char> in(A, 0);
+    for (size_t r = 0; r < qs.size(); ++r) in[qs[r]] = 1;
+    ck = ChunkDataA();
+    ck.chr = cd.chr; ck.start = cd.start; ck.end = cd.end; ck.m_flank = cd.m_flank; ck.K = cd.K;
+    perm.clear();
+    int mg = 0; double wg = 0.0; std::vector<int> ob; std::vector<float> om;
+    for (size_t r = 0; r < qs.size(); ++r) {
+        const int q = qs[r];
+        for (int j = o[q]; j < o[q + 1]; ++j) perm.push_back(j);
+        mg += cd.cat_m[q];
+        if ((size_t) q < cd.cat_w.size()) wg += cd.cat_w[q];
+        if ((size_t) q < cd.cat_obim.size()) ob.insert(ob.end(), cd.cat_obim[q].begin(), cd.cat_obim[q].end());
+        if ((size_t) q < cd.cat_omaf.size()) om.insert(om.end(), cd.cat_omaf[q].begin(), cd.cat_omaf[q].end());
+    }
+    ck.cat_m.push_back(mg); ck.cat_id.push_back(cd.cat_id[qs[0]]); ck.cat_name.push_back("group");
+    ck.cat_w.push_back(wg); ck.cat_obim.push_back(ob); ck.cat_omaf.push_back(om);
+    for (size_t q = 0; q < A; ++q) {
+        if (in[q]) continue;
+        for (int j = o[q]; j < o[q + 1]; ++j) perm.push_back(j);
+        ck.cat_m.push_back(cd.cat_m[q]); ck.cat_id.push_back(cd.cat_id[q]); ck.cat_name.push_back(cd.cat_name[q]);
+        if (q < cd.cat_w.size()) ck.cat_w.push_back(cd.cat_w[q]);
+        if (q < cd.cat_obim.size()) ck.cat_obim.push_back(cd.cat_obim[q]);
+        if (q < cd.cat_omaf.size()) ck.cat_omaf.push_back(cd.cat_omaf[q]);
+    }
+    for (int j = o[A]; j < cd.K; ++j) perm.push_back(j);          // flank / background columns
+    const int K = cd.K;
+    ck.V.resize(cd.V.rows(), K);
+    for (int c = 0; c < K; ++c) ck.V.col(c) = cd.V.col(perm[c]);
+    perm_vec(cd.cj, perm, ck.cj);
+    perm_vec(cd.colmaf, perm, ck.colmaf);
+    perm_vec(cd.colbim, perm, ck.colbim);
+    perm_vec(cd.car, perm, ck.car);
+    perm_vec(cd.dos, perm, ck.dos);
+    perm_vec(cd.colsum, perm, ck.colsum);
+    ck.colw.resize(cd.colw.size());
+    for (size_t w = 0; w < cd.colw.size(); ++w) perm_vec(cd.colw[w], perm, ck.colw[w]);
+}
+
 // Gpre: an already-formed (double) Gram for this cd, used instead of recomputing
 // V'V. Gout: if non-null, receives the Gram. Both default to null, in which case
 // this is exactly the original function. They exist so the multi-alpha path can
@@ -2467,6 +2522,10 @@ static bool g_w_groups_only = false;
 // binary ACAT-V: a KVIK variant enters only when its expected minority-class count
 // MAC x min(prev, 1 - prev) is at least this (KVIK's single-variant saddlepoint is unreliable below)
 static double g_acatv_min_ec = 5.0;
+// burden groups also get a variance-component test (their categories merged into one component);
+// env SPARROW_GROUP_VC=0 switches it off
+static bool g_grp_vc = true;
+static std::vector<std::string> g_grp_vc_names;   // empty = every group
 // burden groups: annotation-column indices (0-based) of each group, and the group names
 static std::vector< std::vector<int> > g_bgrp;
 static std::vector<std::string> g_bgrp_name;
@@ -2483,7 +2542,9 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
                              const std::vector<double>& ycross,
                              const CoherBin& cb,
                              const BinExact& bx, bool one_sided,
-                             ChunkResultA& cr) {
+                             ChunkResultA& cr, int only_cat = -1) {
+    // only_cat >= 0: univariate p-values only for that component (the others stay NA; estimates
+    // are still joint). Used by the burden-group VC test, which needs the merged component only.
     const int n = (int) Y.rows(), P = (int) Y.cols();
     const int A = (int) cd.cat_m.size();
 
@@ -3717,6 +3778,7 @@ static void test_chunk_annot(const ChunkDataA& cd, ChunkGeom& gm,
 
         // ---- SPA-test each category component c ----
         for (int c = 0; c < A; ++c) {
+            if (only_cat >= 0 && c != only_cat) continue;
             const double c_env = Tinv(c, env);
             for (int a = 0; a < C; ++a) {
                 d0v[a] = (a == c) ? 0.0 : s0base[a] * g[a];   // null the tested category
@@ -4289,6 +4351,56 @@ struct Worker : public RcppParallel::Worker {
                     }
                 }
             }
+            // ---- variance-component test of each burden group ----------------------
+            // The group's categories merged into ONE component and tested jointly with the unit's
+            // other categories (and flank), like a single category, at every alpha (unweighted
+            // models). The group p-value becomes the equal-weight ACAT of these VC p-values and the
+            // group's burden p-values. grp_vc[v][group][trait][alpha].
+            std::vector< std::vector< std::vector< std::vector<double> > > > grp_vc(NVP);
+            if (spa && g_burden && g_grp_vc && !pr.coher && gm.ok && !g_bgrp.empty()) {
+                const size_t NGv = g_bgrp.size(), Av = cd.cat_m.size(), NA0 = ctx.alphas.size();
+                const double av0 = ctx.alpha;                  // the alpha V was read at
+                const bool haveG = multi && G0.rows() == cd.K && G0.cols() == cd.K;
+                for (size_t gi = 0; gi < NGv; ++gi) {
+                    if (!g_grp_vc_names.empty() &&
+                        std::find(g_grp_vc_names.begin(), g_grp_vc_names.end(), g_bgrp_name[gi]) == g_grp_vc_names.end()) continue;
+                    std::vector<int> qs;
+                    for (size_t q = 0; q < Av; ++q)
+                        if (cd.cat_m[q] > 0 && std::find(g_bgrp[gi].begin(), g_bgrp[gi].end(), cd.cat_id[q]) != g_bgrp[gi].end())
+                            qs.push_back((int) q);
+                    if (qs.size() < 2) continue;
+                    ChunkDataA cm; std::vector<int> perm;
+                    merge_categories(cd, qs, cm, perm);
+                    Eigen::MatrixXd Gm;
+                    if (haveG) {
+                        Gm.resize(cd.K, cd.K);
+                        for (int b = 0; b < cd.K; ++b) for (int a2 = 0; a2 < cd.K; ++a2) Gm(a2, b) = G0(perm[a2], perm[b]);
+                    }
+                    for (size_t k = 0; k < NA0; ++k) {
+                        const double ak = ctx.alphas[k];
+                        Eigen::VectorXd d(cd.K);
+                        for (int c = 0; c < cd.K; ++c) d[c] = alpha_w(cm.colmaf[c], ak) / alpha_w(cm.colmaf[c], av0);
+                        ChunkDataA ck = cm;
+                        if (ak != av0)
+                            for (int c = 0; c < cd.K; ++c) { ck.V.col(c) *= (float) d[c]; ck.cj[c] *= d[c] * d[c]; }
+                        ChunkGeom gk;
+                        if (haveG) { Eigen::MatrixXd Gk = d.asDiagonal() * Gm * d.asDiagonal(); build_geom(ck, pr.cov_df, spa, pr.binary, gk, &Gk); }
+                        else build_geom(ck, pr.cov_df, spa, pr.binary, gk);
+                        if (!gk.ok) continue;
+                        for (size_t v = 0; v < NVP; ++v) {
+                            ChunkResultA tmp;
+                            test_chunk_annot(ck, gk, S[v].Y, S[v].Yf, S[v].Vp, S[v].yty,
+                                             pr.binary, spa, pr.coher, pr.pairs,
+                                             S[v].ycross, S[v].cb, S[v].bx, pr.one_sided, tmp, 0);
+                            if (tmp.p_spa.empty()) continue;
+                            if (grp_vc[v].empty()) grp_vc[v].resize(NGv);
+                            if (grp_vc[v][gi].empty())
+                                grp_vc[v][gi].assign(tmp.p_spa[0].size(), std::vector<double>(NA0, NA_REAL));
+                            for (size_t t = 0; t < tmp.p_spa[0].size(); ++t) grp_vc[v][gi][t][k] = tmp.p_spa[0][t];
+                        }
+                    }
+                }
+            }
             // ---- burden test, one per category and alpha ----------------------
             // Univariate association passes (not with conditional = TRUE: like ACAT-V,
             // the burden is a marginal test). The omnibus becomes
@@ -4485,16 +4597,23 @@ struct Worker : public RcppParallel::Worker {
                     R.grp_m.assign(NG, 0);
                     R.p_grp.assign(NG, std::vector<double>(NT, NA_REAL));
                     R.p_grpa.assign(NG, std::vector< std::vector<double> >(NT, std::vector<double>(NAL, NA_REAL)));
+                    R.p_grpv.assign(NG, std::vector< std::vector<double> >(NT, std::vector<double>(ctx.alphas.size(), NA_REAL)));
                     for (size_t gi = 0; gi < NG; ++gi) {
                         if (gq[gi].size() < 2) continue;
                         for (size_t r = 0; r < gq[gi].size(); ++r) R.grp_m[gi] += cd.cat_m[gq[gi][r]];
                         bset(gq[gi], pk, true);
                         for (size_t k = 0; k < NAL; ++k)
                             for (size_t t = 0; t < NT; ++t) R.p_grpa[gi][t][k] = pk[k][t];
+                        const bool gvc = v < grp_vc.size() && gi < grp_vc[v].size();
                         for (size_t t = 0; t < NT; ++t) {
                             std::vector<double> bv, bw;
                             for (size_t k = 0; k < NAL; ++k)
                                 if (!std::isnan(R.p_grpa[gi][t][k])) { bv.push_back(R.p_grpa[gi][t][k]); bw.push_back(1.0); }
+                            if (gvc && t < grp_vc[v][gi].size())
+                                for (size_t k = 0; k < grp_vc[v][gi][t].size(); ++k) {
+                                    R.p_grpv[gi][t][k] = grp_vc[v][gi][t][k];
+                                    if (!std::isnan(grp_vc[v][gi][t][k])) { bv.push_back(grp_vc[v][gi][t][k]); bw.push_back(1.0); }
+                                }
                             if (!bv.empty()) R.p_grp[gi][t] = acat_combine(bv, bw);
                         }
                     }
@@ -4989,7 +5108,12 @@ static Rcpp::List run_all(ChunkContext& ctx, const ChunkParams& pr) {
         const bool has = gi < R.p_grp.size() && (size_t) t < R.p_grp[gi].size();
         if (has) wr(f, R.p_grp[gi][t]); else f << "NA";
         f << "\tNA";
-        if (multi_a) for (size_t k = 0; k < NVC; ++k) f << "\tNA";
+        if (multi_a)
+            for (size_t k = 0; k < NVC; ++k) {
+                f << '\t';
+                if (gi < R.p_grpv.size() && (size_t) t < R.p_grpv[gi].size() && k < R.p_grpv[gi][t].size()) wr(f, R.p_grpv[gi][t][k]);
+                else f << "NA";
+            }
         if (acv) for (size_t k = 0; k < ctx.alphas.size() + 2; ++k) f << "\tNA";
         if (bur) {
             f << '\t'; if (has) wr(f, R.p_grp[gi][t]); else f << "NA";
@@ -5183,7 +5307,8 @@ Rcpp::List stratgwas_run(const std::string& filename,
                          int n_threads = 0,
                          Rcpp::Nullable<Rcpp::List> burden_groups = R_NilValue,
                          Rcpp::Nullable<Rcpp::NumericMatrix> variant_weights = R_NilValue,
-                         bool weights_groups_only = false) {
+                         bool weights_groups_only = false,
+                         Rcpp::Nullable<Rcpp::CharacterVector> group_vc = R_NilValue) {
     if (chunk_size < 1) stop("chunk_size must be >= 1");
     if (max_gene_snps < 1) stop("max_gene_snps must be >= 1");
     if (min_gene_snps < 1) stop("min_gene_snps must be >= 1");
@@ -5331,7 +5456,35 @@ Rcpp::List stratgwas_run(const std::string& filename,
             g_bgrp.push_back(v);
             g_bgrp_name.push_back(as<std::string>(bn[k]));
         }
+        // group_vc: names of the burden groups that also get a variance-component test (NULL = none).
+        // The environment variable SPARROW_GROUP_VC overrides it (testing only): 0 = none, 1 = every
+        // group, else a comma-separated list of group names.
+        g_grp_vc = false; g_grp_vc_names.clear();
+        if (group_vc.isNotNull()) {
+            Rcpp::CharacterVector gv(group_vc);
+            for (R_xlen_t k = 0; k < gv.size(); ++k) {
+                const std::string nm = Rcpp::as<std::string>(gv[k]);
+                if (std::find(g_bgrp_name.begin(), g_bgrp_name.end(), nm) == g_bgrp_name.end())
+                    stop("group_vc: '" + nm + "' is not one of the burden_groups");
+                g_grp_vc_names.push_back(nm);
+            }
+            g_grp_vc = !g_grp_vc_names.empty();
+        }
+        if (const char* e = std::getenv("SPARROW_GROUP_VC")) {
+            g_grp_vc = true; g_grp_vc_names.clear();
+            const std::string ev(e);
+            if (ev == "0") g_grp_vc = false;
+            else if (ev != "1" && !ev.empty()) {
+                std::stringstream ss(ev); std::string tok;
+                while (std::getline(ss, tok, ',')) if (!tok.empty()) g_grp_vc_names.push_back(tok);
+            }
+        }
         if (g_burden && SPA && !g_bgrp.empty()) {
+            if (g_grp_vc) {
+                Rcout << "Burden-group variance-component tests (VC p per alpha in p_alpha_<alpha> of the group rows) for: ";
+                if (g_grp_vc_names.empty()) Rcout << "all groups\n";
+                else for (size_t k = 0; k < g_grp_vc_names.size(); ++k) Rcout << g_grp_vc_names[k] << (k + 1 < g_grp_vc_names.size() ? ", " : "\n");
+            }
             Rcout << "Burden groups:";
             for (size_t k = 0; k < g_bgrp.size(); ++k) {
                 Rcout << " " << g_bgrp_name[k] << " = {";
